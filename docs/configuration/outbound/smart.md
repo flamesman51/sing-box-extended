@@ -82,6 +82,8 @@ Budgets use decimal MB (`1 MB = 1,000,000 bytes`) and must be nonnegative. An ex
 
 Default `true`. When a member is confirmed dead, close its attached connections and flows, even if no replacement is available. Other members are not interrupted. A switch for a better tier, stability, or throughput affects only new connections.
 
+Attachment tokens identify the exact member instance. Connections completing after a provider replaces that member, or after the group begins shutdown, are closed instead of being attached to a replacement.
+
 #### notify_all_dead
 
 Default `true`. Notify only after every member has corroborated failures, the interface is up, and a fresh direct HTTPS probe confirms that direct Internet access works, continuously for at least `45s`. Recovery cancels the notification. Paused, offline, captive, and unknown-direct states do not produce this notification.
@@ -100,11 +102,13 @@ Smart compares eligible members in this order:
 
 Health is proven by successful probe transactions, not by connection counters. In particular, SYN, ACK, RST, and packet byte counts are accounting and stall signals, never proof that a server works. HTTPS probes use independent operators and valid TLS; a negative TCP result requires failures against two different operators. UDP probes use STUN. UDP/443 probes validate QUIC version-negotiation responses. Probe name resolution uses DNS-over-TCP through the member rather than the profile's DNS router.
 
-A single operator failure marks a healthy primary suspect and starts a confirmation check in parallel with standby validation. Confirmed failure quarantines the member, initially for `30s`, with exponential backoff capped at `15m`. Recovery requires three successful half-open checks, at least `20s` apart. If no primary is eligible, emergency checks can recover a member without waiting for its quarantine timer; retries back off through `5s`, `10s`, `20s`, and `30s` while there is demand or a network/wake event.
+Stall-triggered checks are coalesced until the attachment receives read progress, with at most one admitted primary check per heartbeat interval.
+
+A single operator failure marks a healthy primary suspect and starts a confirmation check in parallel with standby validation. Confirmed failure quarantines the member, initially for `30s`, with exponential backoff capped at `15m`. Recovery requires three successful half-open checks, at least `20s` apart. If no primary is eligible, emergency checks can recover a member without waiting for its quarantine timer; retries back off through `5s`, `10s`, `20s`, and `30s` while there is demand or a network/wake event. Wake-triggered emergency rounds retain the minimum `2s` gap.
 
 At startup or on a new network generation, the two best-ranked members are checked first. The first successful member can carry new traffic immediately. For up to `10s`, a previous primary that is not down, or the best unknown member, can be used while validation is pending.
 
-A recovered lower-numbered tier must stay healthy for `60s` before tier restoration. An ordinary stability or throughput improvement needs two distinct observations at least `30s` apart and a primary dwell of at least `10m`; healthy primaries are not replaced merely for a lower ping. Sustained demand on an actively measured slow primary can trigger a challenger test in a light-traffic window within `5m` and waive the dwell when the challenger meets the target.
+A recovered lower-numbered tier must stay healthy for `60s` before tier restoration. An ordinary stability or throughput improvement needs two distinct observations at least `30s` apart and a primary dwell of at least `10m`; healthy primaries are not replaced merely for a lower ping. Sustained demand on an actively measured slow primary can trigger a challenger test in a light-traffic window within `5m` and waive the dwell when the challenger meets the target. This waiver cannot override tier, health state, or stability priority.
 
 #### Failure bound and reconnect time
 
@@ -114,7 +118,7 @@ With demand, the default heartbeat and adaptive timeout remove a dead primary fr
 15s heartbeat + 8s first check + 8s confirmation = 31s worst case
 ```
 
-The typical removal time is about `20s`. Standby validation runs in parallel with confirmation. If the standby was checked in the last `60s`, a replacement is validated by that moment; otherwise validation can require one more member timeout. Custom heartbeat intervals or timeouts change this bound.
+The typical removal time is about `20s`. Standby validation runs in parallel with confirmation. If the standby was checked in the last `60s`, a replacement is validated by that moment; otherwise validation can require one more member timeout. Primary and standby checks have a reserved worker that background confirmations cannot occupy. Custom heartbeat intervals or timeouts change this bound.
 
 This is a selection-removal bound, not an application-recovery guarantee. Applications control whether and when they reconnect. Existing flows are not replayed. Ordinary `DialContext` can retry one eligible standby for a timeout or handshake error returned before the connection is handed off, within the remaining dial budget. With no caller deadline, its total budget is twice the member timeout. Destination refusals and resets are neutral and are not retried; lazy handshakes after handoff and TUN fast-path flows are not retried.
 
@@ -130,11 +134,11 @@ For UDP/443 with `quic_policy: "auto"`:
 
 `route_only` uses this routing preference without rejection. `off` disables the UDP/443 special case. Generic UDP success is never substituted for UDP/443 success. Generic UDP positive evidence lasts `30m`; UDP/443 positive and corroborated negative evidence last `10m`.
 
-The first UDP/443 flow in a network generation triggers discovery across healthy members, repeated every `10m` while there is UDP/443 demand. Before results arrive, there is no health-based rejection. The TUN fast path declines health-dependent rejections and lets normal packet routing reevaluate each new session; it does not install a durable dispatcher rejection. Member selection remains destination-aware through nested groups. The group's `Now()` value is only the TCP/display projection.
+The first UDP/443 flow in a network generation triggers discovery across healthy members, repeated every `10m` while there is UDP/443 demand, including when the current flow is rejected. Before results arrive, there is no health-based rejection. The TUN fast path declines health-dependent rejections and lets normal packet routing reevaluate each new session; it does not install a durable dispatcher rejection. Member selection remains destination-aware through nested groups. The group's `Now()` value is only the TCP/display projection.
 
 ### Interfaces, pause, and direct connectivity
 
-Default-interface, network-type, carrier, and BSSID changes start a new network generation. Stale checks from the old generation are discarded, in-flight work is cancelled, and new evidence is collected. Pause, cancellation, resolver failure, and link loss are neutral: they do not count as member failures. No probe timers run while paused; waking coalesces primary and standby checks.
+Default-interface, network-type, carrier, and BSSID changes start a new network generation. Stale checks from the old generation are discarded, in-flight work is cancelled, and new evidence is collected. Pause, cancellation, resolver failure, and link loss are neutral: they do not count as member failures. No probe timers run while paused; waking coalesces primary and standby checks. Pause and shutdown cancel any active `all_dead` notification.
 
 Wi-Fi and cellular metadata improve per-network learning but are optional. Denied permissions, redacted SSIDs/BSSIDs, and stale cellular observations fall back to coarser keys. Smart does not turn on routing's `NeedWIFIState()` requirement. Direct probes use a separate bootstrap resolver and the platform-bound default-network path, not the profile DNS router or a proxy member. Built-in direct target lists depend on the platform country setting; there is no IP-geolocation request.
 
