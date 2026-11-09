@@ -388,7 +388,8 @@ func smartDirectProbe(ctx context.Context, country string, seed []byte) (time.Du
 	if iface == nil {
 		return 0, fmt.Errorf("smart direct probe has no default interface: %w", context.Canceled)
 	}
-	dialOptions := option.DialerOptions{BindInterface: iface.Name}
+	var dialOptions option.DialerOptions
+	dialOptions.BindInterface = iface.Name
 	registry := service.FromContext[adapter.DNSTransportRegistry](ctx)
 	if registry == nil {
 		return 0, fmt.Errorf("%w: missing local DNS registry", errSmartResolve)
