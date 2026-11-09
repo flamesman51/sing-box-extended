@@ -16,6 +16,10 @@ type PlatformInterface interface {
 	UnderNetworkExtension() bool
 	IncludeAllNetworks() bool
 	ReadWIFIState() *WIFIState
+	ReadCellularState() *CellularState
+	SystemCountryCode() string
+	IsPowerSaveMode() bool
+	SystemTimezoneOffsetSeconds() int32
 	ClearDNSCache()
 	SendNotification(notification *Notification) error
 	CancelNotification(identifier string, typeID int32) error
@@ -120,6 +124,11 @@ type WIFIState struct {
 
 func NewWIFIState(wifiSSID string, wifiBSSID string) *WIFIState {
 	return &WIFIState{wifiSSID, wifiBSSID}
+}
+
+type CellularState struct {
+	MCC, MNC, Carrier, RadioType, AreaCode, CellID string
+	ObservedAtUnixMillis                           int64 // Zero means unknown.
 }
 
 type NetworkInterfaceIterator interface {

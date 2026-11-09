@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -188,6 +189,46 @@ func (w *platformInterfaceWrapper) ReadWIFIState(ctx context.Context) adapter.WI
 		return adapter.WIFIState{}
 	}
 	return adapter.WIFIState(*wifiState)
+}
+
+func (w *platformInterfaceWrapper) ReadCellularState() *adapter.CellularState {
+	if w.iif == nil {
+		return nil
+	}
+	state := w.iif.ReadCellularState()
+	if state == nil {
+		return nil
+	}
+	result := &adapter.CellularState{
+		MCC:       state.MCC,
+		MNC:       state.MNC,
+		Carrier:   state.Carrier,
+		RadioType: state.RadioType,
+		AreaCode:  state.AreaCode,
+		CellID:    state.CellID,
+	}
+	if state.ObservedAtUnixMillis != 0 {
+		result.ObservedAt = time.UnixMilli(state.ObservedAtUnixMillis)
+	}
+	return result
+}
+
+func (w *platformInterfaceWrapper) SystemCountryCode() string {
+	if w.iif == nil {
+		return ""
+	}
+	return w.iif.SystemCountryCode()
+}
+
+func (w *platformInterfaceWrapper) IsPowerSaveMode() bool {
+	return w.iif != nil && w.iif.IsPowerSaveMode()
+}
+
+func (w *platformInterfaceWrapper) SystemTimezoneOffsetSeconds() int32 {
+	if w.iif == nil {
+		return 0
+	}
+	return w.iif.SystemTimezoneOffsetSeconds()
 }
 
 func (w *platformInterfaceWrapper) UsePlatformConnectionOwnerFinder() bool {

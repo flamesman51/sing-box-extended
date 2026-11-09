@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-tun"
@@ -32,6 +33,10 @@ type PlatformInterface interface {
 	ClearDNSCache()
 	RequestPermissionForWIFIState() error
 	ReadWIFIState(ctx context.Context) WIFIState
+	ReadCellularState() *CellularState
+	SystemCountryCode() string
+	IsPowerSaveMode() bool
+	SystemTimezoneOffsetSeconds() int32
 
 	UsePlatformConnectionOwnerFinder() bool
 	FindConnectionOwner(request *FindConnectionOwnerRequest) (*ConnectionOwner, error)
@@ -58,6 +63,11 @@ type PlatformInterface interface {
 
 	UsePlatformBridge() bool
 	CreateBridge(options BridgeOptions) (BridgeSession, error)
+}
+
+type CellularState struct {
+	MCC, MNC, Carrier, RadioType, AreaCode, CellID string
+	ObservedAt                                     time.Time // Zero means unknown.
 }
 
 type BridgeOptions struct {

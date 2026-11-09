@@ -136,6 +136,22 @@ func (s *platformInterfaceStub) ReadWIFIState(ctx context.Context) adapter.WIFIS
 	return adapter.WIFIState{}
 }
 
+func (s *platformInterfaceStub) ReadCellularState() *adapter.CellularState {
+	return nil
+}
+
+func (s *platformInterfaceStub) SystemCountryCode() string {
+	return ""
+}
+
+func (s *platformInterfaceStub) IsPowerSaveMode() bool {
+	return false
+}
+
+func (s *platformInterfaceStub) SystemTimezoneOffsetSeconds() int32 {
+	return 0
+}
+
 func (s *platformInterfaceStub) UsePlatformConnectionOwnerFinder() bool {
 	return false
 }

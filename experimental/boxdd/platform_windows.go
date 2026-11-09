@@ -143,6 +143,22 @@ func (p *windowsPlatformInterface) ReadWIFIState(ctx context.Context) adapter.WI
 	return adapter.WIFIState{}
 }
 
+func (p *windowsPlatformInterface) ReadCellularState() *adapter.CellularState {
+	return nil
+}
+
+func (p *windowsPlatformInterface) SystemCountryCode() string {
+	return ""
+}
+
+func (p *windowsPlatformInterface) IsPowerSaveMode() bool {
+	return false
+}
+
+func (p *windowsPlatformInterface) SystemTimezoneOffsetSeconds() int32 {
+	return 0
+}
+
 func (p *windowsPlatformInterface) UsePlatformConnectionOwnerFinder() bool {
 	return false
 }

@@ -129,6 +129,22 @@ func (p *linuxPlatformInterface) ReadWIFIState(ctx context.Context) adapter.WIFI
 	return adapter.WIFIState{}
 }
 
+func (p *linuxPlatformInterface) ReadCellularState() *adapter.CellularState {
+	return nil
+}
+
+func (p *linuxPlatformInterface) SystemCountryCode() string {
+	return ""
+}
+
+func (p *linuxPlatformInterface) IsPowerSaveMode() bool {
+	return false
+}
+
+func (p *linuxPlatformInterface) SystemTimezoneOffsetSeconds() int32 {
+	return 0
+}
+
 func (p *linuxPlatformInterface) UsePlatformConnectionOwnerFinder() bool {
 	return false
 }
