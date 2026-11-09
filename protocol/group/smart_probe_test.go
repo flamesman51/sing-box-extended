@@ -16,13 +16,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service"
 
 	mDNS "github.com/miekg/dns"
 )
 
 type smartProbeTestDialer struct {
 	failResolve           bool
+	blockResolve          bool
 	badFirst              bool
 	block                 bool
 	failUDP, failFirstUDP bool
@@ -47,6 +51,10 @@ func (d *smartProbeTestDialer) DialContext(ctx context.Context, network string, 
 		return client, nil
 	}
 	d.resolves.Add(1)
+	if d.blockResolve {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if d.failResolve {
 		return nil, errors.New("bootstrap DNS blocked")
 	}
@@ -207,6 +215,60 @@ func TestSmartResolverFailuresAndCancellationAreNeutral(t *testing.T) {
 	}
 }
 
+func TestSmartUDPResolverDeadlineRemainsNeutral(t *testing.T) {
+	for _, test := range []struct {
+		kind string
+		quic bool
+	}{{"udp", false}, {"udp443", true}} {
+		t.Run(test.kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			dialer := &smartProbeTestDialer{blockResolve: true}
+			_, err := smartUDPProbe(ctx, dialer, test.quic)
+			if !errors.Is(err, errSmartResolve) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("resolver deadline lost neutral classification: %v", err)
+			}
+			if dialer.resolves.Load() == 0 || dialer.packets.Load() != 0 {
+				t.Fatal("resolver deadline did not remain in DNS")
+			}
+			s, clock := smartTestGroup()
+			s.applyResultLocked(smartResult{member: s.primary, generation: s.generation, memberGeneration: s.primary.generation, configGeneration: s.configGeneration, kind: test.kind, err: err}, clock.now)
+			if s.primary.udp.value(clock.now) != "unknown" || s.primary.udp443.value(clock.now) != "unknown" {
+				t.Fatal("resolver deadline produced negative UDP evidence")
+			}
+		})
+	}
+}
+
+func TestSmartUDPDatagramTimeoutsRemainNegative(t *testing.T) {
+	for _, test := range []struct {
+		kind string
+		quic bool
+	}{{"udp", false}, {"udp443", true}} {
+		t.Run(test.kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			dialer := &smartProbeTestDialer{block: true}
+			_, err := smartUDPProbe(ctx, dialer, test.quic)
+			if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errSmartResolve) {
+				t.Fatalf("datagram timeout lost negative classification: %v", err)
+			}
+			if dialer.packets.Load() != 2 {
+				t.Fatal("datagram timeout was not corroborated")
+			}
+			s, clock := smartTestGroup()
+			s.applyResultLocked(smartResult{member: s.primary, generation: s.generation, memberGeneration: s.primary.generation, configGeneration: s.configGeneration, kind: test.kind, err: err}, clock.now)
+			evidence := s.primary.udp
+			if test.quic {
+				evidence = s.primary.udp443
+			}
+			if evidence.value(clock.now) != "failed" {
+				t.Fatal("corroborated datagram timeout did not produce negative evidence")
+			}
+		})
+	}
+}
+
 func TestSmartUDPClosesBlockedSocketOnCancellation(t *testing.T) {
 	dialer := &smartProbeTestDialer{block: true, packetStarted: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -278,6 +340,49 @@ func TestSmartMeasureCountsInnerBytesAndCapsOverhead(t *testing.T) {
 	}
 	if dialer.httpDials.Load() > 2 {
 		t.Fatal("download connection limit exceeded")
+	}
+}
+
+type smartProbeDisappearingNetworkManager struct {
+	adapter.NetworkManager
+	iface *adapter.NetworkInterface
+	reads int
+}
+
+func (m *smartProbeDisappearingNetworkManager) DefaultNetworkInterface() *adapter.NetworkInterface {
+	m.reads++
+	iface := m.iface
+	m.iface = nil
+	return iface
+}
+
+func TestSmartDirectProbeSnapshotsDefaultInterface(t *testing.T) {
+	manager := &smartProbeDisappearingNetworkManager{iface: &adapter.NetworkInterface{Interface: control.Interface{Name: "wlan0"}}}
+	ctx := service.ContextWith[adapter.NetworkManager](context.Background(), manager)
+	if _, err := smartDirectProbe(ctx, "", nil); !errors.Is(err, errSmartResolve) {
+		t.Fatalf("probe did not advance to bootstrap resolution: %v", err)
+	}
+	if manager.reads != 1 {
+		t.Fatalf("default interface read %d times", manager.reads)
+	}
+}
+
+func TestSmartDirectProbeMissingInterfaceIsNeutral(t *testing.T) {
+	for name, ctx := range map[string]context.Context{
+		"missing manager":   context.Background(),
+		"missing interface": service.ContextWith[adapter.NetworkManager](context.Background(), &smartProbeDisappearingNetworkManager{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := smartDirectProbe(ctx, "", nil)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("link loss not tagged neutral: %v", err)
+			}
+			s, clock := smartTestGroup()
+			s.applyResultLocked(smartResult{generation: s.generation, configGeneration: s.configGeneration, kind: "direct", err: err}, clock.now)
+			if s.direct.value(clock.now) != "unknown" || !s.ambiguousSince.IsZero() {
+				t.Fatal("missing interface produced negative direct evidence")
+			}
+		})
 	}
 }
 

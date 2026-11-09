@@ -236,8 +236,11 @@ func smartUDPProbe(ctx context.Context, dialer N.Dialer, quic bool) (time.Durati
 			resolveFailed = true
 		}
 		cancel()
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			if resolveFailed {
+				return 0, fmt.Errorf("%w: %w", errSmartResolve, err)
+			}
+			return 0, err
 		}
 		failures = append(failures, err)
 	}
@@ -378,11 +381,14 @@ func smartDirectProbe(ctx context.Context, country string, seed []byte) (time.Du
 		return 0, err
 	}
 	manager := service.FromContext[adapter.NetworkManager](ctx)
-	if manager == nil || manager.DefaultNetworkInterface() == nil {
-		return 0, errors.New("smart direct probe has no default interface")
+	var iface *adapter.NetworkInterface
+	if manager != nil {
+		iface = manager.DefaultNetworkInterface()
 	}
-	dialOptions := option.DialerOptions{}
-	dialOptions.BindInterface = manager.DefaultNetworkInterface().Name
+	if iface == nil {
+		return 0, fmt.Errorf("smart direct probe has no default interface: %w", context.Canceled)
+	}
+	dialOptions := option.DialerOptions{BindInterface: iface.Name}
 	registry := service.FromContext[adapter.DNSTransportRegistry](ctx)
 	if registry == nil {
 		return 0, fmt.Errorf("%w: missing local DNS registry", errSmartResolve)
