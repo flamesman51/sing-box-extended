@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -431,6 +432,25 @@ type smartTestIdentityProvider struct{}
 
 func (smartTestIdentityProvider) SmartIdentity(outbound adapter.Outbound) (string, string, error) {
 	return outbound.Tag(), outbound.Tag(), nil
+}
+
+func TestSmartProviderRefreshDoesNotRetainUnobservedIdentities(t *testing.T) {
+	s, _ := smartTestGroup()
+	s.members, s.primary, s.standby = nil, nil, nil
+	provider := &smartReplacementProvider{}
+	s.providerManager = &smartReplacementProviderManager{provider: provider}
+	s.providerCallbacks = make(map[adapter.Provider]*list.Element[adapter.ProviderUpdateCallback])
+	s.options.Providers = []string{"provider"}
+	s.ctx = service.ContextWith[adapter.SmartIdentityProvider](s.ctx, smartTestIdentityProvider{})
+	for index := range 100 {
+		provider.values = []adapter.Outbound{&smartFakeOutbound{tag: fmt.Sprintf("configuration-%d", index)}}
+		if err := s.loadMembers(); err != nil {
+			t.Fatal(err)
+		}
+		if len(s.history.IdentityServers) != 0 {
+			t.Fatal("unobserved provider configurations retained history identity metadata")
+		}
+	}
 }
 
 func TestSmartProviderReplacementRejectsOldIncarnation(t *testing.T) {

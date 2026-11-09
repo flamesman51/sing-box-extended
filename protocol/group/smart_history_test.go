@@ -213,6 +213,83 @@ func TestSmartHistoryBoundsRoundTripAndTimeline(t *testing.T) {
 	}
 }
 
+func TestSmartLiveHistoryBoundsIdentityMappingsWithoutPersistence(t *testing.T) {
+	s, clock := smartTestGroup()
+	member := s.primary
+	for index := range 100 {
+		member.identity = fmt.Sprintf("configuration-%03d", index)
+		member.serverIdentity = fmt.Sprintf("server-%03d", index)
+		s.recordObservationLocked(member, true, 100*time.Millisecond, clock.Now())
+		if len(s.history.IdentityServers) != min(index+1, 32) {
+			t.Fatalf("configuration %d retained %d identity mappings", index, len(s.history.IdentityServers))
+		}
+		for identity := range s.history.Stats["wifi"] {
+			if s.history.IdentityServers[identity] == "" {
+				t.Fatalf("live statistic lost server identity %s", identity)
+			}
+		}
+		clock.Advance(time.Minute)
+	}
+}
+
+func TestSmartHistoryRetainsIdentityUntilLastStatisticEviction(t *testing.T) {
+	s, clock := smartTestGroup()
+	member := s.primary
+	member.identity, member.serverIdentity = "shared", "shared-server"
+	for _, key := range []string{"wifi", "cell"} {
+		s.network = smartNetwork{Key: key, Type: key, Path: []string{key}, Link: true}
+		s.recordObservationLocked(member, true, 100*time.Millisecond, clock.Now())
+		clock.Advance(time.Minute)
+	}
+	for _, key := range []string{"wifi", "cell"} {
+		s.network = smartNetwork{Key: key, Type: key, Path: []string{key}, Link: true}
+		for index := range 32 {
+			member.identity = fmt.Sprintf("%s-%02d", key, index)
+			member.serverIdentity = member.identity
+			s.recordObservationLocked(member, true, 100*time.Millisecond, clock.Now())
+			clock.Advance(time.Minute)
+		}
+		if s.history.Stats[key]["shared"] != nil {
+			t.Fatalf("%s did not evict oldest statistic", key)
+		}
+		_, retained := s.history.IdentityServers["shared"]
+		if retained != (key == "wifi") {
+			t.Fatalf("shared identity retained after %s eviction: %v", key, retained)
+		}
+	}
+}
+
+func TestSmartHistoryNetworkEvictionKeepsNewObservationIdentity(t *testing.T) {
+	s, clock := smartTestGroup()
+	member := s.primary
+	for index := range 49 {
+		key := fmt.Sprintf("eth/eth%d", index)
+		s.network = smartNetwork{Key: key, Type: "ethernet", Path: []string{key}, Link: true}
+		member.identity = fmt.Sprintf("member-%d", index)
+		if index == 48 {
+			member.identity = "member-0"
+		}
+		member.serverIdentity = member.identity
+		s.recordObservationLocked(member, true, 100*time.Millisecond, clock.Now())
+		clock.Advance(time.Minute)
+	}
+	if s.history.Stats["eth/eth0"] != nil || s.history.IdentityServers["member-0"] != "member-0" {
+		t.Fatal("network eviction lost the new observation's server identity")
+	}
+}
+
+func TestSmartThroughputHistoryKeepsServerIdentityWithoutTCPObservation(t *testing.T) {
+	s, clock := smartTestGroup()
+	member := s.primary
+	s.applyResultLocked(smartResult{
+		member: member, kind: "throughput", generation: s.generation, configGeneration: s.configGeneration,
+		memberGeneration: member.generation, download: 25,
+	}, clock.Now())
+	if s.history.Stats["wifi"][member.identity] == nil || s.history.IdentityServers[member.identity] != member.serverIdentity {
+		t.Fatal("throughput-only statistic lost its server identity")
+	}
+}
+
 func TestSmartHistoryRejectsInvalidStatistics(t *testing.T) {
 	for _, data := range []string{
 		"null",

@@ -418,7 +418,6 @@ func (s *Smart) loadMembers() error {
 		if tier == 0 {
 			tier = 1
 		}
-		s.history.IdentityServers[identity] = server
 		s.memberGeneration++
 		nextMembers = append(nextMembers, &smartMember{outbound: member, tag: member.Tag(), identity: identity, serverIdentity: server, tier: tier, configOrder: order, country: strings.ToUpper(options.Country), generation: s.memberGeneration, state: "unknown", queued: make(map[string]bool)})
 	}
@@ -1300,6 +1299,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 					points[len(points)-1].MBPS = result.download
 				}
 			}
+			s.history.IdentityServers[member.identity] = member.serverIdentity
 			if s.challenger == member && result.download >= s.targetMbps && !now.After(s.challengerUntil) && s.demandChallengerEligibleLocked(member, now) {
 				s.switchLocked(member, "switch", "demand challenger meets target", now)
 				s.challenger = nil
@@ -1411,8 +1411,8 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 }
 
 func (s *Smart) recordObservationLocked(member *smartMember, success bool, rtt time.Duration, now time.Time) {
-	s.history.IdentityServers[member.identity] = member.serverIdentity
 	s.history.Observe(s.network.Path, member.identity, success, rtt.Seconds()*1000, s.historyTime(now), s.pausedTotal)
+	s.history.IdentityServers[member.identity] = member.serverIdentity
 	for index, key := range s.network.Path {
 		label := s.network.Labels[key]
 		parent := ""

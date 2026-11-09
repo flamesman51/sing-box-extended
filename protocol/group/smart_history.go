@@ -176,19 +176,11 @@ func (h *smartHistory) evictOldestNetwork() bool {
 		return false
 	}
 	delete(h.Networks, oldest)
-	for identity := range h.Stats[oldest] {
-		retained := false
-		for key, statistics := range h.Stats {
-			if key != oldest && statistics[identity] != nil {
-				retained = true
-				break
-			}
-		}
-		if !retained {
-			delete(h.IdentityServers, identity)
-		}
-	}
+	evicted := h.Stats[oldest]
 	delete(h.Stats, oldest)
+	for identity := range evicted {
+		h.removeUnusedIdentity(identity)
+	}
 	delete(h.Timeline, oldest)
 	delete(h.Labels, oldest)
 	delete(h.recency, oldest)
@@ -207,6 +199,7 @@ func (h *smartHistory) statistic(key, identity string, now time.Time) *smartStat
 		for len(statistics) >= smartHistoryMaxIdentities {
 			evicted := smartEvictIdentity(statistics)
 			delete(h.Timeline[key], evicted)
+			h.removeUnusedIdentity(evicted)
 		}
 		statistic = &smartStatistic{UpdatedAt: now.Unix()}
 		statistics[identity] = statistic
@@ -235,6 +228,15 @@ func smartEvictIdentity(statistics map[string]*smartStatistic) string {
 	}
 	delete(statistics, oldest)
 	return oldest
+}
+
+func (h *smartHistory) removeUnusedIdentity(identity string) {
+	for _, statistics := range h.Stats {
+		if statistics[identity] != nil {
+			return
+		}
+	}
+	delete(h.IdentityServers, identity)
 }
 
 // Observe receives the group's cumulative paused time; each key keeps its own baseline.
@@ -405,16 +407,7 @@ func (h *smartHistory) limit() {
 		}
 	}
 	for identity := range h.IdentityServers {
-		retained := false
-		for _, statistics := range h.Stats {
-			if statistics[identity] != nil {
-				retained = true
-				break
-			}
-		}
-		if !retained {
-			delete(h.IdentityServers, identity)
-		}
+		h.removeUnusedIdentity(identity)
 	}
 	if len(h.Events) > smartHistoryMaxEvents {
 		h.Events = slices.Delete(h.Events, 0, len(h.Events)-smartHistoryMaxEvents)

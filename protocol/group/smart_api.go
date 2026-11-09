@@ -526,9 +526,6 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 		s.mu.Lock()
 		s.priors = nil
 		s.history.Reset()
-		for _, member := range s.members {
-			s.history.IdentityServers[member.identity] = member.serverIdentity
-		}
 		s.eventLocked("reset", "", "", s.network.Key, "learned history reset; live health and budget retained", s.clock.Now())
 		s.notifyUpdatedLocked()
 		s.mu.Unlock()
