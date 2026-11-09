@@ -56,6 +56,11 @@ type CacheFile interface {
 	SaveMASQUEConfig(tag string, set *SavedBinary) error
 	LoadSubscription(tag string) *SavedBinary
 	SaveSubscription(tag string, sub *SavedBinary) error
+	LoadSmartHistory(group string) (*SmartHistory, error)
+	SaveSmartHistory(group string, history *SmartHistory) error
+	ResetSmartHistory(group string) error
+	LoadSmartMetadata() (*SmartMetadata, error)
+	SaveSmartMetadata(metadata *SmartMetadata) error
 }
 
 type SavedBinary struct {
