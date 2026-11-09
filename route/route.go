@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -472,7 +474,21 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			return continueResult
 		}
 	}
+	var selections []adapter.SmartSelection
 	for range 8 {
+		if smartGroup, isSmart := outbound.(adapter.SmartGroup); isSmart {
+			decision, err := smartGroup.SelectMember(ctx, metadata.Network, metadata.Destination)
+			if err != nil {
+				// Health-dependent rejection must not become a durable TUN verdict.
+				return continueResult
+			}
+			outbound = decision.Outbound()
+			if outbound == nil {
+				return continueResult
+			}
+			selections = append(selections, decision.Selections()...)
+			continue
+		}
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			break
@@ -536,6 +552,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		result.Destination = metadata.Destination.AddrPort()
 	}
 	metadataCopy := *metadata
+	decision := adapter.NewSmartDecision(outbound, selections)
 	result.NewTracker = func() tun.FlowTracker {
 		r.logger.InfoContext(ctx, "pre-match: forward ", metadataCopy.Network, " connection from ", metadataCopy.Source.AddrString(), " to ", metadataCopy.Destination.AddrString(), " via outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 		flowTrackers := make([]tun.FlowTracker, 0, len(r.trackers)+1)
@@ -546,12 +563,98 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 				flowTrackers = append(flowTrackers, flowTracker)
 			}
 		}
-		if len(flowTrackers) == 1 {
-			return flowTrackers[0]
+		var flowTracker tun.FlowTracker = flowTrackers[0]
+		if len(flowTrackers) > 1 {
+			flowTracker = multiFlowTracker(flowTrackers)
 		}
-		return multiFlowTracker(flowTrackers)
+		if len(selections) > 0 {
+			flowTracker = &smartFlowTracker{FlowTracker: flowTracker, decision: decision}
+		}
+		return flowTracker
 	}
 	return result
+}
+
+type smartFlowTracker struct {
+	tun.FlowTracker
+	decision adapter.SmartDecision
+	mu       sync.Mutex
+	lease    adapter.SmartLease
+	closer   *smartFlowCloser
+	closed   bool
+}
+
+func (t *smartFlowTracker) AttachFlow(handle tun.FlowHandle) {
+	closer := &smartFlowCloser{handle: handle}
+	t.mu.Lock()
+	t.closer = closer
+	closed := t.closed
+	t.mu.Unlock()
+	t.FlowTracker.AttachFlow(handle)
+	if closed {
+		_ = closer.Close()
+		return
+	}
+	lease := adapter.AttachSmartDecision(t.decision, closer)
+	t.mu.Lock()
+	closed = t.closed
+	if !closed {
+		t.lease = lease
+	}
+	t.mu.Unlock()
+	if closed {
+		_ = lease.Close()
+	}
+}
+
+func (t *smartFlowTracker) CountForward(n int) {
+	t.FlowTracker.CountForward(n)
+	t.mu.Lock()
+	lease := t.lease
+	t.mu.Unlock()
+	if lease != nil {
+		lease.CountWrite(n)
+	}
+}
+
+func (t *smartFlowTracker) CountReverse(n int) {
+	t.FlowTracker.CountReverse(n)
+	t.mu.Lock()
+	lease := t.lease
+	t.mu.Unlock()
+	if lease != nil {
+		lease.CountRead(n)
+	}
+}
+
+func (t *smartFlowTracker) CloseFlow(reason tun.FlowCloseReason) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	lease := t.lease
+	if t.closer != nil {
+		t.closer.closed.Store(true)
+	}
+	t.mu.Unlock()
+	if lease != nil {
+		_ = lease.Close()
+	}
+	t.FlowTracker.CloseFlow(reason)
+}
+
+type smartFlowCloser struct {
+	handle tun.FlowHandle
+	closed atomic.Bool
+}
+
+func (c *smartFlowCloser) Close() error {
+	if c.closed.CompareAndSwap(false, true) {
+		c.handle.CloseFlow()
+	}
+	return nil
 }
 
 func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.InboundContext) error {

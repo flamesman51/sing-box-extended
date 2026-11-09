@@ -543,11 +543,16 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			continue
 		}
 		switch nested := detour.(type) {
-		case *URLTest:
+		case adapter.URLTestGroup:
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
 			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
+				var nestedResult map[string]uint16
+				if urlTest, isURLTest := nested.(*URLTest); isURLTest {
+					nestedResult, _ = urlTest.group.urlTest(b.ctx, force)
+				} else {
+					nestedResult, _ = nested.URLTest(b.ctx)
+				}
 				b.access.Lock()
 				maps.Copy(b.result, nestedResult)
 				b.access.Unlock()
