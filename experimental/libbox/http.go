@@ -56,6 +56,8 @@ type HTTPRequest interface {
 
 type HTTPResponse interface {
 	GetContent() (*StringBox, error)
+	// GetHeader returns the first value of the named response header, or "" if absent.
+	GetHeader(name string) string
 	WriteTo(path string) error
 	WriteToWithProgress(path string, handler HTTPResponseWriteToProgressHandler) error
 }
@@ -254,6 +256,10 @@ func (h *httpResponse) GetContent() (*StringBox, error) {
 		return nil, h.contentError
 	}
 	return wrapString(string(h.content)), nil
+}
+
+func (h *httpResponse) GetHeader(name string) string {
+	return h.Header.Get(name)
 }
 
 func (h *httpResponse) WriteTo(path string) error {
