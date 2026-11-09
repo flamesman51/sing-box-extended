@@ -36,8 +36,11 @@ type SmartIdentityMetadata struct {
 	initialized   bool
 }
 
-func (m *SmartIdentityMetadata) SetSmartIdentity(local, server string, err error) {
-	m.local, m.server, m.err = local, server, err
+func (m *SmartIdentityMetadata) InitializeSmartIdentity(kind string, options any) {
+	if m.initialized {
+		return
+	}
+	m.local, m.server, m.err = ComputeSmartIdentity(kind, options)
 	m.initialized = true
 }
 

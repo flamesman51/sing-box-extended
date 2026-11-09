@@ -74,9 +74,8 @@ func (r *Registry) UnsafeCreateOutbound(ctx context.Context, router adapter.Rout
 		return nil, E.New("outbound type not found: " + outboundType)
 	}
 	result, err := constructor(ctx, router, logger, tag, options)
-	if identity, ok := result.(interface{ SetSmartIdentity(string, string, error) }); err == nil && ok {
-		local, server, identityErr := adapter.ComputeSmartIdentity(outboundType, options)
-		identity.SetSmartIdentity(local, server, identityErr)
+	if identity, ok := result.(interface{ InitializeSmartIdentity(string, any) }); err == nil && ok {
+		identity.InitializeSmartIdentity(outboundType, options)
 	}
 	return result, err
 }
