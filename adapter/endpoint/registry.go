@@ -37,19 +37,12 @@ type Registry struct {
 	access      sync.Mutex
 	optionsType map[string]optionsConstructorFunc
 	constructor map[string]constructorFunc
-	identities  map[adapter.Outbound]smartIdentity
-}
-
-type smartIdentity struct {
-	local, server string
-	err           error
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
 		optionsType: make(map[string]optionsConstructorFunc),
 		constructor: make(map[string]constructorFunc),
-		identities:  make(map[adapter.Outbound]smartIdentity),
 	}
 }
 
@@ -77,21 +70,20 @@ func (m *Registry) Create(ctx context.Context, router adapter.Router, logger log
 		return nil, E.New("outbound type not found: " + outboundType)
 	}
 	result, err := constructor(ctx, router, logger, tag, options)
-	if err == nil {
+	if identity, ok := result.(interface{ SetSmartIdentity(string, string, error) }); err == nil && ok {
 		local, server, identityErr := adapter.ComputeSmartIdentity(outboundType, options)
-		m.identities[result] = smartIdentity{local, server, identityErr}
+		identity.SetSmartIdentity(local, server, identityErr)
 	}
 	return result, err
 }
 
 func (m *Registry) SmartIdentity(outbound adapter.Outbound) (string, string, error) {
-	m.access.Lock()
-	defer m.access.Unlock()
-	identity, loaded := m.identities[outbound]
-	if !loaded {
-		return "", "", E.New("endpoint identity unavailable")
+	if identity, ok := outbound.(interface {
+		SmartIdentity() (string, string, error)
+	}); ok {
+		return identity.SmartIdentity()
 	}
-	return identity.local, identity.server, identity.err
+	return "", "", E.New("endpoint identity unavailable")
 }
 
 func (m *Registry) register(outboundType string, optionsConstructor optionsConstructorFunc, constructor constructorFunc) {

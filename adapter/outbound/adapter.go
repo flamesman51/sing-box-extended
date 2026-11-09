@@ -1,10 +1,12 @@
 package outbound
 
 import (
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
 )
 
 type Adapter struct {
+	adapter.SmartIdentityMetadata
 	outboundType string
 	outboundTag  string
 	network      []string

@@ -160,6 +160,8 @@ Network keys always store Wi-Fi SSIDs/BSSIDs and detailed location components as
 
 Local member identities include the outbound configuration and local public-key identity; credential or configuration changes start fresh live evidence. Private keys are never persisted in history or exported. Imported statistics match server identities and provide bounded priors only. Imports never restore live health, quarantine, the budget ledger, or `last_ok`. Reimporting the same source replaces that source's prior rather than adding it again. Foreign-install hashed network keys cannot be matched and are ignored; only matching coarse keys are imported, without folding child records into parents.
 
+Configured fingerprints belong to each outbound or endpoint instance. Reloading or checking configurations does not keep closed instances alive in the constructor registries.
+
 Each network also learns six local-time, four-hour buckets. A bucket influences stability only after at least `24` weight units of its own observations and can shift the stability class by at most one step. One weight unit is five minutes of observed time; pauses do not contribute. Statistics decay with a three-day half-life and shrink toward broader network levels until enough local evidence is available.
 
 Fresh cellular location data adds a hashed tower key below carrier and radio technology. Tower changes affect history attribution only, not network generation or live health. Tower data older than `120s`, or missing after permission revocation, falls back to a coarser key.

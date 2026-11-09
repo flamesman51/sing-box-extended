@@ -1,8 +1,12 @@
 package endpoint
 
-import "github.com/sagernet/sing-box/option"
+import (
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/option"
+)
 
 type Adapter struct {
+	adapter.SmartIdentityMetadata
 	endpointType string
 	endpointTag  string
 	network      []string

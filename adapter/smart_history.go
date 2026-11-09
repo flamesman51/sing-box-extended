@@ -29,6 +29,25 @@ type SmartIdentityProvider interface {
 	SmartIdentity(outbound Outbound) (local, server string, err error)
 }
 
+// SmartIdentityMetadata keeps configured fingerprints alive only with their instance.
+type SmartIdentityMetadata struct {
+	local, server string
+	err           error
+	initialized   bool
+}
+
+func (m *SmartIdentityMetadata) SetSmartIdentity(local, server string, err error) {
+	m.local, m.server, m.err = local, server, err
+	m.initialized = true
+}
+
+func (m *SmartIdentityMetadata) SmartIdentity() (local, server string, err error) {
+	if !m.initialized {
+		return "", "", errors.New("outbound identity unavailable")
+	}
+	return m.local, m.server, m.err
+}
+
 // ComputeSmartIdentity derives stable fingerprints without retaining configured credentials.
 func ComputeSmartIdentity(kind string, options any) (local, server string, err error) {
 	data, err := json.Marshal(options)
