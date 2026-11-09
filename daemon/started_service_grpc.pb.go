@@ -33,6 +33,11 @@ const (
 	StartedService_URLTest_FullMethodName                        = "/daemon.StartedService/URLTest"
 	StartedService_SelectOutbound_FullMethodName                 = "/daemon.StartedService/SelectOutbound"
 	StartedService_SetGroupExpand_FullMethodName                 = "/daemon.StartedService/SetGroupExpand"
+	StartedService_GetSmartStatus_FullMethodName                 = "/daemon.StartedService/GetSmartStatus"
+	StartedService_GetSmartNetworks_FullMethodName               = "/daemon.StartedService/GetSmartNetworks"
+	StartedService_ExportSmartHistory_FullMethodName             = "/daemon.StartedService/ExportSmartHistory"
+	StartedService_ImportSmartHistory_FullMethodName             = "/daemon.StartedService/ImportSmartHistory"
+	StartedService_ResetSmartHistory_FullMethodName              = "/daemon.StartedService/ResetSmartHistory"
 	StartedService_SubscribeConnections_FullMethodName           = "/daemon.StartedService/SubscribeConnections"
 	StartedService_CloseConnection_FullMethodName                = "/daemon.StartedService/CloseConnection"
 	StartedService_CloseAllConnections_FullMethodName            = "/daemon.StartedService/CloseAllConnections"
@@ -81,6 +86,11 @@ type StartedServiceClient interface {
 	URLTest(ctx context.Context, in *URLTestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SelectOutbound(ctx context.Context, in *SelectOutboundRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SetGroupExpand(ctx context.Context, in *SetGroupExpandRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	GetSmartStatus(ctx context.Context, in *GetSmartStatusRequest, opts ...grpc.CallOption) (*GetSmartStatusResponse, error)
+	GetSmartNetworks(ctx context.Context, in *GetSmartNetworksRequest, opts ...grpc.CallOption) (*GetSmartNetworksResponse, error)
+	ExportSmartHistory(ctx context.Context, in *ExportSmartHistoryRequest, opts ...grpc.CallOption) (*ExportSmartHistoryResponse, error)
+	ImportSmartHistory(ctx context.Context, in *ImportSmartHistoryRequest, opts ...grpc.CallOption) (*ImportSmartHistoryResponse, error)
+	ResetSmartHistory(ctx context.Context, in *ResetSmartHistoryRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SubscribeConnections(ctx context.Context, in *SubscribeConnectionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ConnectionEvents], error)
 	CloseConnection(ctx context.Context, in *CloseConnectionRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CloseAllConnections(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -289,6 +299,56 @@ func (c *startedServiceClient) SetGroupExpand(ctx context.Context, in *SetGroupE
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, StartedService_SetGroupExpand_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetSmartStatus(ctx context.Context, in *GetSmartStatusRequest, opts ...grpc.CallOption) (*GetSmartStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSmartStatusResponse)
+	err := c.cc.Invoke(ctx, StartedService_GetSmartStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetSmartNetworks(ctx context.Context, in *GetSmartNetworksRequest, opts ...grpc.CallOption) (*GetSmartNetworksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSmartNetworksResponse)
+	err := c.cc.Invoke(ctx, StartedService_GetSmartNetworks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) ExportSmartHistory(ctx context.Context, in *ExportSmartHistoryRequest, opts ...grpc.CallOption) (*ExportSmartHistoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExportSmartHistoryResponse)
+	err := c.cc.Invoke(ctx, StartedService_ExportSmartHistory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) ImportSmartHistory(ctx context.Context, in *ImportSmartHistoryRequest, opts ...grpc.CallOption) (*ImportSmartHistoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImportSmartHistoryResponse)
+	err := c.cc.Invoke(ctx, StartedService_ImportSmartHistory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) ResetSmartHistory(ctx context.Context, in *ResetSmartHistoryRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, StartedService_ResetSmartHistory_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -719,6 +779,11 @@ type StartedServiceServer interface {
 	URLTest(context.Context, *URLTestRequest) (*emptypb.Empty, error)
 	SelectOutbound(context.Context, *SelectOutboundRequest) (*emptypb.Empty, error)
 	SetGroupExpand(context.Context, *SetGroupExpandRequest) (*emptypb.Empty, error)
+	GetSmartStatus(context.Context, *GetSmartStatusRequest) (*GetSmartStatusResponse, error)
+	GetSmartNetworks(context.Context, *GetSmartNetworksRequest) (*GetSmartNetworksResponse, error)
+	ExportSmartHistory(context.Context, *ExportSmartHistoryRequest) (*ExportSmartHistoryResponse, error)
+	ImportSmartHistory(context.Context, *ImportSmartHistoryRequest) (*ImportSmartHistoryResponse, error)
+	ResetSmartHistory(context.Context, *ResetSmartHistoryRequest) (*emptypb.Empty, error)
 	SubscribeConnections(*SubscribeConnectionsRequest, grpc.ServerStreamingServer[ConnectionEvents]) error
 	CloseConnection(context.Context, *CloseConnectionRequest) (*emptypb.Empty, error)
 	CloseAllConnections(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
@@ -796,6 +861,21 @@ func (UnimplementedStartedServiceServer) SelectOutbound(context.Context, *Select
 }
 func (UnimplementedStartedServiceServer) SetGroupExpand(context.Context, *SetGroupExpandRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetGroupExpand not implemented")
+}
+func (UnimplementedStartedServiceServer) GetSmartStatus(context.Context, *GetSmartStatusRequest) (*GetSmartStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSmartStatus not implemented")
+}
+func (UnimplementedStartedServiceServer) GetSmartNetworks(context.Context, *GetSmartNetworksRequest) (*GetSmartNetworksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSmartNetworks not implemented")
+}
+func (UnimplementedStartedServiceServer) ExportSmartHistory(context.Context, *ExportSmartHistoryRequest) (*ExportSmartHistoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExportSmartHistory not implemented")
+}
+func (UnimplementedStartedServiceServer) ImportSmartHistory(context.Context, *ImportSmartHistoryRequest) (*ImportSmartHistoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ImportSmartHistory not implemented")
+}
+func (UnimplementedStartedServiceServer) ResetSmartHistory(context.Context, *ResetSmartHistoryRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResetSmartHistory not implemented")
 }
 func (UnimplementedStartedServiceServer) SubscribeConnections(*SubscribeConnectionsRequest, grpc.ServerStreamingServer[ConnectionEvents]) error {
 	return status.Error(codes.Unimplemented, "method SubscribeConnections not implemented")
@@ -1100,6 +1180,96 @@ func _StartedService_SetGroupExpand_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(StartedServiceServer).SetGroupExpand(ctx, req.(*SetGroupExpandRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetSmartStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSmartStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetSmartStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetSmartStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetSmartStatus(ctx, req.(*GetSmartStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetSmartNetworks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSmartNetworksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetSmartNetworks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetSmartNetworks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetSmartNetworks(ctx, req.(*GetSmartNetworksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_ExportSmartHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExportSmartHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).ExportSmartHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_ExportSmartHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).ExportSmartHistory(ctx, req.(*ExportSmartHistoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_ImportSmartHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportSmartHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).ImportSmartHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_ImportSmartHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).ImportSmartHistory(ctx, req.(*ImportSmartHistoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_ResetSmartHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResetSmartHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).ResetSmartHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_ResetSmartHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).ResetSmartHistory(ctx, req.(*ResetSmartHistoryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1547,6 +1717,26 @@ var StartedService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetGroupExpand",
 			Handler:    _StartedService_SetGroupExpand_Handler,
+		},
+		{
+			MethodName: "GetSmartStatus",
+			Handler:    _StartedService_GetSmartStatus_Handler,
+		},
+		{
+			MethodName: "GetSmartNetworks",
+			Handler:    _StartedService_GetSmartNetworks_Handler,
+		},
+		{
+			MethodName: "ExportSmartHistory",
+			Handler:    _StartedService_ExportSmartHistory_Handler,
+		},
+		{
+			MethodName: "ImportSmartHistory",
+			Handler:    _StartedService_ImportSmartHistory_Handler,
+		},
+		{
+			MethodName: "ResetSmartHistory",
+			Handler:    _StartedService_ResetSmartHistory_Handler,
 		},
 		{
 			MethodName: "CloseConnection",

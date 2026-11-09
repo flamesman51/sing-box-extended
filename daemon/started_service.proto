@@ -22,6 +22,12 @@ service StartedService {
   rpc SelectOutbound(SelectOutboundRequest) returns (google.protobuf.Empty) {}
   rpc SetGroupExpand(SetGroupExpandRequest) returns (google.protobuf.Empty) {}
 
+  rpc GetSmartStatus(GetSmartStatusRequest) returns (GetSmartStatusResponse) {}
+  rpc GetSmartNetworks(GetSmartNetworksRequest) returns (GetSmartNetworksResponse) {}
+  rpc ExportSmartHistory(ExportSmartHistoryRequest) returns (ExportSmartHistoryResponse) {}
+  rpc ImportSmartHistory(ImportSmartHistoryRequest) returns (ImportSmartHistoryResponse) {}
+  rpc ResetSmartHistory(ResetSmartHistoryRequest) returns (google.protobuf.Empty) {}
+
   rpc SubscribeConnections(SubscribeConnectionsRequest) returns(stream ConnectionEvents) {}
   rpc CloseConnection(CloseConnectionRequest) returns(google.protobuf.Empty) {}
   rpc CloseAllConnections(google.protobuf.Empty) returns(google.protobuf.Empty) {}
@@ -143,6 +149,43 @@ message SelectOutboundRequest {
 message SetGroupExpandRequest {
   string groupTag = 1;
   bool isExpand = 2;
+}
+
+message GetSmartStatusRequest {
+  string tag = 1;
+}
+
+message GetSmartStatusResponse {
+  string json = 1;
+}
+
+message GetSmartNetworksRequest {
+  string tag = 1;
+}
+
+message GetSmartNetworksResponse {
+  string json = 1;
+}
+
+message ExportSmartHistoryRequest {
+  bool raw = 1;
+}
+
+message ExportSmartHistoryResponse {
+  string json = 1;
+}
+
+message ImportSmartHistoryRequest {
+  string data = 1;
+  double trust = 2;
+}
+
+message ImportSmartHistoryResponse {
+  string json = 1;
+}
+
+message ResetSmartHistoryRequest {
+  string tag = 1;
 }
 
 message ClashMode {
