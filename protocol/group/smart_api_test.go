@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 type smartTestManager struct {
@@ -130,20 +131,42 @@ func TestSmartImprovementNeedsDistinctObservationsAndDwell(t *testing.T) {
 	}
 }
 
+type smartHistorySave struct {
+	data []byte
+	err  error
+}
+
 type smartBlockingHistoryCache struct {
 	adapter.CacheFile
 	mu               sync.Mutex
 	started, release chan struct{}
+	startOnce        sync.Once
+	completed        chan smartHistorySave
 	data             []byte
+	writes, failures int
 }
 
 func (c *smartBlockingHistoryCache) SaveSmartHistory(_ string, history *adapter.SmartHistory) error {
-	close(c.started)
-	<-c.release
+	if c.started != nil {
+		c.startOnce.Do(func() { close(c.started) })
+	}
+	if c.release != nil {
+		<-c.release
+	}
 	c.mu.Lock()
-	c.data = append([]byte(nil), history.Data...)
+	c.writes++
+	var err error
+	if c.failures > 0 {
+		c.failures--
+		err = errors.New("history write failed")
+	} else {
+		c.data = append([]byte(nil), history.Data...)
+	}
 	c.mu.Unlock()
-	return nil
+	if c.completed != nil {
+		c.completed <- smartHistorySave{data: history.Data, err: err}
+	}
+	return err
 }
 
 func (c *smartBlockingHistoryCache) ResetSmartHistory(string) error {
@@ -153,32 +176,281 @@ func (c *smartBlockingHistoryCache) ResetSmartHistory(string) error {
 	return nil
 }
 
+func smartAwaitHistorySave(t *testing.T, s *Smart, cache *smartBlockingHistoryCache) smartHistorySave {
+	t.Helper()
+	select {
+	case saved := <-cache.completed:
+		s.persistenceMu.Lock()
+		s.persistenceMu.Unlock()
+		return saved
+	case <-time.After(2 * time.Second):
+		t.Fatal("history persistence did not finish")
+		return smartHistorySave{}
+	}
+}
+
 func TestSmartResetCannotBeOverwrittenByPendingSave(t *testing.T) {
-	s, _ := smartTestGroup()
+	s, clock := smartTestGroup()
 	cache := &smartBlockingHistoryCache{started: make(chan struct{}), release: make(chan struct{})}
 	s.cache = cache
-	s.dirty = true
-	saved := make(chan struct{})
-	go func() { s.flushHistory(true); close(saved) }()
-	<-cache.started
+	s.recordObservationLocked(s.primary, true, time.Millisecond, clock.Now())
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(cache.release) }) }
+	t.Cleanup(func() { unblock(); _ = s.Close() })
+	s.requestHistoryFlush()
+	select {
+	case <-cache.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("history save did not start")
+	}
+	clock.Advance(time.Minute)
+	s.mu.Lock()
+	s.eventLocked("switch", "a", "b", "wifi", "pending history before reset", clock.Now())
+	s.mu.Unlock()
+	s.requestHistoryFlush()
 	reset := make(chan error, 1)
 	go func() { reset <- SmartReset(context.Background(), smartTestManager{values: []adapter.Outbound{s}}, "") }()
 	select {
 	case err := <-reset:
-		close(cache.release)
-		<-saved
 		t.Fatalf("reset passed in-flight save: %v", err)
 	case <-time.After(10 * time.Millisecond):
 	}
-	close(cache.release)
-	<-saved
-	if err := <-reset; err != nil {
+	unblock()
+	select {
+	case err := <-reset:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reset did not finish after persistence resumed")
+	}
+	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	if cache.data != nil {
-		t.Fatal("old history survived reset")
+	data := append([]byte(nil), cache.data...)
+	cache.mu.Unlock()
+	history, err := decodeSmartHistory(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Stats) != 0 || len(history.Events) != 1 || history.Events[0].Kind != "reset" {
+		t.Fatal("a pending or in-flight snapshot overwrote reset")
+	}
+}
+
+func TestSmartBlockedHistoryPersistenceDoesNotBlockOwner(t *testing.T) {
+	s, clock := smartTestGroup()
+	started := clock.Now()
+	cache := &smartBlockingHistoryCache{
+		started: make(chan struct{}), release: make(chan struct{}),
+		completed: make(chan smartHistorySave, 4),
+	}
+	s.cache = cache
+	primary, standby := s.primary, s.standby
+	s.timeout, s.udpEnabled, s.generationSucceeded = 8*time.Second, false, true
+	s.lastDirect, s.lastFullRound, s.lastNetworkRead = started, started, started.Add(time.Hour)
+	s.recordObservationLocked(primary, true, 80*time.Millisecond, started)
+	calls := make(chan smartProbeCall, 16)
+	for _, member := range s.members {
+		member.lastProbe = started
+		member.outbound = &smartTimedOutbound{
+			smartFakeOutbound: smartFakeOutbound{tag: member.tag}, clock: clock, calls: calls,
+			delay: 8 * time.Second, blackhole: member == primary,
+		}
+	}
+	smartStartTestOwner(t, s, clock)
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(cache.release) }) }
+	t.Cleanup(unblock)
+	select {
+	case <-cache.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("history save did not start")
+	}
+	selected := make(chan error, 1)
+	go func() {
+		decision, err := s.SelectMember(context.Background(), "tcp", M.Socksaddr{})
+		if err == nil && decision.Outbound() != primary.outbound {
+			err = errors.New("unexpected primary while persistence is blocked")
+		}
+		selected <- err
+	}()
+	select {
+	case err := <-selected:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("selection waited for history persistence")
+	}
+	clock.Advance(15 * time.Second)
+	s.request("demand")
+	smartAwaitProbe(t, calls, "a", 1)
+	clock.Advance(8 * time.Second)
+	s.request("demand")
+	confirmed := make(map[string]bool)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for len(confirmed) < 2 {
+		select {
+		case call := <-calls:
+			if call.operator == 2 && (call.tag == "a" || call.tag == "b") {
+				confirmed[call.tag] = true
+			}
+		case <-deadline.C:
+			t.Fatal("completed primary failure did not schedule confirmation and standby validation")
+		}
+	}
+	clock.Advance(8 * time.Second)
+	s.request("demand")
+	smartAwaitGroup(t, s, clock, func() bool {
+		return primary.state == "quarantined" && s.primary == standby && standby.lastOK.Equal(clock.Now())
+	})
+	decision, err := s.SelectMember(context.Background(), "tcp", M.Socksaddr{})
+	if err != nil || decision.Outbound() != standby.outbound {
+		t.Fatalf("completed failure did not remove the dead primary: %v", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("close did not wait for blocked persistence: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not finish after persistence resumed")
+	}
+	first := smartAwaitHistorySave(t, s, cache)
+	latest := smartAwaitHistorySave(t, s, cache)
+	oldHistory, err := decodeSmartHistory(first.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := decodeSmartHistory(latest.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.mu.Lock()
+	writes := cache.writes
+	cache.mu.Unlock()
+	if first.err != nil || latest.err != nil || writes != 2 {
+		t.Fatalf("shutdown must write one final snapshot: writes=%d errors=%v, %v", writes, first.err, latest.err)
+	}
+	if !oldHistory.Stats["wifi"][primary.identity].LastSuccess || history.Stats["wifi"][primary.identity].LastSuccess {
+		t.Fatal("shutdown did not preserve updates made during the blocked write")
+	}
+	if len(history.Events) == 0 || history.Events[len(history.Events)-1].Kind != "failover" {
+		t.Fatal("shutdown did not persist the latest owner events")
+	}
+}
+
+func TestSmartHistoryPersistenceRetriesDirtyWritesAfterDebounce(t *testing.T) {
+	s, clock := smartTestGroup()
+	cache := &smartBlockingHistoryCache{failures: 1, completed: make(chan smartHistorySave, 4)}
+	s.cache = cache
+	s.recordObservationLocked(s.primary, true, time.Millisecond, clock.Now())
+	t.Cleanup(func() { _ = s.Close() })
+	s.requestHistoryFlush()
+	if saved := smartAwaitHistorySave(t, s, cache); saved.err == nil {
+		t.Fatal("write failure was not exercised")
+	}
+	s.mu.Lock()
+	dirty := s.dirty
+	s.eventLocked("recover", "", "a", "wifi", "updated after failed write", clock.Now())
+	s.mu.Unlock()
+	if !dirty {
+		t.Fatal("failed write lost the dirty history")
+	}
+	clock.Advance(59 * time.Second)
+	for range 10 {
+		s.requestHistoryFlush()
+	}
+	cache.mu.Lock()
+	writes := cache.writes
+	cache.mu.Unlock()
+	if writes != 1 {
+		t.Fatal("failed history writes bypassed the one-minute debounce")
+	}
+	clock.Advance(time.Second)
+	s.requestHistoryFlush()
+	saved := smartAwaitHistorySave(t, s, cache)
+	if saved.err != nil {
+		t.Fatal(saved.err)
+	}
+	history, err := decodeSmartHistory(saved.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	dirty = s.dirty
+	s.mu.Unlock()
+	if dirty || len(history.Events) != 1 || history.Events[0].Reason != "updated after failed write" {
+		t.Fatal("retry did not persist the latest dirty history")
+	}
+}
+
+func TestSmartHistoryPersistenceSnapshotIsDeep(t *testing.T) {
+	s, clock := smartTestGroup()
+	s.recordObservationLocked(s.primary, true, time.Millisecond, clock.Now())
+	s.eventLocked("switch", "a", "b", "wifi", "snapshot", clock.Now())
+	statistic := s.history.Stats["wifi"]["a"]
+	statistic.Flaps = []int64{clock.Now().Unix()}
+	s.history.Labels["wifi"] = "original"
+	before, err := json.Marshal(s.history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := cloneSmartHistory(s.history)
+	s.history.Networks["wifi"].Label = "changed"
+	s.history.Labels["wifi"] = "changed"
+	s.history.IdentityServers["a"] = "changed"
+	statistic.W++
+	statistic.RTTs[0]++
+	statistic.Flaps[0]++
+	statistic.Hours[0][0]++
+	s.history.Timeline["wifi"]["a"][0].RTT++
+	*s.history.Events[0].From = "changed"
+	*s.history.Events[0].To = "changed"
+	*s.history.Events[0].Network = "changed"
+	s.history.recency["wifi"]++
+	s.history.sequence++
+	after, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) || snapshot.recency["wifi"] == s.history.recency["wifi"] || snapshot.sequence == s.history.sequence {
+		t.Fatal("history snapshot shares mutable state")
+	}
+}
+
+func TestSmartHistoryPersistenceBoundsOnlySnapshot(t *testing.T) {
+	s, clock := smartTestGroup()
+	cache := &smartBlockingHistoryCache{completed: make(chan smartHistorySave, 2)}
+	s.cache = cache
+	s.recordObservationLocked(s.primary, true, time.Millisecond, clock.Now())
+	s.eventLocked("switch", "a", "b", "wifi", strings.Repeat("x", smartHistoryMaxBytes), clock.Now())
+	t.Cleanup(func() { _ = s.Close() })
+	s.requestHistoryFlush()
+	saved := smartAwaitHistorySave(t, s, cache)
+	if saved.err != nil || len(saved.data) > smartHistoryMaxBytes {
+		t.Fatalf("persisted snapshot exceeded the history bound: bytes=%d error=%v", len(saved.data), saved.err)
+	}
+	history, err := decodeSmartHistory(saved.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	events := len(s.history.Events)
+	s.mu.Unlock()
+	if events != 1 || len(history.Events) != 0 || len(history.Stats) != 1 {
+		t.Fatal("serialization eviction mutated live history or discarded bounded statistics")
 	}
 }
 

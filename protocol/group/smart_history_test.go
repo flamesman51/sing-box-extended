@@ -38,12 +38,69 @@ func TestSmartHistoryObservationTimeGolden(t *testing.T) {
 	if math.Abs(statistic.W-1.3983967791713545) > 1e-12 || math.Abs(statistic.S-0.9983967791713544) > 1e-12 {
 		t.Fatalf("pause sums = %.15f, %.15f", statistic.S, statistic.W)
 	}
-	history.Observe(path, "member", true, 120, start.Add(24*time.Hour), 0)
+	history.Observe(path, "member", true, 120, start.Add(24*time.Hour), 8*time.Minute)
 	if math.Abs(statistic.W-2.1116905445988845) > 1e-12 || math.Abs(statistic.S-1.7937005259840997) > 1e-12 {
 		t.Fatalf("idle gap did not cap observation weight: %v", statistic.W)
 	}
 	if len(statistic.Flaps) != 2 || len(statistic.RTTs) != 2 {
 		t.Fatalf("flaps/RTTs = %v/%v", statistic.Flaps, statistic.RTTs)
+	}
+}
+
+func TestSmartHistoryPauseExclusionSurvivesNetworkChanges(t *testing.T) {
+	s, clock := smartTestGroup()
+	member := s.primary
+	start := clock.now
+	wifi := smartNetwork{
+		Key: "wifi/bssid:0123456789abcdef", Type: "wifi",
+		Path: []string{"wifi/bssid:0123456789abcdef", "wifi/ssid:fedcba9876543210", "wifi"}, Link: true,
+	}
+	s.network = wifi
+	s.pausedTotal = 2 * time.Minute
+	s.recordObservationLocked(member, true, 100*time.Millisecond, clock.now)
+
+	s.pausedTotal += 8 * time.Minute
+	clock.Advance(8 * time.Minute)
+	s.network = smartNetwork{Key: "cell/25001/LTE", Type: "cellular", Path: []string{"cell/25001/LTE", "cell/25001", "cell"}, Link: true}
+	s.recordObservationLocked(member, true, 100*time.Millisecond, clock.now)
+	for _, key := range s.network.Path {
+		if weight := s.history.Stats[key][member.identity].W; weight != 1 {
+			t.Fatalf("first observation on %s has weight %v; want 1", key, weight)
+		}
+	}
+
+	clock.Advance(2 * time.Minute)
+	s.network = wifi
+	s.recordObservationLocked(member, false, 0, clock.now)
+	for _, key := range wifi.Path {
+		statistic := s.history.Stats[key][member.identity]
+		if math.Abs(statistic.W-1.3983967791713545) > 1e-12 || math.Abs(statistic.S-0.9983967791713544) > 1e-12 {
+			t.Fatalf("%s pause sums = %.15f, %.15f; want 1.3983967791713545, 0.9983967791713544", key, statistic.W, statistic.S)
+		}
+	}
+	if clock.now.Sub(start) != 10*time.Minute {
+		t.Fatal("test did not include the eight-minute pause and two observed minutes")
+	}
+}
+
+func TestSmartHistoryPauseBaselineBelongsToEachHierarchyLevel(t *testing.T) {
+	start := time.Unix(1_800_000_000, 0)
+	history := newSmartHistory()
+	first := []string{"wifi/bssid:0123456789abcdef", "wifi/ssid:fedcba9876543210", "wifi"}
+	second := []string{"wifi/bssid:123456789abcdef0", first[1], "wifi"}
+	history.Observe(first, "member", true, 100, start, 0)
+	history.Observe(second, "member", true, 100, start.Add(9*time.Minute), 8*time.Minute)
+	history.Observe(first, "member", false, 0, start.Add(10*time.Minute), 8*time.Minute)
+	child := history.Stats[first[0]]["member"]
+	if math.Abs(child.W-1.3983967791713545) > 1e-12 {
+		t.Fatalf("returning BSSID weight = %.15f; want 1.3983967791713545", child.W)
+	}
+	for _, key := range first[1:] {
+		statistic := history.Stats[key]["member"]
+		expectedSuccess := math.Exp2(-10.0/4320) + 0.2*math.Exp2(-1.0/4320)
+		if math.Abs(statistic.S-expectedSuccess) > 1e-12 || math.Abs(statistic.W-expectedSuccess-0.2) > 1e-12 {
+			t.Fatalf("%s parent sums = %.15f, %.15f; want %.15f, %.15f", key, statistic.S, statistic.W, expectedSuccess, expectedSuccess+0.2)
+		}
 	}
 }
 

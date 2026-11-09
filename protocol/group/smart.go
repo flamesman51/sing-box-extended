@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -96,7 +98,6 @@ type smartMember struct {
 	throughput                                                                smartThroughput
 	inflight                                                                  bool
 	queued                                                                    map[string]bool
-	pauseAtResult                                                             time.Duration
 	improvementAt                                                             time.Time
 	improvementObservations                                                   int
 	improvementSignature                                                      int
@@ -149,6 +150,7 @@ type Smart struct {
 	options                                                                              option.SmartOutboundOptions
 	mu                                                                                   sync.Mutex
 	persistenceMu                                                                        sync.Mutex
+	persistenceKick, persistenceStop, persistenceDone                                    chan struct{}
 	members                                                                              []*smartMember
 	primary, standby                                                                     *smartMember
 	generation, configGeneration, selectionGeneration, memberGeneration                  uint64
@@ -305,7 +307,7 @@ func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 		if s.cache != nil {
 			stored, err := s.cache.LoadSmartHistory(s.Tag())
-			if err != nil {
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 			if stored != nil {
@@ -814,7 +816,7 @@ func (s *Smart) loop(ctx context.Context) {
 		for _, closer := range closers {
 			_ = closer.Close()
 		}
-		s.flushHistory(false)
+		s.requestHistoryFlush()
 		var timer smartTimer
 		var timerC <-chan time.Time
 		if !paused {
@@ -1410,9 +1412,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 
 func (s *Smart) recordObservationLocked(member *smartMember, success bool, rtt time.Duration, now time.Time) {
 	s.history.IdentityServers[member.identity] = member.serverIdentity
-	paused := s.pausedTotal - member.pauseAtResult
-	s.history.Observe(s.network.Path, member.identity, success, rtt.Seconds()*1000, s.historyTime(now), paused)
-	member.pauseAtResult = s.pausedTotal
+	s.history.Observe(s.network.Path, member.identity, success, rtt.Seconds()*1000, s.historyTime(now), s.pausedTotal)
 	for index, key := range s.network.Path {
 		label := s.network.Labels[key]
 		parent := ""
@@ -1749,6 +1749,86 @@ func (s *Smart) updateNotificationLocked(now time.Time) {
 	}
 }
 
+func cloneSmartHistory(history *smartHistory) *smartHistory {
+	snapshot := *history
+	snapshot.Networks = maps.Clone(history.Networks)
+	for key, network := range snapshot.Networks {
+		if network != nil {
+			value := *network
+			snapshot.Networks[key] = &value
+		}
+	}
+	snapshot.Stats = maps.Clone(history.Stats)
+	for key, statistics := range snapshot.Stats {
+		cloned := maps.Clone(statistics)
+		for identity, statistic := range cloned {
+			if statistic != nil {
+				value := *statistic
+				value.RTTs = slices.Clone(statistic.RTTs)
+				value.Flaps = slices.Clone(statistic.Flaps)
+				cloned[identity] = &value
+			}
+		}
+		snapshot.Stats[key] = cloned
+	}
+	snapshot.Events = slices.Clone(history.Events)
+	for index := range snapshot.Events {
+		event := &snapshot.Events[index]
+		for _, pointer := range []**string{&event.From, &event.To, &event.Network} {
+			if *pointer != nil {
+				value := **pointer
+				*pointer = &value
+			}
+		}
+	}
+	snapshot.Labels = maps.Clone(history.Labels)
+	snapshot.IdentityServers = maps.Clone(history.IdentityServers)
+	snapshot.recency = maps.Clone(history.recency)
+	snapshot.Timeline = maps.Clone(history.Timeline)
+	for key, members := range snapshot.Timeline {
+		cloned := maps.Clone(members)
+		for identity, points := range cloned {
+			cloned[identity] = slices.Clone(points)
+		}
+		snapshot.Timeline[key] = cloned
+	}
+	return &snapshot
+}
+
+func (s *Smart) startHistoryPersistenceLocked() {
+	if s.persistenceDone != nil {
+		return
+	}
+	s.persistenceKick = make(chan struct{}, 1)
+	s.persistenceStop = make(chan struct{})
+	s.persistenceDone = make(chan struct{})
+	go func() {
+		defer close(s.persistenceDone)
+		for {
+			select {
+			case <-s.persistenceStop:
+				s.flushHistory(true)
+				return
+			case <-s.persistenceKick:
+				s.flushHistory(false)
+			}
+		}
+	}()
+}
+
+func (s *Smart) requestHistoryFlush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache == nil || s.closed || !s.dirty || s.clock.Now().Sub(s.lastWrite) < time.Minute {
+		return
+	}
+	s.startHistoryPersistenceLocked()
+	select {
+	case s.persistenceKick <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Smart) flushHistory(force bool) {
 	if s.cache == nil {
 		return
@@ -1761,12 +1841,11 @@ func (s *Smart) flushHistory(force bool) {
 		s.mu.Unlock()
 		return
 	}
-	data, err := s.history.Encode()
-	if err == nil {
-		s.dirty = false
-		s.lastWrite = now
-	}
+	snapshot := cloneSmartHistory(s.history)
+	s.dirty = false
+	s.lastWrite = now
 	s.mu.Unlock()
+	data, err := snapshot.Encode()
 	if err == nil {
 		err = s.cache.SaveSmartHistory(s.Tag(), &adapter.SmartHistory{Data: data})
 	}
@@ -1872,7 +1951,16 @@ func (s *Smart) Close() error {
 		provider.UnregisterCallback(callback)
 	}
 	s.workers.Wait()
-	s.flushHistory(true)
+	s.mu.Lock()
+	if s.cache != nil {
+		s.startHistoryPersistenceLocked()
+		close(s.persistenceStop)
+	}
+	persistenceDone := s.persistenceDone
+	s.mu.Unlock()
+	if persistenceDone != nil {
+		<-persistenceDone
+	}
 	if s.ledger != nil {
 		s.ledger.Unregister(s.Tag())
 	}

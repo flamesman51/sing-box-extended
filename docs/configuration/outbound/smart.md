@@ -156,9 +156,13 @@ Reservations are persisted before testing, reconciled afterward, and charged in 
 
 Active speed results last `24h`. A passive result needs a busy window of at least `10s`, proves only a lower bound on achieved speed, and lasts `6h`; a newer active result supersedes older passive observations. Expired results become unknown.
 
+If a completed test's accounting write fails, its durable reservation remains charged as reserved space. Smart retries the pending reconciliation before admitting another test; a temporary storage failure does not require a restart.
+
 ### History, privacy, and backup
 
 Learned history is scoped to the cache ID. Installation metadata is **not**: the installation ID, HMAC seed, direct-list seed, budget ledger, reservations, and import lineage share one installation-wide metadata bucket across profiles and cache IDs. Changing cache ID or resetting history does not reset daily usage or create a new installation identity. **A different `cache_file.path` is treated as a different installation**, which is a storage-path limitation.
+
+An absent Smart metadata or history document initializes empty first-run state. Other cache read errors still fail startup rather than silently discarding stored data.
 
 Network keys always store Wi-Fi SSIDs/BSSIDs and detailed location components as per-install HMAC-SHA256 hashes, using the first `16` hexadecimal characters. MCC, MNC, and radio technology are not hashed. Clear labels are stored separately for local display and explicitly requested raw exports. The default export is redacted. Raw exports can reveal network names and location-related identifiers; share them only with people you trust. Hashing is pseudonymization, not removal of every identifying fact: carrier, radio, interface, and server statistics remain.
 
@@ -166,10 +170,10 @@ Local member identities include the outbound configuration and local public-key 
 
 Configured fingerprints belong to each outbound or endpoint instance. Reloading or checking configurations does not keep closed instances alive in the constructor registries. A `parser` member uses the parsed concrete outbound's identity rather than the link wrapper's identity.
 
-Each network also learns six local-time, four-hour buckets. A bucket influences stability only after at least `24` weight units of its own observations and can shift the stability class by at most one step. One weight unit is five minutes of observed time; pauses do not contribute. Statistics decay with a three-day half-life and shrink toward broader network levels until enough local evidence is available.
+Each network also learns six local-time, four-hour buckets. A bucket influences stability only after at least `24` weight units of its own observations and can shift the stability class by at most one step. One weight unit is five minutes of observed time; pauses do not contribute. Pause exclusion keeps a separate baseline for every network key and member identity, including each hierarchy level, so changing networks cannot consume another key's paused time. Statistics decay with a three-day half-life and shrink toward broader network levels until enough local evidence is available.
 
 Fresh cellular location data adds a hashed tower key below carrier and radio technology. Tower changes affect history attribution only, not network generation or live health. Tower data older than `120s`, or missing after permission revocation, falls back to a coarser key.
 
 History reset clears learned statistics, events, timeline, and imported priors for the selected group while keeping live health and installation metadata. Android backup does not restore live Smart health; export/import is a statistics exchange, not a running VPN-state backup.
 
-Stored history is bounded: at most `48` network keys, `32` identities per key, `500` events per group, and `1 MiB` serialized history. Writes are debounced to at most once per minute. The cache uses bbolt, which reuses freed pages but does not shrink its file after eviction or reset. Expect a high-water file size of a few MiB; automatic compaction is not performed.
+Stored history is bounded: at most `48` network keys, `32` identities per key, `500` events per group, and `1 MiB` serialized history. A dedicated persistence worker serializes consistent snapshots and writes at most once per minute without waiting in the health owner loop or holding its state lock during serialization or disk writes. Reset is ordered against pending writes; shutdown waits for a final flush. The cache uses bbolt, which reuses freed pages but does not shrink its file after eviction or reset. Expect a high-water file size of a few MiB; automatic compaction is not performed.

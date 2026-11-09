@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -57,11 +58,18 @@ type smartReservation struct {
 	Bytes       int64  `json:"bytes"`
 }
 
+type smartReconciliation struct {
+	id        string
+	bytes     int64
+	uncertain bool
+}
+
 type smartLedger struct {
 	mu           sync.Mutex
 	cache        adapter.CacheFile
 	installation smartInstallation
 	state        smartLedgerState
+	pending      smartReconciliation
 	raw          map[string]json.RawMessage
 	limits       map[string]map[string]float64
 }
@@ -80,7 +88,7 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 	ledger := &smartLedger{cache: cache, limits: make(map[string]map[string]float64), raw: make(map[string]json.RawMessage)}
 	if cache != nil {
 		metadata, err := cache.LoadSmartMetadata()
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 		if metadata != nil && len(metadata.Data) != 0 {
@@ -211,6 +219,9 @@ func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.
 	if l.cache == nil {
 		return "", 0, errSmartTestsDisabled
 	}
+	if err := l.reconcileLocked(); err != nil {
+		return "", 0, err
+	}
 	if len(l.state.Reservations) != 0 {
 		return "", 0, errSmartTestBusy
 	}
@@ -256,17 +267,27 @@ func (l *smartLedger) Reconcile(id string, bytes int64, uncertain bool) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	reservation, exists := l.state.Reservations[id]
-	if !exists {
+	if _, exists := l.state.Reservations[id]; !exists {
 		return errors.New("unknown smart reservation")
 	}
+	if l.pending.id == "" {
+		l.pending = smartReconciliation{id: id, bytes: bytes, uncertain: uncertain}
+	}
+	return l.reconcileLocked()
+}
+
+func (l *smartLedger) reconcileLocked() error {
+	if l.pending.id == "" {
+		return nil
+	}
+	reservation := l.state.Reservations[l.pending.id]
 	before := l.cloneStateLocked()
-	delete(l.state.Reservations, id)
-	if uncertain {
+	delete(l.state.Reservations, l.pending.id)
+	if l.pending.uncertain {
 		reservation.NetworkType = "cellular"
 	}
 	key := reservation.NetworkType + "/" + reservation.Day
-	l.state.Days[key] += bytes
+	l.state.Days[key] += l.pending.bytes
 	if l.state.Latest[reservation.NetworkType] < reservation.Day {
 		l.state.Latest[reservation.NetworkType] = reservation.Day
 	}
@@ -274,6 +295,7 @@ func (l *smartLedger) Reconcile(id string, bytes int64, uncertain bool) error {
 		l.state = before
 		return err
 	}
+	l.pending = smartReconciliation{}
 	return nil
 }
 

@@ -68,6 +68,7 @@ type smartStatistic struct {
 	Flaps         []int64       `json:"flaps,omitempty"`
 	HasResult     bool          `json:"has_result,omitempty"`
 	LastSuccess   bool          `json:"last_success,omitempty"`
+	pauseAtResult time.Duration
 }
 
 type smartEvent struct {
@@ -236,7 +237,8 @@ func smartEvictIdentity(statistics map[string]*smartStatistic) string {
 	return oldest
 }
 
-func (h *smartHistory) Observe(path []string, identity string, success bool, rtt float64, now time.Time, paused time.Duration) {
+// Observe receives the group's cumulative paused time; each key keeps its own baseline.
+func (h *smartHistory) Observe(path []string, identity string, success bool, rtt float64, now time.Time, pausedTotal time.Duration) {
 	for index, key := range path {
 		if key == "" || slices.Contains(path[:index], key) {
 			continue
@@ -245,7 +247,8 @@ func (h *smartHistory) Observe(path []string, identity string, success bool, rtt
 		h.Networks[key].LastSeen = max(h.Networks[key].LastSeen, now.Unix())
 		weight := 1.0
 		if statistic.HasResult || statistic.LastResult != 0 {
-			elapsed := now.Sub(time.Unix(statistic.LastResult, 0)) - max(paused, 0)
+			paused := max(pausedTotal-statistic.pauseAtResult, 0)
+			elapsed := now.Sub(time.Unix(statistic.LastResult, 0)) - paused
 			weight = min(max(elapsed.Seconds(), 0), 300) / 300
 			if statistic.LastSuccess != success {
 				statistic.Flaps = append(statistic.Flaps, now.Unix())
@@ -265,6 +268,7 @@ func (h *smartHistory) Observe(path []string, identity string, success bool, rtt
 		statistic.LastResult = max(statistic.LastResult, now.Unix())
 		statistic.HasResult = true
 		statistic.LastSuccess = success
+		statistic.pauseAtResult = pausedTotal
 		h.observeTimeline(key, identity, success, rtt, weight, now)
 		smartObserveHour(statistic, success, weight, now)
 	}
