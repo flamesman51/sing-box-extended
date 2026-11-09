@@ -3,9 +3,11 @@ package group
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -49,19 +51,23 @@ func smartFind(outbounds adapter.OutboundManager, tag string) (*Smart, error) {
 	}
 	return nil, ErrSmartNotFound
 }
+
 func smartJSON(value any) (string, error) { data, err := json.Marshal(value); return string(data), err }
+
 func smartNullable(value string) any {
 	if value == "" {
 		return nil
 	}
 	return value
 }
+
 func smartTime(value time.Time) any {
 	if value.IsZero() {
 		return nil
 	}
 	return value.Unix()
 }
+
 func smartNumber(value float64) any {
 	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return nil
@@ -219,6 +225,18 @@ func SmartNetworks(_ context.Context, outbounds adapter.OutboundManager, tag str
 	})
 	for _, key := range keys {
 		network := s.history.Networks[key]
+		path := []string{key}
+		for parent := network.Parent; parent != "" && len(path) < 8 && !slices.Contains(path, parent); {
+			path = append(path, parent)
+			next := s.history.Networks[parent]
+			if next == nil {
+				break
+			}
+			parent = next.Parent
+		}
+		if len(path) == 1 {
+			path = smartNetworkPath(key)
+		}
 		members := make([]map[string]any, 0, len(s.members))
 		totalWeight := 0.0
 		for _, member := range s.members {
@@ -226,7 +244,7 @@ func SmartNetworks(_ context.Context, outbounds adapter.OutboundManager, tag str
 			if stat == nil {
 				stat = &smartStatistic{}
 			}
-			p, w := s.history.Estimate(smartNetworkPath(key), member.identity, member.serverIdentity, now, priors)
+			p, w := s.history.Estimate(path, member.identity, member.serverIdentity, now, priors)
 			totalWeight += w
 			rtt, _ := smartRTTs(stat.RTTs)
 			members = append(members, map[string]any{"tag": member.tag, "stability": p, "weight": w, "download_mbps": smartNumber(stat.Download), "rtt_ms": rtt})
@@ -275,10 +293,7 @@ func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool)
 		}
 		group := smartExportGroup{Networks: make(map[string]smartExportNetwork), Stats: make([]smartExportStatistic, 0)}
 		if raw {
-			group.Labels = make(map[string]string)
-			for key, label := range s.history.Labels {
-				group.Labels[key] = label
-			}
+			group.Labels = maps.Clone(s.history.Labels)
 		}
 		for key, network := range s.history.Networks {
 			var label *string
@@ -320,8 +335,9 @@ func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool)
 					record.ThroughputAt = &value
 				}
 				for hour := range 6 {
-					record.Hours[hour][0] += stat.Hours[hour][0]
-					record.Hours[hour][1] += stat.Hours[hour][1]
+					decay := smartDecay(stat.HourUpdatedAt[hour], now)
+					record.Hours[hour][0] += stat.Hours[hour][0] * decay
+					record.Hours[hour][1] += stat.Hours[hour][1] * decay
 				}
 			}
 			for _, record := range merged {
@@ -359,7 +375,11 @@ type smartImportReport struct {
 	Replaced        bool                 `json:"replaced_previous_import"`
 }
 
+var smartMutationAccess sync.Mutex
+
 func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data string, trust float64) (string, error) {
+	smartMutationAccess.Lock()
+	defer smartMutationAccess.Unlock()
 	if len(data) > 2*1024*1024 {
 		return "", ErrSmartTooLarge
 	}
@@ -391,10 +411,15 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 		same := document.InstallID == s.installID
 		var incoming []smartPrior
 		applied := make(map[string]*smartImportApplied)
+		importedNetworks := make(map[string]*smartHistoryNetwork)
 		for _, sourceGroup := range document.Groups {
 			for _, record := range sourceGroup.Stats {
 				if !smartImportNetworkAllowed(record.Network, same) {
-					report.Ignored = append(report.Ignored, smartImportIgnored{record.Network, "foreign_redacted_key"})
+					reason := "invalid"
+					if !same && (strings.Contains(record.Network, "/bssid:") || strings.Contains(record.Network, "/ssid:") || strings.Contains(record.Network, "/tower:")) {
+						reason = "foreign_redacted_key"
+					}
+					report.Ignored = append(report.Ignored, smartImportIgnored{record.Network, reason})
 					continue
 				}
 				if !known[record.ServerIdentity] {
@@ -421,6 +446,21 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 					continue
 				}
 				incoming = append(incoming, prior)
+				sourceNetwork := sourceGroup.Networks[record.Network]
+				network := &smartHistoryNetwork{Type: sourceNetwork.Type, LastSeen: min(sourceNetwork.LastSeen, now.Unix())}
+				if sourceNetwork.Carrier != nil {
+					network.Carrier = *sourceNetwork.Carrier
+				}
+				if sourceNetwork.Radio != nil {
+					network.Radio = *sourceNetwork.Radio
+				}
+				if !document.Redacted {
+					network.Label = sourceGroup.Labels[record.Network]
+					if network.Label == "" && sourceNetwork.Label != nil {
+						network.Label = *sourceNetwork.Label
+					}
+				}
+				importedNetworks[record.Network] = network
 				entry := applied[record.Network]
 				if entry == nil {
 					entry = &smartImportApplied{Network: record.Network, MappedTo: record.Network}
@@ -442,6 +482,15 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 		}
 		s.mu.Lock()
 		s.priors = slices.Clone(priors)
+		for key, network := range importedNetworks {
+			if s.history.Networks[key] == nil {
+				s.history.touch(key, now)
+				s.history.Networks[key] = network
+			}
+			if network.Label != "" && s.history.Labels[key] == "" {
+				s.history.Labels[key] = network.Label
+			}
+		}
 		s.eventLocked("import", "", "", s.network.Key, "imported historical priors", now)
 		s.notifyUpdatedLocked()
 		s.mu.Unlock()
@@ -451,6 +500,8 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 }
 
 func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string) error {
+	smartMutationAccess.Lock()
+	defer smartMutationAccess.Unlock()
 	groups := smartGroups(outbounds)
 	if tag != "" {
 		group, err := smartFind(outbounds, tag)
@@ -465,8 +516,10 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 				return err
 			}
 		}
+		s.persistenceMu.Lock()
 		if s.cache != nil {
 			if err := s.cache.ResetSmartHistory(s.Tag()); err != nil {
+				s.persistenceMu.Unlock()
 				return err
 			}
 		}
@@ -479,6 +532,7 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 		s.eventLocked("reset", "", "", s.network.Key, "learned history reset; live health and budget retained", s.clock.Now())
 		s.notifyUpdatedLocked()
 		s.mu.Unlock()
+		s.persistenceMu.Unlock()
 	}
 	return nil
 }

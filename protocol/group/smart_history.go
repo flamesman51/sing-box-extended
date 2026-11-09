@@ -23,7 +23,6 @@ const (
 	smartHistoryMaxBytes      = 1 << 20
 	smartHistoryHalfLife      = 72 * time.Hour
 	smartHistoryShrinkage     = 6.0
-	smartHistoryHoursEnabled  = false
 )
 
 type smartHistory struct {
@@ -43,6 +42,7 @@ type smartHistoryNetwork struct {
 	Carrier  string `json:"carrier,omitempty"`
 	Radio    string `json:"radio,omitempty"`
 	LastSeen int64  `json:"last_seen"`
+	Parent   string `json:"parent,omitempty"`
 }
 
 type smartTimelinePoint struct {
@@ -266,16 +266,13 @@ func (h *smartHistory) Observe(path []string, identity string, success bool, rtt
 		statistic.HasResult = true
 		statistic.LastSuccess = success
 		h.observeTimeline(key, identity, success, rtt, weight, now)
-		if smartHistoryHoursEnabled {
-			smartObserveHour(statistic, success, weight, now)
-		}
+		smartObserveHour(statistic, success, weight, now)
 	}
 }
 
 func (h *smartHistory) Estimate(path []string, identity, serverIdentity string, now time.Time, priors []smartPrior) (probability, weight float64) {
 	probability = 0.9
-	for index := len(path) - 1; index >= 0; index-- {
-		key := path[index]
+	for index, key := range slices.Backward(path) {
 		if key == "" || slices.Contains(path[index+1:], key) {
 			continue
 		}
@@ -318,7 +315,7 @@ func smartStabilityClass(probability, weight float64) int {
 func (h *smartHistory) Class(path []string, identity, serverIdentity string, now time.Time, priors []smartPrior) int {
 	probability, weight := h.Estimate(path, identity, serverIdentity, now, priors)
 	class := smartStabilityClass(probability, weight)
-	if smartHistoryHoursEnabled && len(path) > 0 && h.Stats[path[0]][identity] != nil {
+	if len(path) > 0 && h.Stats[path[0]][identity] != nil {
 		statistic := h.Stats[path[0]][identity]
 		bucket := now.Hour() / 4
 		decay := smartDecay(statistic.HourUpdatedAt[bucket], now)

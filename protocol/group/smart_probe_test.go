@@ -131,6 +131,7 @@ func (p *smartProbeTestPacket) WriteTo(b []byte, _ net.Addr) (int, error) {
 	p.packets <- reply
 	return len(b), nil
 }
+
 func (p *smartProbeTestPacket) Close() error                     { p.once.Do(func() { close(p.done) }); return nil }
 func (p *smartProbeTestPacket) LocalAddr() net.Addr              { return &net.UDPAddr{} }
 func (p *smartProbeTestPacket) SetDeadline(time.Time) error      { return nil }

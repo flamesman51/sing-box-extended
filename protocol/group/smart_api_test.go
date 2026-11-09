@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,5 +127,92 @@ func TestSmartImprovementNeedsDistinctObservationsAndDwell(t *testing.T) {
 	s.chooseLocked(clock.now)
 	if s.primary != challenger {
 		t.Fatal("confirmed throughput improvement did not switch")
+	}
+}
+
+type smartBlockingHistoryCache struct {
+	adapter.CacheFile
+	mu               sync.Mutex
+	started, release chan struct{}
+	data             []byte
+}
+
+func (c *smartBlockingHistoryCache) SaveSmartHistory(_ string, history *adapter.SmartHistory) error {
+	close(c.started)
+	<-c.release
+	c.mu.Lock()
+	c.data = append([]byte(nil), history.Data...)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *smartBlockingHistoryCache) ResetSmartHistory(string) error {
+	c.mu.Lock()
+	c.data = nil
+	c.mu.Unlock()
+	return nil
+}
+
+func TestSmartResetCannotBeOverwrittenByPendingSave(t *testing.T) {
+	s, _ := smartTestGroup()
+	cache := &smartBlockingHistoryCache{started: make(chan struct{}), release: make(chan struct{})}
+	s.cache = cache
+	s.dirty = true
+	saved := make(chan struct{})
+	go func() { s.flushHistory(true); close(saved) }()
+	<-cache.started
+	reset := make(chan error, 1)
+	go func() { reset <- SmartReset(context.Background(), smartTestManager{values: []adapter.Outbound{s}}, "") }()
+	select {
+	case err := <-reset:
+		close(cache.release)
+		<-saved
+		t.Fatalf("reset passed in-flight save: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(cache.release)
+	<-saved
+	if err := <-reset; err != nil {
+		t.Fatal(err)
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.data != nil {
+		t.Fatal("old history survived reset")
+	}
+}
+
+func TestSmartImportedPriorsListNetworksWithoutLiveEvidence(t *testing.T) {
+	s, clock := smartTestGroup()
+	ledger, err := getSmartLedger(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ledger = ledger
+	s.installID, s.seed, s.directSeed = ledger.Installation()
+	label, carrier := "imported network", "carrier"
+	document := smartExportDocument{Version: 1, ExportedAt: clock.now.Unix(), InstallID: s.installID, Groups: map[string]smartExportGroup{
+		"source": {Networks: map[string]smartExportNetwork{"wifi": {Type: "wifi", Label: &label, Carrier: &carrier, LastSeen: clock.now.Unix()}}, Stats: []smartExportStatistic{{Network: "wifi", ServerIdentity: s.primary.serverIdentity, S: 9, W: 10}}},
+	}}
+	data, err := smartJSON(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := smartTestManager{values: []adapter.Outbound{s}}
+	if _, err = SmartImport(context.Background(), manager, data, .25); err != nil {
+		t.Fatal(err)
+	}
+	networks, err := SmartNetworks(context.Background(), manager, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(networks, label) || !strings.Contains(networks, carrier) || len(s.history.Stats) != 0 {
+		t.Fatalf("imported history projection: %s", networks)
+	}
+	if s.primary.state != "healthy" || s.primary.lastOK != clock.now {
+		t.Fatal("import touched live health")
+	}
+	if err = SmartReset(context.Background(), manager, ""); err != nil {
+		t.Fatal(err)
 	}
 }

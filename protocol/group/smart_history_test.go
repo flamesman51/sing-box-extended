@@ -271,3 +271,18 @@ func TestSmartHistoryRankingDoesNotCreateEvidenceOrEvict(t *testing.T) {
 		t.Fatal("ranking unknown members created or evicted learned history")
 	}
 }
+
+func TestSmartHistoryHourBucketChangesClassByOne(t *testing.T) {
+	history := newSmartHistory()
+	now := time.Date(2026, 11, 9, 1, 0, 0, 0, time.UTC)
+	stat := &smartStatistic{S: 99, W: 100, UpdatedAt: now.Unix()}
+	stat.Hours[0] = [2]float64{0, 24}
+	stat.HourUpdatedAt[0] = now.Unix()
+	history.Stats["wifi"] = map[string]*smartStatistic{"member": stat}
+	if class := history.Class([]string{"wifi"}, "member", "server", now, nil); class != 1 {
+		t.Fatalf("bad hour must move class A only to B, got %d", class)
+	}
+	if class := history.Class([]string{"wifi"}, "member", "server", now.Add(4*time.Hour), nil); class != 0 {
+		t.Fatalf("unobserved hour must retain class A, got %d", class)
+	}
+}

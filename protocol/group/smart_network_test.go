@@ -75,14 +75,10 @@ func TestSmartNetworkTowerOnlyChangesAttribution(t *testing.T) {
 	ctx := service.ContextWith[adapter.PlatformInterface](context.Background(), p)
 	ctx = service.ContextWith[adapter.NetworkManager](ctx, m)
 	base := smartReadNetwork(ctx, []byte("seed"), now)
-	if smartTowerAttributionEnabled {
-		if !strings.HasPrefix(base.Key, "cell/25001/LTE/tower:") {
-			t.Fatalf("stage 2 tower missing: %s", base.Key)
-		}
-		base.Key, base.Path = "cell/25001/LTE", base.Path[1:]
-	} else if base.Key != "cell/25001/LTE" {
-		t.Fatalf("stage 1 tower leaked: %s", base.Key)
+	if !strings.HasPrefix(base.Key, "cell/25001/LTE/tower:") {
+		t.Fatalf("tower attribution missing: %s", base.Key)
 	}
+	base.Key, base.Path = "cell/25001/LTE", base.Path[1:]
 	first := smartNetworkWithTower(base, []byte("seed"), p.cell, now)
 	p.cell.CellID = "21"
 	second := smartNetworkWithTower(base, []byte("seed"), p.cell, now)

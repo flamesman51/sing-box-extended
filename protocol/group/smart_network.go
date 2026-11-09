@@ -26,9 +26,6 @@ type smartNetwork struct {
 	PowerSave                                              bool
 }
 
-// Stage 2 is activated only after the Stage 1 acceptance suite passes.
-const smartTowerAttributionEnabled = false
-
 type smartNetworkService struct {
 	mu       sync.Mutex
 	at       time.Time
@@ -142,12 +139,10 @@ func smartReadNetwork(ctx context.Context, seed []byte, now time.Time) smartNetw
 		fingerprint += "\x00" + cell.MCC + cell.MNC
 	}
 	result.Fingerprint = smartNetworkHash(seed, fingerprint)
-	if smartTowerAttributionEnabled {
-		result = smartNetworkWithTower(result, seed, cell, now)
-	}
+	result = smartNetworkWithTower(result, seed, cell, now)
 	cached.at, cached.snapshot = now, result
 	cached.expires = now.Add(30 * time.Second)
-	if smartTowerAttributionEnabled && cell != nil && strings.Contains(result.Key, "/tower:") {
+	if cell != nil && strings.Contains(result.Key, "/tower:") {
 		if expiry := cell.ObservedAt.Add(120 * time.Second); expiry.Before(cached.expires) {
 			cached.expires = expiry
 		}

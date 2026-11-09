@@ -295,3 +295,53 @@ func TestSmartNestedDecisionAttachesEveryGroup(t *testing.T) {
 		t.Fatal("nested close did not unregister exactly once")
 	}
 }
+
+func TestSmartHourBucketsUsePlatformTimezone(t *testing.T) {
+	s, clock := smartTestGroup()
+	clock.now = time.Date(2026, 11, 9, 2, 0, 0, 0, time.UTC)
+	s.timezone = time.FixedZone("platform", 3*3600)
+	s.recordObservationLocked(s.primary, true, 100*time.Millisecond, clock.now)
+	stat := s.history.Stats["wifi"][s.primary.identity]
+	if stat.Hours[1] != [2]float64{1, 1} || stat.Hours[0] != [2]float64{} {
+		t.Fatalf("platform hour attribution: %v", stat.Hours)
+	}
+}
+
+func TestSmartQuarantineDecayKeepsFailureTimestamp(t *testing.T) {
+	s, clock := smartTestGroup()
+	primary := s.primary
+	primary.quarantineLevel = 3
+	primary.quarantineDecayAt, primary.lastFail = clock.now, clock.now
+	failedAt := primary.lastFail
+	clock.Advance(6 * time.Hour)
+	s.applyResultLocked(smartResult{member: primary, generation: 1, memberGeneration: 1, configGeneration: 1, kind: "tcp", rtt: time.Millisecond}, clock.now)
+	if primary.quarantineLevel != 2 || primary.lastFail != failedAt {
+		t.Fatalf("level=%d last_fail=%v", primary.quarantineLevel, primary.lastFail)
+	}
+}
+
+func TestSmartStandbyEvidenceUsesStandbyCadence(t *testing.T) {
+	s, clock := smartTestGroup()
+	standby := s.standby
+	s.applyResultLocked(smartResult{member: standby, generation: 1, memberGeneration: 1, configGeneration: 1, kind: "tcp", rtt: time.Millisecond}, clock.now)
+	if got := standby.tcp.expires.Sub(clock.now); got != 2*time.Minute {
+		t.Fatalf("standby TCP TTL=%v", got)
+	}
+}
+
+func TestSmartCloseJoinsOwnerAndStopsTimer(t *testing.T) {
+	s, clock := smartTestGroup()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.workCtx, s.workCancel = context.WithCancel(ctx)
+	s.loopDone = make(chan struct{})
+	go s.loop(ctx)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, timer := range clock.timers {
+		if !timer.stopped {
+			t.Fatal("owner timer survived close")
+		}
+	}
+}

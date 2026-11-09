@@ -134,6 +134,17 @@ func (l *smartLedger) Register(group string, limits map[string]float64) {
 	l.limits[group] = maps.Clone(limits)
 }
 
+func (l *smartLedger) Unregister(group string) {
+	smartLedgers.Lock()
+	defer smartLedgers.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.limits, group)
+	if l.cache != nil && len(l.limits) == 0 && smartLedgers.byCache[l.cache] == l {
+		delete(smartLedgers.byCache, l.cache)
+	}
+}
+
 func smartBudgetType(networkType string) string {
 	switch networkType {
 	case "wifi", "cellular":

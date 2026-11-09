@@ -87,6 +87,8 @@ type smartMember struct {
 	probation                                                                 int
 	emergency                                                                 bool
 	quarantineLevel                                                           int
+	quarantineDecayAt                                                         time.Time
+	startupRank                                                               int
 	quarantineUntil, healthySince, lastOK, lastFail, lastProbe, lastProbation time.Time
 	lastUDP, lastUDP443, lastThroughput                                       time.Time
 	tcp, udp, udp443                                                          smartEvidence
@@ -118,6 +120,7 @@ type (
 		country, networkType                           string
 	}
 )
+
 type smartResult struct {
 	member                                         *smartMember
 	kind                                           string
@@ -145,6 +148,7 @@ type Smart struct {
 	logger                                                                               log.ContextLogger
 	options                                                                              option.SmartOutboundOptions
 	mu                                                                                   sync.Mutex
+	persistenceMu                                                                        sync.Mutex
 	members                                                                              []*smartMember
 	primary, standby                                                                     *smartMember
 	generation, configGeneration, selectionGeneration                                    uint64
@@ -173,6 +177,7 @@ type Smart struct {
 	backgroundCtx                                                                        context.Context
 	backgroundCancel                                                                     context.CancelFunc
 	workers                                                                              sync.WaitGroup
+	loopDone                                                                             chan struct{}
 	leases                                                                               map[*smartMember]map[*smartLease]struct{}
 	startedAt, selectedAt, lastDemand, lastNetworkRead, lastFullRound                    time.Time
 	lastUDP443Demand, lastDiscovery, lastDirect, lastWrite, allDeadSince, ambiguousSince time.Time
@@ -318,12 +323,16 @@ func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		s.lastDemand = s.startedAt
 		s.restoreThroughputLocked(s.startedAt)
 		s.rankLocked(s.startedAt)
+		for rank, member := range s.members {
+			member.startupRank = rank
+		}
 		s.primary = s.members[0]
 	case adapter.StartStateStarted:
 		ctx, cancel := context.WithCancel(s.ctx)
 		s.cancel = cancel
 		s.workCtx, s.workCancel = context.WithCancel(ctx)
 		s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
+		s.loopDone = make(chan struct{})
 		if s.pauseManager != nil {
 			s.paused = s.pauseManager.IsPaused()
 			s.pauseCallback = s.pauseManager.RegisterCallback(func(int) { s.request("pause") })
@@ -386,14 +395,14 @@ func (s *Smart) loadMembers() error {
 	for _, member := range s.members {
 		old[member.outbound] = member
 	}
-	s.members = nil
+	nextMembers := make([]*smartMember, 0, len(members))
 	for order, member := range members {
 		if member == s {
 			return E.New("smart group cannot contain itself")
 		}
 		if existing := old[member]; existing != nil {
 			existing.configOrder = order
-			s.members = append(s.members, existing)
+			nextMembers = append(nextMembers, existing)
 			continue
 		}
 		identity, server, err := smartMemberIdentity(s.ctx, member)
@@ -406,8 +415,9 @@ func (s *Smart) loadMembers() error {
 			tier = 1
 		}
 		s.history.IdentityServers[identity] = server
-		s.members = append(s.members, &smartMember{outbound: member, tag: member.Tag(), identity: identity, serverIdentity: server, tier: tier, configOrder: order, country: strings.ToUpper(options.Country), generation: 1, state: "unknown", queued: make(map[string]bool)})
+		nextMembers = append(nextMembers, &smartMember{outbound: member, tag: member.Tag(), identity: identity, serverIdentity: server, tier: tier, configOrder: order, country: strings.ToUpper(options.Country), generation: 1, state: "unknown", queued: make(map[string]bool)})
 	}
+	s.members = nextMembers
 	if s.primary != nil && !slices.Contains(s.members, s.primary) {
 		s.primary = nil
 	}
@@ -434,7 +444,7 @@ func (s *Smart) Now() string {
 }
 func (s *Smart) References() []string             { return []string{s.Now()} }
 func (s *Smart) InterfaceUpdated(context.Context) { s.request("network") }
-func (s *Smart) PerformUpdateCheck() { s.request("demand") }
+func (s *Smart) PerformUpdateCheck()              { s.request("demand") }
 func (s *Smart) request(kind string) {
 	for i, name := range smartRequestNames {
 		if kind == name {
@@ -448,7 +458,7 @@ func (s *Smart) request(kind string) {
 	}
 }
 
-var smartRequestNames = []string{"network", "pause", "provider", "udp443", "stall", "force", "demand"}
+var smartRequestNames = []string{"network", "pause", "provider", "udp443", "stall", "force", "demand", "snapshot"}
 
 type smartDepthKey struct{}
 
@@ -472,6 +482,10 @@ func (s *Smart) SelectMember(ctx context.Context, network string, destination M.
 		s.request("udp443")
 	}
 	chain := []adapter.SmartSelection{{Group: s, Member: member.tag, Generation: token}}
+	return s.resolveDecision(ctx, selected, chain, network, destination)
+}
+
+func (s *Smart) resolveDecision(ctx context.Context, selected adapter.Outbound, chain []adapter.SmartSelection, network string, destination M.Socksaddr) (adapter.SmartDecision, error) {
 	for range 8 {
 		if nested, ok := selected.(adapter.SmartGroup); ok {
 			decision, err := nested.SelectMember(ctx, network, destination)
@@ -567,13 +581,9 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if !eligible {
 		return nil, err
 	}
-	retryDecision := adapter.NewSmartDecision(standby.outbound, []adapter.SmartSelection{{Group: s, Member: standby.tag, Generation: token}})
-	if nested, ok := standby.outbound.(adapter.SmartGroup); ok {
-		nestedDecision, nestedErr := nested.SelectMember(totalCtx, network, destination)
-		if nestedErr != nil {
-			return nil, nestedErr
-		}
-		retryDecision = adapter.NewSmartDecision(nestedDecision.Outbound(), append(retryDecision.Selections(), nestedDecision.Selections()...))
+	retryDecision, retryErr := s.resolveDecision(totalCtx, standby.outbound, []adapter.SmartSelection{{Group: s, Member: standby.tag, Generation: token}}, network, destination)
+	if retryErr != nil {
+		return nil, retryErr
 	}
 	conn, err = retryDecision.Outbound().DialContext(totalCtx, network, destination)
 	if err != nil {
@@ -693,6 +703,8 @@ func (l *smartLease) count(n int, read bool) {
 
 func (s *Smart) revokeLocked(member *smartMember) []io.Closer {
 	member.generation++
+	member.queued = make(map[string]bool)
+	member.inflight = false
 	var closers []io.Closer
 	if s.interrupt {
 		for lease := range s.leases[member] {
@@ -742,7 +754,10 @@ func (s *Smart) worker(ctx context.Context, reserved bool) {
 		}
 		cancel()
 		if job.kind == "throughput" && s.ledger != nil {
-			result.err = errors.Join(result.err, s.ledger.Reconcile(job.reservation, result.bytes, job.ctx.Err() != nil))
+			s.mu.Lock()
+			uncertain := job.generation != s.generation || job.networkType != s.network.Type
+			s.mu.Unlock()
+			result.err = errors.Join(result.err, s.ledger.Reconcile(job.reservation, result.bytes, uncertain))
 		}
 		select {
 		case s.results <- result:
@@ -757,6 +772,7 @@ func (s *Smart) cellularUploadAllowed() bool {
 }
 
 func (s *Smart) loop(ctx context.Context) {
+	defer close(s.loopDone)
 	for {
 		bits := s.requestBits.Swap(0)
 		for i, kind := range smartRequestNames {
@@ -805,8 +821,10 @@ func (s *Smart) loop(ctx context.Context) {
 }
 
 func (s *Smart) handleRequest(request smartRequest) {
-	if request.kind == "network" || request.kind == "pause" {
-		smartForceNetwork(s.ctx)
+	if request.kind == "network" || request.kind == "pause" || request.kind == "snapshot" {
+		if request.kind != "snapshot" {
+			smartForceNetwork(s.ctx)
+		}
 		network := smartReadNetwork(s.ctx, s.seed, s.clock.Now())
 		s.mu.Lock()
 		now := s.clock.Now()
@@ -843,7 +861,12 @@ func (s *Smart) handleRequest(request smartRequest) {
 		if network.Fingerprint != s.network.Fingerprint || network.Link != s.network.Link {
 			s.newGenerationLocked(network, now)
 		} else {
+			keyChanged := network.Key != s.network.Key
 			s.network = network
+			if keyChanged {
+				s.restoreThroughputLocked(now)
+				s.lastChallenger = time.Time{}
+			}
 		}
 		s.timezone = time.FixedZone("", s.network.Offset)
 		s.mu.Unlock()
@@ -941,12 +964,12 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 		member.probation = 0
 	}
 	s.restoreThroughputLocked(now)
-	if s.primary == nil {
-		for _, member := range s.members {
-			if s.primary == nil || member.configOrder < s.primary.configOrder {
-				s.primary = member
-			}
-		}
+	s.rankLocked(now)
+	for rank, member := range s.members {
+		member.startupRank = rank
+	}
+	if s.primary == nil && len(s.members) > 0 {
+		s.primary = s.members[0]
 	}
 	s.eventLocked("network_change", "", "", network.Key, "default network changed", now)
 }
@@ -1009,7 +1032,7 @@ func (s *Smart) queueLocked(member *smartMember, kind string, operator int, conf
 	if member != nil {
 		job.memberGeneration = member.generation
 		job.timeout = s.memberTimeoutLocked(member)
-		job.urgent = kind == "tcp" && (confirm || member == s.primary || member == s.standby || !s.generationSucceeded && member.configOrder < 2)
+		job.urgent = kind == "tcp" && (confirm || member == s.primary || member == s.standby || !s.generationSucceeded && member.startupRank < 2)
 	}
 	if !job.urgent && s.backgroundCtx != nil {
 		job.ctx = s.backgroundCtx
@@ -1062,13 +1085,28 @@ func (s *Smart) dispatchLocked() {
 	}
 }
 
+func (s *Smart) memberIntervalLocked(member *smartMember, now time.Time) time.Duration {
+	if now.Sub(s.lastDemand) <= 30*time.Second {
+		if member == s.primary {
+			return s.heartbeat
+		}
+		if member == s.standby {
+			return s.standbyInterval
+		}
+	}
+	if now.Sub(s.lastDemand) <= 10*time.Minute {
+		return s.backgroundInterval
+	}
+	return 30 * time.Minute
+}
+
 func (s *Smart) tickLocked(now time.Time) []io.Closer {
 	if s.paused {
 		return nil
 	}
 	if s.network.Link && now.Sub(s.lastNetworkRead) >= 30*time.Second && now.Sub(s.lastDemand) <= 30*time.Second {
 		s.lastNetworkRead = now
-		s.request("network")
+		s.request("snapshot")
 	}
 	if !s.network.Link {
 		s.offline = true
@@ -1090,10 +1128,6 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 			}
 		}
 	}
-	background := 30 * time.Minute
-	if now.Sub(s.lastDemand) <= 10*time.Minute {
-		background = s.backgroundInterval
-	}
 	if s.lastFullRound.IsZero() || now.Sub(s.lastFullRound) >= 2*time.Second {
 		s.lastFullRound = now
 		for _, member := range s.members {
@@ -1102,12 +1136,7 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 				member.probation = 0
 				member.lastProbation = time.Time{}
 			}
-			interval := background
-			if member == s.primary && demand {
-				interval = s.heartbeat
-			} else if member == s.standby && demand {
-				interval = s.standbyInterval
-			}
+			interval := s.memberIntervalLocked(member, now)
 			if member.state == "unknown" {
 				interval = 2 * time.Second
 			}
@@ -1233,7 +1262,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		if result.err == nil {
 			wasHealthy := member.state == "healthy"
 			member.lastOK = now
-			member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(2 * s.heartbeat)}
+			member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(2 * s.memberIntervalLocked(member, now))}
 			member.rtts = append(member.rtts, result.rtt.Seconds()*1000)
 			if len(member.rtts) > 64 {
 				member.rtts = member.rtts[len(member.rtts)-64:]
@@ -1266,9 +1295,12 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 					s.switchLocked(member, "recover", "first success this network", now)
 				}
 			}
-			if member.quarantineLevel > 0 && now.Sub(member.lastFail) >= 6*time.Hour {
-				member.quarantineLevel--
-				member.lastFail = now.Add(-6 * time.Hour)
+			if member.quarantineLevel > 0 && !member.quarantineDecayAt.IsZero() {
+				steps := int(now.Sub(member.quarantineDecayAt) / (6 * time.Hour))
+				if steps > 0 {
+					member.quarantineLevel = max(member.quarantineLevel-steps, 0)
+					member.quarantineDecayAt = member.quarantineDecayAt.Add(time.Duration(steps) * 6 * time.Hour)
+				}
 			}
 			s.recordObservationLocked(member, true, result.rtt, now)
 			if s.urlHistory != nil {
@@ -1303,6 +1335,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 				return nil
 			}
 			member.lastFail = now
+			member.quarantineDecayAt = now
 			member.tcp = smartEvidence{state: "failed", at: now, expires: now.Add(2 * s.heartbeat)}
 			member.emergency = false
 			member.state = "quarantined"
@@ -1335,9 +1368,13 @@ func (s *Smart) recordObservationLocked(member *smartMember, success bool, rtt t
 	paused := s.pausedTotal - member.pauseAtResult
 	s.history.Observe(s.network.Path, member.identity, success, rtt.Seconds()*1000, s.historyTime(now), paused)
 	member.pauseAtResult = s.pausedTotal
-	for _, key := range s.network.Path {
+	for index, key := range s.network.Path {
 		label := s.network.Labels[key]
-		s.history.Networks[key] = &smartHistoryNetwork{Type: s.network.Type, Label: label, Carrier: s.network.Carrier, Radio: s.network.Radio, LastSeen: now.Unix()}
+		parent := ""
+		if index+1 < len(s.network.Path) {
+			parent = s.network.Path[index+1]
+		}
+		s.history.Networks[key] = &smartHistoryNetwork{Type: s.network.Type, Label: label, Carrier: s.network.Carrier, Radio: s.network.Radio, LastSeen: now.Unix(), Parent: parent}
 		if label != "" {
 			s.history.Labels[key] = label
 		}
@@ -1348,6 +1385,7 @@ func (s *Smart) recordObservationLocked(member *smartMember, success bool, rtt t
 func (s *Smart) hasEligiblePrimaryLocked(now time.Time) bool {
 	return s.primary != nil && (s.primary.state == "healthy" || s.primary.state == "suspect" || s.primary.emergency || s.primary.state == "unknown" && now.Sub(s.startedAt) < 10*time.Second)
 }
+
 func (s *Smart) primaryTagLocked() string {
 	if s.primary != nil {
 		return s.primary.tag
@@ -1543,6 +1581,7 @@ func (s *Smart) eventLocked(kind, from, to, network, reason string, now time.Tim
 	}
 	s.dirty = true
 }
+
 func (s *Smart) notifyUpdatedLocked() {
 	if s.urlHistory != nil {
 		s.urlHistory.NotifyUpdated()
@@ -1661,6 +1700,8 @@ func (s *Smart) flushHistory(force bool) {
 	if s.cache == nil {
 		return
 	}
+	s.persistenceMu.Lock()
+	defer s.persistenceMu.Unlock()
 	s.mu.Lock()
 	now := s.clock.Now()
 	if !s.dirty || !force && now.Sub(s.lastWrite) < time.Minute {
@@ -1741,6 +1782,9 @@ func (s *Smart) Close() error {
 	if s.workCancel != nil {
 		s.workCancel()
 	}
+	if s.loopDone != nil {
+		<-s.loopDone
+	}
 	s.mu.Lock()
 	s.clearPendingLocked()
 	s.cancelURLWaitersLocked(context.Canceled)
@@ -1753,6 +1797,9 @@ func (s *Smart) Close() error {
 	}
 	s.workers.Wait()
 	s.flushHistory(true)
+	if s.ledger != nil {
+		s.ledger.Unregister(s.Tag())
+	}
 	s.mu.Lock()
 	var closers []io.Closer
 	for _, entries := range s.leases {

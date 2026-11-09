@@ -280,3 +280,18 @@ func TestSmartLedgerMetadataUpdatesPreserveGroupsAndReservations(t *testing.T) {
 		t.Fatal("prior save failure did not roll back")
 	}
 }
+
+func TestSmartLedgerRemovedGroupDoesNotLimitSurvivors(t *testing.T) {
+	cache := new(smartLedgerTestCache)
+	ledger, err := getSmartLedger(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger.Register("a", map[string]float64{"wifi": 50})
+	ledger.Register("b", map[string]float64{"wifi": 300})
+	ledger.Unregister("a")
+	if got := ledger.Snapshot("wifi", time.Unix(1800000000, 0), 0).LimitMB; got != 300 {
+		t.Fatalf("removed group kept budget limit %v", got)
+	}
+	ledger.Unregister("b")
+}

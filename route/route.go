@@ -563,7 +563,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 				flowTrackers = append(flowTrackers, flowTracker)
 			}
 		}
-		var flowTracker tun.FlowTracker = flowTrackers[0]
+		flowTracker := flowTrackers[0]
 		if len(flowTrackers) > 1 {
 			flowTracker = multiFlowTracker(flowTrackers)
 		}
