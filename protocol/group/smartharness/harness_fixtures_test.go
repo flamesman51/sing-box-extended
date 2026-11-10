@@ -3,6 +3,7 @@
 package smartharness_test
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -78,15 +79,20 @@ func harnessMain(m *testing.M) (int, error) {
 }
 
 type probeFixtures struct {
-	httpsPort uint16
-	dnsPort   uint16
-	stunPort  uint16
-	quicPort  uint16
-	https     atomic.Int64
-	dns       atomic.Int64
-	stun      atomic.Int64
-	quic      atomic.Int64
-	downloads atomic.Int64
+	httpsPort            uint16
+	dnsPort              uint16
+	stunPort             uint16
+	quicPort             uint16
+	https                atomic.Int64
+	dns                  atomic.Int64
+	stun                 atomic.Int64
+	quic                 atomic.Int64
+	downloads            atomic.Int64
+	bulkBytes            atomic.Int64
+	bulkRate             atomic.Int64
+	downloadRate         atomic.Int64
+	downloadBurst        atomic.Int64
+	unpaceBulkOnDownload atomic.Bool
 }
 
 func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
@@ -112,7 +118,12 @@ func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
 			}
 			f.downloads.Add(1)
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-			_, _ = io.CopyN(w, zeroReader{}, size)
+			if f.unpaceBulkOnDownload.Load() {
+				f.bulkRate.Store(0)
+			}
+			writeFixturePayload(r.Context(), w, size, &f.downloadRate, f.downloadBurst.Load(), nil)
+		case "/bulk":
+			writeFixturePayload(r.Context(), w, -1, &f.bulkRate, 0, &f.bulkBytes)
 		case "/upload":
 			_, _ = io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 1_000_000))
 			w.WriteHeader(http.StatusNoContent)
@@ -183,6 +194,42 @@ func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
 		return response
 	})
 	return f
+}
+
+func writeFixturePayload(ctx context.Context, w http.ResponseWriter, remaining int64, rate *atomic.Int64, burst int64, counter *atomic.Int64) {
+	var buffer [16 * 1024]byte
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	if !timer.Stop() {
+		<-timer.C
+	}
+	for remaining != 0 {
+		size := int64(len(buffer))
+		if remaining > 0 {
+			size = min(size, remaining)
+		}
+		if burst > 0 {
+			size = min(size, burst)
+			burst -= size
+		} else if bytesPerSecond := rate.Load(); bytesPerSecond > 0 {
+			timer.Reset(time.Duration(float64(size) / float64(bytesPerSecond) * float64(time.Second)))
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
+		n, err := w.Write(buffer[:size])
+		if counter != nil {
+			counter.Add(int64(n))
+		}
+		if err != nil || ctx.Err() != nil {
+			return
+		}
+		if remaining > 0 {
+			remaining -= int64(n)
+		}
+	}
 }
 
 type zeroReader struct{}

@@ -19,6 +19,7 @@ type relayFaults struct {
 	loss           float64
 	blackhole      bool
 	maxDatagram    int
+	downstream     *sharedDownstream
 }
 
 type relayPacket struct {
@@ -26,6 +27,28 @@ type relayPacket struct {
 	size int
 	to   netip.AddrPort
 	at   time.Time
+}
+
+// A single queueing clock accounts for downstream packets from every member.
+type sharedDownstream struct {
+	mu             sync.Mutex
+	bytesPerSecond int
+	next           time.Time
+}
+
+func (s *sharedDownstream) reserve(size int) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.next = maxTime(s.next, now).Add(time.Duration(float64(size) / float64(s.bytesPerSecond) * float64(time.Second)))
+	return s.next.Sub(now)
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // Each direction has an independent token bucket, as on a full-duplex link.
@@ -51,8 +74,8 @@ func newFaultRelay(t *testing.T, server *net.UDPAddr, faults relayFaults) *fault
 	serverAddress := netip.AddrPortFrom(server.AddrPort().Addr().Unmap(), uint16(server.Port))
 	up, down := make(chan relayPacket, 256), make(chan relayPacket, 256)
 	r.workers.Add(3)
-	go r.forward(ctx, up, 1)
-	go r.forward(ctx, down, 2)
+	go r.forward(ctx, up, 1, false)
+	go r.forward(ctx, down, 2, true)
 	go func() {
 		defer r.workers.Done()
 		var client netip.AddrPort
@@ -102,7 +125,7 @@ func (r *faultRelay) current() relayFaults {
 	return r.faults
 }
 
-func (r *faultRelay) forward(ctx context.Context, packets <-chan relayPacket, seed int64) {
+func (r *faultRelay) forward(ctx context.Context, packets <-chan relayPacket, seed int64, downstream bool) {
 	defer r.workers.Done()
 	random := rand.New(rand.NewPCG(uint64(seed), 0))
 	timer := time.NewTimer(time.Hour)
@@ -131,6 +154,9 @@ func (r *faultRelay) forward(ctx context.Context, packets <-chan relayPacket, se
 				if tokens < 0 {
 					wait = max(wait, time.Duration(-tokens/float64(faults.bytesPerSecond)*float64(time.Second)))
 				}
+			}
+			if downstream && faults.downstream != nil {
+				wait = max(wait, faults.downstream.reserve(packet.size))
 			}
 			if wait > 0 {
 				timer.Reset(wait)

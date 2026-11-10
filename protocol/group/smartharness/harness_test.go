@@ -156,15 +156,32 @@ type harnessStatus struct {
 		At       int64    `json:"throughput_at"`
 	} `json:"members"`
 	Events []struct {
-		Kind string `json:"kind"`
+		Kind   string  `json:"kind"`
+		From   *string `json:"from"`
+		To     *string `json:"to"`
+		Reason string  `json:"reason"`
 	} `json:"events"`
+	Degradation struct {
+		State       string   `json:"state"`
+		Observed    *float64 `json:"observed_mbps"`
+		Provisional *float64 `json:"provisional_mbps"`
+		Flows       int      `json:"continuous_flows"`
+		Checked     int64    `json:"checked_at"`
+		Retry       int64    `json:"retry_at"`
+		Blocked     string   `json:"blocked_reason"`
+	} `json:"throughput_degradation"`
 }
 
 type harnessBudget struct {
-	Day      string  `json:"day"`
-	Used     float64 `json:"used_mb"`
-	Reserved float64 `json:"reserved_mb"`
-	Limit    float64 `json:"limit_mb"`
+	Day         string  `json:"day"`
+	Used        float64 `json:"used_mb"`
+	Reserved    float64 `json:"reserved_mb"`
+	Limit       float64 `json:"limit_mb"`
+	Degradation struct {
+		Used     float64 `json:"used_mb"`
+		Reserved float64 `json:"reserved_mb"`
+		Limit    float64 `json:"limit_mb"`
+	} `json:"degradation"`
 }
 
 func statusHarness(t *testing.T, client *harnessBox) harnessStatus {
@@ -249,17 +266,20 @@ func metadataHarness(t *testing.T, client *harnessBox) map[string]json.RawMessag
 	return fields
 }
 
-func TestSmartHarness(t *testing.T) {
-	started := time.Now()
-	owner := t
-	t.Cleanup(func() { t.Logf("real-component harness runtime: %s", time.Since(started)) })
+type harnessLink struct {
+	tag       string
+	mbps      float64
+	delay     time.Duration
+	blackhole bool
+}
+
+func newHarnessNetwork(t *testing.T, links []harnessLink, budget float64, probeTimeout string) (*harnessBox, []harnessMember, map[string]any) {
+	t.Helper()
 	var members []harnessMember
 	var endpoints []any
-	for i, entry := range []struct {
-		tag   string
-		mbps  float64
-		delay time.Duration
-	}{{"fast", 20, 0}, {"medium", 5, 10 * time.Millisecond}, {"slow", 1.5, 20 * time.Millisecond}} {
+	var tags []string
+	for i, entry := range links {
+		tags = append(tags, entry.tag)
 		overlay := netip.AddrFrom4([4]byte{10, 200, byte(i + 1), 1})
 		fixtures := newProbeFixtures(t, overlay)
 		serverPrivate, serverPublic := wireGuardKeys(t)
@@ -277,11 +297,20 @@ func TestSmartHarness(t *testing.T) {
 		serverEndpoint := endpointConfig("server", overlay.String()+"/24", serverPrivate, serverPort, map[string]any{"public_key": clientPublic, "allowed_ips": []string{fmt.Sprintf("10.200.%d.2/32", i+1)}})
 		serverConfig := map[string]any{"log": map[string]any{"disabled": true}, "endpoints": []any{serverEndpoint}, "outbounds": []any{map[string]any{"type": "direct", "tag": "local"}}, "route": map[string]any{"rules": rules}}
 		serverPort = startHarnessServer(t, serverConfig, serverEndpoint)
-		faults := relayFaults{bytesPerSecond: int(entry.mbps * 1_000_000 / 8), delay: entry.delay}
+		faults := relayFaults{bytesPerSecond: int(entry.mbps * 1_000_000 / 8), delay: entry.delay, blackhole: entry.blackhole}
 		relay := newFaultRelay(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(serverPort)}, faults)
 		clientEndpoint := endpointConfig(entry.tag, fmt.Sprintf("10.200.%d.2/24", i+1), clientPrivate, 0, map[string]any{"address": "127.0.0.1", "port": relay.conn.LocalAddr().(*net.UDPAddr).Port, "public_key": serverPublic, "allowed_ips": []string{"0.0.0.0/0"}})
 		endpoints = append(endpoints, clientEndpoint)
 		members = append(members, harnessMember{fixtures: fixtures, relay: relay, faults: faults})
+	}
+	probe := map[string]any{
+		"disable_direct":      true,
+		"heartbeat_interval":  "30s",
+		"standby_interval":    "30s",
+		"background_interval": "30s",
+	}
+	if probeTimeout != "" {
+		probe["timeout"] = probeTimeout
 	}
 	config := map[string]any{
 		"log":       map[string]any{"disabled": true},
@@ -289,27 +318,28 @@ func TestSmartHarness(t *testing.T) {
 		"outbounds": []any{map[string]any{
 			"type":      "smart",
 			"tag":       "smart",
-			"outbounds": []string{"fast", "medium", "slow"},
-			"probe": map[string]any{
-				"disable_direct":      true,
-				"heartbeat_interval":  "30s",
-				"standby_interval":    "30s",
-				"background_interval": "30s",
-				"timeout":             "2s",
-			},
+			"outbounds": tags,
+			"probe":     probe,
 			"throughput": map[string]any{
 				"target_mbps":              10,
 				"download_url":             "https://fixture.invalid/download?bytes={bytes}",
 				"upload_url":               "https://fixture.invalid/upload",
-				"wifi_daily_budget_mb":     100,
-				"cellular_daily_budget_mb": 100,
-				"other_daily_budget_mb":    100,
+				"wifi_daily_budget_mb":     budget,
+				"cellular_daily_budget_mb": budget,
+				"other_daily_budget_mb":    budget,
 			},
 		}},
 		"route":        map[string]any{"final": "smart"},
 		"experimental": map[string]any{"cache_file": map[string]any{"enabled": true, "path": filepath.Join(t.TempDir(), "cache.db")}},
 	}
-	client := startHarnessBox(t, config)
+	return startHarnessBox(t, config), members, config
+}
+
+func TestSmartHarness(t *testing.T) {
+	started := time.Now()
+	owner := t
+	t.Cleanup(func() { t.Logf("real-component harness runtime: %s", time.Since(started)) })
+	client, members, config := newHarnessNetwork(t, []harnessLink{{tag: "fast", mbps: 20}, {tag: "medium", mbps: 5, delay: 10 * time.Millisecond}, {tag: "slow", mbps: 1.5, delay: 20 * time.Millisecond}}, 100, "2s")
 	requestHarness(t, client)
 	var calibrated harnessStatus
 	if !t.Run("initial_selection_after_calibration", func(t *testing.T) {
