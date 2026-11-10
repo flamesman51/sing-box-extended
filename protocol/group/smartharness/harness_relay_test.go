@@ -37,11 +37,12 @@ type sharedDownstream struct {
 	next           time.Time
 }
 
-func (s *sharedDownstream) reserve(size int) time.Duration {
+func (s *sharedDownstream) reserve(size int, arrived time.Time) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	s.next = maxTime(s.next, now).Add(time.Duration(float64(size) / float64(s.bytesPerSecond) * float64(time.Second)))
+	// Use arrival time so late timer wakeups do not add another serialization delay per packet.
+	s.next = maxTime(s.next, arrived).Add(time.Duration(float64(size) / float64(s.bytesPerSecond) * float64(time.Second)))
 	return s.next.Sub(now)
 }
 
@@ -163,7 +164,7 @@ func (r *faultRelay) forward(ctx context.Context, packets <-chan relayPacket, se
 				}
 			}
 			if downstream && faults.downstream != nil {
-				wait = max(wait, faults.downstream.reserve(packet.size))
+				wait = max(wait, faults.downstream.reserve(packet.size, packet.at))
 			}
 			if wait > 0 {
 				timer.Reset(wait)
@@ -242,5 +243,23 @@ func TestSmartHarnessRelayFaults(t *testing.T) {
 				t.Fatalf("size=%d error=%v elapsed=%v minimum=%v", n, err, time.Since(start), test.minimum)
 			}
 		})
+	}
+}
+
+func TestSmartHarnessSharedDownstreamLateDelivery(t *testing.T) {
+	shared := &sharedDownstream{bytesPerSecond: 5_000_000}
+	arrived := time.Now().Add(-time.Second)
+	for range 100 {
+		if delay := shared.reserve(1_250, arrived); delay > 0 {
+			t.Fatalf("late delivery added a new serialization delay: %s", delay)
+		}
+	}
+	if want := arrived.Add(25 * time.Millisecond); !shared.next.Equal(want) {
+		t.Fatalf("100 queued packets advanced the shared clock to %s, want %s", shared.next, want)
+	}
+	later := arrived.Add(2 * time.Second)
+	shared.reserve(1_250, later)
+	if want := later.Add(250 * time.Microsecond); !shared.next.Equal(want) {
+		t.Fatalf("idle link did not restart at packet arrival: got %s, want %s", shared.next, want)
 	}
 }
