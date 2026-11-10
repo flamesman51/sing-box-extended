@@ -186,7 +186,7 @@ Active speed results last `24h`. A passive result needs a busy window of at leas
 
 #### Degradation checks
 
-Smart can recheck a primary before its active estimate expires. A window of at least 20 seconds must stay below half `target_mbps`, include at least 18 seconds of download-progress sampling, average at least 256 KiB per 20 seconds, and include a reading flow at least ten seconds old. Sampling tolerates intervals of 0.5–3 seconds and computes rates using actual elapsed time; a real read gap longer than three seconds resets demand evidence. Rates aggregate concurrent primary flows. These signals indicate demand, not proof of saturation: paced video can resemble a slow download. Passive observations never demote the server.
+Smart can recheck a primary before its active estimate expires. A rolling 20-second window must stay below half `target_mbps`, include download progress over at least 90% of its elapsed sampling coverage, transfer at least 256 KiB, and include a reading flow at least ten seconds old. Sampling tolerates intervals of 0.5–3 seconds and computes rates using actual elapsed time; a sampling interval or real read gap longer than three seconds resets demand evidence. Partial oldest samples are weighted by their overlap with the window, so intermittent progress cannot accumulate indefinitely. Rates aggregate concurrent primary flows. These signals indicate demand, not proof of saturation: paced video can resemble a slow download. Passive observations never demote the server.
 
 Each sampled rate must remain below half-target; a recovered sample resets the low-rate window rather than being averaged away by later slowness.
 

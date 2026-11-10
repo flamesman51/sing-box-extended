@@ -26,8 +26,8 @@ type smartDegradationEpisode struct {
 type smartDegradationState struct {
 	episode               *smartDegradationEpisode
 	sampled, window       time.Time
-	baseline, previous    int64
-	activeDuration        time.Duration
+	previous              int64
+	coverage              smartDegradationCoverage
 	flows                 int
 	observed, provisional float64
 	state, blocked        string
@@ -60,7 +60,7 @@ func (s *Smart) clearDegradationLocked() {
 	d.episode = nil
 	d.window = time.Time{}
 	d.sampled = time.Time{}
-	d.activeDuration = 0
+	d.coverage = smartDegradationCoverage{}
 	d.flows = 0
 	d.provisional = 0
 }
@@ -122,36 +122,32 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 			flows++
 		}
 	}
-	if d.window.IsZero() || flows == 0 {
+	if d.window.IsZero() || flows == 0 || now.Sub(d.sampled) > 3*time.Second {
 		d.window, d.sampled = now, now
-		d.baseline = total
 		d.previous = total
-		d.activeDuration = 0
+		d.coverage = smartDegradationCoverage{}
 		d.flows = flows
 		return false
 	}
-	elapsed := now.Sub(d.window)
 	sampleInterval := now.Sub(d.sampled)
-	d.observed = float64(total-d.previous) * 8 / sampleInterval.Seconds() / 1e6
-	if total > d.previous && sampleInterval <= 3*time.Second {
-		d.activeDuration += sampleInterval
-	}
+	delta := total - d.previous
+	d.observed = float64(delta) * 8 / sampleInterval.Seconds() / 1e6
 	d.previous = total
 	if d.observed >= s.targetMbps*.5 {
 		d.window = now
-		d.baseline = total
-		d.activeDuration = 0
+		d.coverage = smartDegradationCoverage{}
 		d.sampled = now
 		d.state = "idle"
 		return false
 	}
 	d.sampled = now
+	d.coverage.add(sampleInterval, delta)
 	d.flows = flows
-	if elapsed < 20*time.Second {
+	if d.coverage.duration < 20*time.Second {
 		d.state = "observing"
 		return false
 	}
-	qualified := d.activeDuration >= 18*time.Second && float64(total-d.baseline)/elapsed.Seconds() >= float64(256*1024)/20 && d.observed < s.targetMbps*.5
+	qualified := d.coverage.active >= d.coverage.duration*9/10 && d.coverage.bytes >= 256*1024 && d.observed < s.targetMbps*.5
 	if !qualified {
 		d.state = "observing"
 		return false
@@ -333,4 +329,43 @@ func (s *Smart) degradationChallengerRetryLocked() time.Time {
 		}
 	}
 	return retry
+}
+
+type smartDegradationSample struct {
+	duration time.Duration
+	bytes    float64
+}
+
+type smartDegradationCoverage struct {
+	// Samples are at least 500 ms, so 41 entries cover a partially trimmed 20 s window.
+	samples          [41]smartDegradationSample
+	head, count      int
+	duration, active time.Duration
+	bytes            float64
+}
+
+func (c *smartDegradationCoverage) add(duration time.Duration, bytes int64) {
+	c.samples[(c.head+c.count)%len(c.samples)] = smartDegradationSample{duration: duration, bytes: float64(bytes)}
+	c.count++
+	c.duration += duration
+	c.bytes += float64(bytes)
+	if bytes > 0 {
+		c.active += duration
+	}
+	for c.duration > 20*time.Second {
+		oldest := &c.samples[c.head]
+		trim := min(oldest.duration, c.duration-20*time.Second)
+		removedBytes := oldest.bytes * float64(trim) / float64(oldest.duration)
+		c.duration -= trim
+		c.bytes -= removedBytes
+		if oldest.bytes > 0 {
+			c.active -= trim
+		}
+		oldest.bytes -= removedBytes
+		oldest.duration -= trim
+		if oldest.duration == 0 {
+			c.head = (c.head + 1) % len(c.samples)
+			c.count--
+		}
+	}
 }

@@ -428,3 +428,52 @@ func TestSmartDegradationJitteredTicksReachSuspicion(t *testing.T) {
 	}
 	t.Fatalf("sustained 1.5 Mbps download stayed %q under jittered sampling", s.degradation.state)
 }
+
+func TestSmartDegradationIntermittentReadsNeverAccumulateCoverage(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+	s.scheduleDegradationLocked(clock.Now())
+	for i := range 80 {
+		clock.Advance(time.Second)
+		if i%2 == 0 {
+			lease.CountRead(375_000)
+		}
+		s.scheduleDegradationLocked(clock.Now())
+		if s.degradation.episode != nil {
+			t.Fatalf("50%% progress coverage qualified after %d seconds", i+1)
+		}
+	}
+}
+
+func TestSmartDegradationSamplingPauseResetsCoverage(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+	s.scheduleDegradationLocked(clock.Now())
+	for range 18 {
+		clock.Advance(time.Second)
+		lease.CountRead(375_000)
+		s.scheduleDegradationLocked(clock.Now())
+	}
+	clock.Advance(10 * time.Second)
+	lease.CountRead(375_000)
+	s.scheduleDegradationLocked(clock.Now())
+	if s.degradation.episode != nil {
+		t.Fatal("read after sampling pause reused old coverage")
+	}
+	for range 19 {
+		clock.Advance(time.Second)
+		lease.CountRead(375_000)
+		s.scheduleDegradationLocked(clock.Now())
+		if s.degradation.episode != nil {
+			t.Fatal("pause did not require a fresh twenty-second window")
+		}
+	}
+	clock.Advance(time.Second)
+	lease.CountRead(375_000)
+	s.scheduleDegradationLocked(clock.Now())
+	if s.degradation.episode == nil {
+		t.Fatal("fresh continuous window did not qualify")
+	}
+}
