@@ -181,9 +181,10 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 	return smartJSON(map[string]any{
 		"version": 1, "group": s.Tag(), "now": now.Unix(), "state": state, "generation": s.selectionGeneration,
 		"panics": s.panicSnapshot(), "degraded": s.degradedLocked(), "budgets": budgets,
-		"selected": map[string]any{"tcp": primary, "standby": standby, "udp": udp, "udp443": udp443},
-		"network":  map[string]any{"key": s.network.Key, "type": s.network.Type, "label": smartNullable(s.network.Label), "carrier": smartNullable(s.network.Carrier), "radio": smartNullable(s.network.Radio), "country": smartNullable(s.network.Country)},
-		"direct":   map[string]any{"state": s.direct.value(now), "checked_at": smartTime(s.direct.at), "rtt_ms": smartNumber(float64(s.directRTT) / float64(time.Millisecond)), "download_mbps": nil}, "budget": budget, "members": members, "events": events, "timeline": timeline,
+		"throughput_degradation": s.degradationSnapshotLocked(),
+		"selected":               map[string]any{"tcp": primary, "standby": standby, "udp": udp, "udp443": udp443},
+		"network":                map[string]any{"key": s.network.Key, "type": s.network.Type, "label": smartNullable(s.network.Label), "carrier": smartNullable(s.network.Carrier), "radio": smartNullable(s.network.Radio), "country": smartNullable(s.network.Country)},
+		"direct":                 map[string]any{"state": s.direct.value(now), "checked_at": smartTime(s.direct.at), "rtt_ms": smartNumber(float64(s.directRTT) / float64(time.Millisecond)), "download_mbps": nil}, "budget": budget, "members": members, "events": events, "timeline": timeline,
 	})
 }
 

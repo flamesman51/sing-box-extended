@@ -704,15 +704,8 @@ func TestSmartDemandChallengerPreservesRankingPriority(t *testing.T) {
 			primary, challenger := s.primary, s.standby
 			primary.throughput = smartThroughput{Download: 10, At: clock.Now(), Source: "active"}
 			s.selectedAt = clock.Now()
-			decision, err := s.SelectMember(context.Background(), "tcp", M.Socksaddr{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			lease := s.Attach(decision, &smartTestCloser{})
-			defer lease.Close()
-			s.demandStarted = clock.Now()
-			clock.Advance(20 * time.Second)
-			lease.CountWrite(1024)
+			episode := smartTestDegradationEpisode(s, clock.Now())
+			smartTestDegradationResult(s, episode, primary, smartDegradationConfirmation, 3, clock.Now())
 			switch priority {
 			case "tier":
 				challenger.tier = 2
@@ -725,18 +718,16 @@ func TestSmartDemandChallengerPreservesRankingPriority(t *testing.T) {
 				stat.S, stat.W = 50, 100
 			}
 			s.rankLocked(clock.Now())
-			s.scheduleThroughputLocked(clock.Now())
 			if priority == "equal" {
-				if s.challenger != challenger {
-					t.Fatal("equal-priority demand challenger was not admitted")
+				if s.degradationCandidateLocked(clock.Now()) != challenger {
+					t.Fatal("eligible challenger missing")
 				}
-			} else if s.challenger != nil {
+			} else if s.degradationCandidateLocked(clock.Now()) != nil {
 				t.Fatalf("%s priority was ignored when choosing a demand challenger", priority)
 			}
 			// A queued measurement must be revalidated if priorities changed while it ran.
-			s.challenger = challenger
-			s.challengerUntil = clock.Now().Add(5 * time.Minute)
-			s.applyResultLocked(smartResult{member: challenger, generation: s.generation, memberGeneration: challenger.generation, configGeneration: s.configGeneration, kind: "throughput", download: 30}, clock.Now())
+			episode.challenger, episode.challengerGeneration = challenger, challenger.generation
+			smartTestDegradationResult(s, episode, challenger, smartDegradationChallenger, 30, clock.Now())
 			if priority == "equal" {
 				if s.primary != challenger {
 					t.Fatal("demand did not waive dwell for an equal-priority challenger")

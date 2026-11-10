@@ -108,7 +108,7 @@ A single operator failure marks a healthy primary suspect and starts a confirmat
 
 At startup or on a new network generation, the two best-ranked members are checked first. The first successful member can carry new traffic immediately. For up to `10s`, a previous primary that is not down, or the best unknown member, can be used while validation is pending.
 
-A recovered lower-numbered tier must stay healthy for `60s` before tier restoration. An ordinary stability or throughput improvement needs two distinct observations at least `30s` apart and a primary dwell of at least `10m`; healthy primaries are not replaced merely for a lower ping. Sustained demand on an actively measured slow primary can trigger a challenger test in a light-traffic window within `5m` and waive the dwell when the challenger meets the target. This waiver cannot override tier, health state, or stability priority.
+A recovered lower-numbered tier must stay healthy for `60s` before tier restoration. An ordinary stability or throughput improvement needs two distinct observations at least `30s` apart and a primary dwell of at least `10m`; healthy primaries are not replaced merely for a lower ping. Sustained low-rate demand can trigger a bounded fresh primary confirmation and challenger pair, including during busy traffic. A freshly target-meeting challenger can waive the dwell; this waiver cannot override tier, health state, or stability priority. See [Degradation checks](#degradation-checks) for admission limits and cooldowns.
 
 ### Internal panic containment
 
@@ -173,7 +173,7 @@ If direct checks also fail and no member has succeeded in this generation, ambig
 
 **Active throughput tests require an enabled `experimental.cache_file`.** Without persistent cache storage they are disabled, even when `throughput.enabled` is `true`; reachability checks and selection still work.
 
-The daily ledger is shared by every Smart group in the process. If groups configure different limits, the effective limit for each network type is the minimum of their limits. Tests are serial, at most four per hour, and are not started while paused or in power-save mode. They wait for light user traffic. Primary calibration comes first, then standby and challengers, with at most one challenger per hour and no repeat until eligible members have had a turn.
+The daily ledger is shared by every Smart group in the process. If groups configure different limits, the effective limit for each network type is the minimum of their limits. Tests are serial, at most four per hour, and are not started while paused or in power-save mode. Ordinary calibration waits for light user traffic, with primary calibration before standby and other members. Degradation checks have a separate, bounded busy-traffic exception described below.
 
 A test reserves `min(25 MB, 20% of remaining daily budget)` before it starts. If the cap is below `1.1 MB`, it is skipped. Counted member-connection bytes include a `10%` estimate for outer overhead; at most `10%` reservation overshoot is allowed. Download uses at most two connections and ramps from `1 MB` until a steady measurement or the cap. The `1 MB` upload test runs only on Wi-Fi, or on cellular with a configured daily budget of at least `500 MB`.
 
@@ -182,6 +182,20 @@ Budget reservation and reconciliation use cancellable background admission work,
 Reservations are persisted before testing, reconciled afterward, and charged in full after a crash if left orphaned. Daily accounting uses platform local time. If the clock moves to an earlier date, the latest date already seen keeps accumulating usage; a clock rollback does not grant another budget. These budgets cover active throughput tests, not ordinary user traffic or small health probes.
 
 Active speed results last `24h`. A passive result needs a busy window of at least `10s`, proves only a lower bound on achieved speed, and lasts `6h`; a newer active result supersedes older passive observations. Expired results become unknown.
+
+#### Degradation checks
+
+Smart can recheck a primary before its active estimate expires. A 20-second window must stay below half `target_mbps`, make download progress on at least 18 one-second samples, have no gap longer than two seconds, transfer at least 256 KiB, and include a reading flow at least ten seconds old. Rates aggregate concurrent primary flows. These signals indicate demand, not proof of saturation: paced video can resemble a slow download. Passive observations never demote the server.
+
+One episode performs a fresh primary confirmation and, only when it confirms below half-target, one fresh challenger. These download-only jobs may run during user traffic, survive ordinary heartbeat preemption, and still obey health, power, pause, network, cache and budget gates. Primary confirmation adds the user's achieved primary download bytes over exactly the same interval to active-test bytes. Fast proof excludes the first 1 MB and requires four target-meeting intervals of at least 500 ms each. Low results remain provisional: stale fast estimates cannot defeat the fresh-challenger requirement. A same-tier, healthy challenger with no worse stability must freshly meet the target before the demand waiver switches selection.
+
+A fast confirmation receives a one-hour cooldown for that primary and network; other completed episodes receive 30 minutes. Degradation challengers are limited to one per hour, including standby members, and rotate through untried or least-recently-tried eligible members. Two slow results suggest a shared bottleneck or two slow servers; they do not prove a local problem or trigger a switch.
+
+Degradation admissions share the ordinary durable ledger, four-tests-per-hour limit and daily budget. Their separate admission allowance is 10% of the effective daily network-type budget. At target 25 Mbit/s, confirmation reserves 10 MB nominal, and a full confirmation/challenger pair allows at most 38.5 MB including overshoot headroom. Before another confirmation, at least 49.5 MB of degradation allowance must remain, preserving one full episode after a harmless test. With 5000 MB Wi-Fi and 1000 MB cellular budgets, allowances are 500 MB and 100 MB; five worst-case harmless cellular confirmations leave 45 MB and further confirmations wait. Small budgets may prevent any adequately sized confirmation. Exhausting this allowance does not disable ordinary calibration. Uncertain attribution after a network handover charges all consumed bytes to cellular, even when the final cellular allowance is exceeded: this is an admission allowance, not a hard accounting cap.
+
+Additive version 1 status includes `throughput_degradation` (state, observed/provisional rate, continuous flow count, last check, retry time and block reason) and each budget's `degradation` usage, reservations and limit. Containment `degraded` retains its separate meaning. Budget, cooldown or eligibility blocks mean there is no universal switching deadline.
+
+**Switching helps new connections only. An established slow download stays on its current server.**
 
 If a completed test's accounting write or callback fails, its durable reservation remains charged as reserved space, with its settlement queued before the callback runs. Smart retries the pending reconciliation before admitting another test; a temporary storage failure or contained accounting panic does not require a restart.
 

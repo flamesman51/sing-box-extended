@@ -104,6 +104,8 @@ type smartMember struct {
 	improvementSignature                                                      int
 	rankState, rankStability, rankThroughput                                  int
 	rankLatency                                                               float64
+	passiveRead                                                               int64
+	degradationQueued                                                         *smartDegradationEpisode
 }
 
 type (
@@ -118,6 +120,8 @@ type (
 		timeout                                        time.Duration
 		capBytes                                       int64
 		reservation                                    string
+		episode                                        *smartDegradationEpisode
+		purpose                                        string
 		urgent                                         bool
 		country, networkType                           string
 	}
@@ -136,6 +140,8 @@ type smartResult struct {
 	reservation                                    string
 	admission                                      *smartAdmission
 	contained                                      bool
+	episode                                        *smartDegradationEpisode
+	purpose                                        string
 }
 
 type smartURLWaiter struct {
@@ -214,9 +220,9 @@ type Smart struct {
 	pauseCallback                                                                        *list.Element[pause.Callback]
 	providerCallbacks                                                                    map[adapter.Provider]*list.Element[adapter.ProviderUpdateCallback]
 	providerManager                                                                      adapter.ProviderManager
-	challenger                                                                           *smartMember
-	challengerUntil, demandStarted                                                       time.Time
 	lastChallenger                                                                       time.Time
+	degradation                                                                          smartDegradationState
+	primaryEpoch                                                                         uint64
 	urlWaiters                                                                           []*smartURLWaiter
 }
 
@@ -444,6 +450,8 @@ func (s *Smart) loadMembers() error {
 	}
 	s.members = nextMembers
 	if s.primary != nil && !slices.Contains(s.members, s.primary) {
+		s.clearDegradationLocked()
+		s.primaryEpoch++
 		s.primary = nil
 	}
 	return nil
@@ -793,6 +801,9 @@ func (l *smartLease) count(n int, read bool) {
 	s.lastDemand = now
 	if read {
 		l.read += int64(n)
+		if l.generation == s.generation {
+			l.member.passiveRead += int64(n)
+		}
 		l.lastRead = now
 		l.stalled = false
 	} else {
@@ -944,6 +955,7 @@ func (s *Smart) handleRequest(request smartRequest) {
 		now := s.clock.Now()
 		paused := s.pauseManager != nil && s.pauseManager.IsPaused()
 		if paused && !s.paused {
+			s.clearDegradationLocked()
 			s.paused = true
 			s.pauseStarted = now
 			s.wakeEmergency = false
@@ -983,6 +995,7 @@ func (s *Smart) handleRequest(request smartRequest) {
 			keyChanged := network.Key != s.network.Key
 			s.network = network
 			if keyChanged {
+				s.clearDegradationLocked()
 				s.restoreThroughputLocked(now)
 				s.lastChallenger = time.Time{}
 			}
@@ -1047,6 +1060,7 @@ func (s *Smart) handleRequest(request smartRequest) {
 }
 
 func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
+	s.clearDegradationLocked()
 	if s.workCancel != nil {
 		s.workCancel()
 	}
@@ -1072,7 +1086,6 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 	s.emergencyStep = 0
 	s.wakeEmergency = false
 	s.lastStall = time.Time{}
-	s.challenger = nil
 	s.timezone = time.FixedZone("", network.Offset)
 	s.cancelURLWaitersLocked(context.Canceled)
 	for _, member := range s.members {
@@ -1333,6 +1346,10 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		s.applyAdmissionLocked(result, now)
 		return nil
 	}
+	if result.episode != nil {
+		s.applyDegradationResultLocked(result, now)
+		return nil
+	}
 	if s.closed || s.ctx.Err() != nil || result.generation != s.generation || result.configGeneration != s.configGeneration || s.paused {
 		return nil
 	}
@@ -1418,10 +1435,6 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 				}
 			}
 			s.history.IdentityServers[member.identity] = member.serverIdentity
-			if s.challenger == member && result.download >= s.targetMbps && !now.After(s.challengerUntil) && s.demandChallengerEligibleLocked(member, now) {
-				s.switchLocked(member, "switch", "demand challenger meets target", now)
-				s.challenger = nil
-			}
 		}
 	case "tcp":
 		if result.err == nil {
@@ -1510,6 +1523,8 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			s.eventLocked("quarantine", member.tag, "", s.network.Key, "two probe operators failed", now)
 			closers := s.revokeLocked(member)
 			if member == s.primary {
+				s.clearDegradationLocked()
+				s.primaryEpoch++
 				s.primary = nil
 				s.chooseLocked(now)
 				s.eventLocked("failover", member.tag, s.primaryTagLocked(), s.network.Key, "primary corroborated unreachable", now)
@@ -1721,6 +1736,8 @@ func (s *Smart) switchLocked(member *smartMember, kind, reason string, now time.
 		return
 	}
 	previous := s.primaryTagLocked()
+	s.clearDegradationLocked()
+	s.primaryEpoch++
 	s.primary = member
 	s.selectedAt = now
 	s.selectionGeneration++
@@ -1760,6 +1777,9 @@ func (s *Smart) scheduleThroughputLocked(now time.Time) {
 	if !s.throughputEnabled || s.ledger == nil || s.network.PowerSave || s.paused || s.primary == nil || !s.generationSucceeded {
 		return
 	}
+	if s.scheduleDegradationLocked(now) {
+		return
+	}
 	busy := false
 	for _, entries := range s.leases {
 		for lease := range entries {
@@ -1769,44 +1789,24 @@ func (s *Smart) scheduleThroughputLocked(now time.Time) {
 		}
 	}
 	if busy {
-		if s.demandStarted.IsZero() {
-			s.demandStarted = now
-		}
-		if s.primary.throughput.Source == "active" && s.throughputClass(s.primary, now) >= 2 && now.Sub(s.demandStarted) >= 20*time.Second && s.challenger == nil {
-			for _, member := range s.members {
-				if s.demandChallengerEligibleLocked(member, now) {
-					s.challenger = member
-					s.challengerUntil = now.Add(5 * time.Minute)
-					break
-				}
-			}
-		}
 		return
 	}
-	s.demandStarted = time.Time{}
-	if s.challenger != nil && (now.After(s.challengerUntil) || !s.demandChallengerEligibleLocked(s.challenger, now)) {
-		s.challenger = nil
-	}
 	var candidate *smartMember
-	if s.challenger != nil {
-		candidate = s.challenger
-	} else {
-		ordered := []*smartMember{s.primary, s.standby}
-		ordered = append(ordered, s.members...)
-		oldest := now
-		for _, member := range ordered {
-			if member == nil || member.state != "healthy" {
-				continue
-			}
-			if member.throughput.Source != "active" || member.throughput.At.IsZero() || now.Sub(member.throughput.At) >= 24*time.Hour {
-				if candidate == nil || member.lastThroughput.Before(oldest) {
-					candidate = member
-					oldest = member.lastThroughput
-				}
+	ordered := []*smartMember{s.primary, s.standby}
+	ordered = append(ordered, s.members...)
+	oldest := now
+	for _, member := range ordered {
+		if member == nil || member.state != "healthy" {
+			continue
+		}
+		if member.throughput.Source != "active" || member.throughput.At.IsZero() || now.Sub(member.throughput.At) >= 24*time.Hour {
+			if candidate == nil || member.lastThroughput.Before(oldest) {
+				candidate = member
+				oldest = member.lastThroughput
 			}
 		}
 	}
-	if candidate != nil && candidate != s.primary && candidate != s.standby && s.challenger != candidate && !s.lastChallenger.IsZero() && now.Sub(s.lastChallenger) < time.Hour {
+	if candidate != nil && candidate != s.primary && candidate != s.standby && !s.lastChallenger.IsZero() && now.Sub(s.lastChallenger) < time.Hour {
 		return
 	}
 	if candidate == nil || candidate.queued["throughput"] {
@@ -2040,6 +2040,7 @@ func (s *Smart) Close() (err error) {
 			return
 		}
 		s.closed = true
+		s.clearDegradationLocked()
 		for _, member := range s.members {
 			s.memberGeneration++
 			member.generation = s.memberGeneration

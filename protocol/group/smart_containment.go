@@ -201,6 +201,7 @@ func (s *Smart) loop(ctx context.Context) {
 		s.contain("restart", func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
+			s.clearDegradationLocked()
 			if s.workCancel != nil {
 				s.workCancel()
 			}
@@ -278,7 +279,7 @@ func (s *Smart) runJob(job smartJob) smartResult {
 type smartContainmentKey struct{}
 
 func (s *Smart) runOperation(job smartJob) (result smartResult) {
-	result = smartResult{member: job.member, kind: job.kind, operator: job.operator, confirm: job.confirm, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, reservation: job.reservation}
+	result = smartResult{member: job.member, kind: job.kind, operator: job.operator, confirm: job.confirm, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, reservation: job.reservation, episode: job.episode, purpose: job.purpose}
 	started := false
 	defer func() {
 		if value := recover(); value != nil {
@@ -301,6 +302,10 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 		result.err = job.ctx.Err()
 		return
 	}
+	if job.episode != nil && !s.degradationJobValid(job) {
+		result.err = context.Canceled
+		return
+	}
 	started = true
 	s.injectPanic("probe/" + job.kind)
 	switch job.kind {
@@ -311,7 +316,15 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 	case "direct":
 		result.rtt, result.err = s.directProbe(workCtx, job.country, s.directSeed)
 	case "throughput":
-		result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.networkType == "wifi" || s.cellularUploadAllowed())
+		if job.episode != nil {
+			var passive func() int64
+			if job.purpose == smartDegradationConfirmation {
+				passive = func() int64 { return s.degradationPassive(job.episode) }
+			}
+			result.download, result.bytes, result.err = smartMeasureDegradation(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, job.capBytes, s.targetMbps, passive, s.clock)
+		} else {
+			result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.networkType == "wifi" || s.cellularUploadAllowed())
+		}
 	}
 	return
 }
