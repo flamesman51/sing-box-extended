@@ -335,6 +335,11 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			if bulk.bytes.Load() <= before || members[1].fixtures.bulkBytes.Load() != 0 {
 				t.Fatal("original download stopped or moved to replacement")
 			}
+			select {
+			case err := <-bulk.done:
+				t.Fatalf("original download terminated before cancellation: %v", err)
+			default:
+			}
 			if scenario == "two_slow_one_fast" {
 				if members[1].fixtures.downloads.Load() <= 0 || members[2].fixtures.downloads.Load() != 0 {
 					t.Fatal("fresh slow challenger B was not tested before untried C")
