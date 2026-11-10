@@ -96,6 +96,67 @@ func TestSmartOutageExposureExcludesPauseAndOtherNetworks(t *testing.T) {
 	}
 }
 
+func TestSmartOutageDenominatorsExcludeGroupMeasurementLoad(t *testing.T) {
+	s, clock := smartProfileTestGroup(t, "stability-downtime")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observeAllOutagesLocked(clock.now)
+	clock.Advance(time.Hour)
+	s.openOutageLocked(s.primary, clock.now)
+	s.observeOutageRecoveryLocked(s.primary, true, clock.now)
+	recoveryAt := clock.now.UnixNano()
+	s.primary.state = "quarantined"
+	s.observeAllOutagesLocked(clock.now)
+
+	s.measurementLoad.executing = make(map[*smartMeasurementLease]context.CancelFunc)
+	first, second := &smartMeasurementLease{}, &smartMeasurementLease{}
+	setExecuting := func(lease *smartMeasurementLease, executing bool) {
+		s.observeAllOutagesLocked(clock.now)
+		if executing {
+			s.measurementLoad.executing[lease] = func() {}
+		} else {
+			delete(s.measurementLoad.executing, lease)
+		}
+		s.observeAllOutagesLocked(clock.now)
+	}
+	setExecuting(first, true)
+	clock.Advance(20 * time.Minute)
+	setExecuting(second, true)
+	clock.Advance(20 * time.Minute)
+	setExecuting(first, false)
+	clock.Advance(20 * time.Minute)
+	setExecuting(second, false)
+
+	for _, member := range s.members {
+		statistic := s.history.Stats["wifi"][member.identity]
+		want := math.Exp2(-1.0 / 72)
+		if math.Abs(statistic.OutageObservedHours-want) > 1e-12 || math.Abs(statistic.OutageExposureHours-want) > 1e-12 {
+			t.Fatalf("%s gained loaded time or lost the preceding interval: %+v; want observed and exposure=%v", member.tag, statistic, want)
+		}
+	}
+	statistic := s.history.Stats["wifi"][s.primary.identity]
+	if !statistic.OutageOpen || statistic.OutageRecoverySuccesses != 1 || statistic.OutageRecoveryAtNS != recoveryAt {
+		t.Fatalf("loaded hour censored the open episode or changed its recovery timestamp: %+v", statistic)
+	}
+
+	clock.Advance(time.Hour)
+	s.observeAllOutagesLocked(clock.now)
+	for _, member := range s.members {
+		_, exposure, observed, _ := s.outageEvidenceLocked(member, clock.now)
+		wantExposure := math.Exp2(-2.0 / 72)
+		wantObserved := wantExposure + 1
+		if member == s.standby {
+			wantExposure++
+		}
+		if math.Abs(exposure-wantExposure) > 1e-12 || math.Abs(observed-wantObserved) > 1e-12 {
+			t.Fatalf("%s backfilled loaded time or failed to resume observation: exposure=%v observed=%v; want %v and %v", member.tag, exposure, observed, wantExposure, wantObserved)
+		}
+	}
+	if !statistic.OutageOpen || statistic.OutageRecoverySuccesses != 1 || statistic.OutageRecoveryAtNS != recoveryAt {
+		t.Fatalf("unloaded observation changed the existing recovery episode: %+v", statistic)
+	}
+}
+
 func TestSmartOutageMembersAndHierarchyObserveOnce(t *testing.T) {
 	s, clock := smartTestGroup()
 	s.network = smartNetwork{Key: "cell/00101/LTE", Path: []string{"cell/00101/LTE", "cell/00101", "cell", "", "cell"}, Link: true}

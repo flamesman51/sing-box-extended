@@ -301,13 +301,27 @@ func smartMeasure(ctx context.Context, dialer N.Dialer, downloadURL, uploadURL s
 		if !strings.Contains(downloadURL, "{bytes}") {
 			return result, errors.New("smart download URL lacks {bytes}")
 		}
-		result.Download, result.DownloadBins, err = smartMeasureDownload(workCtx, dialer, downloadURL, meter, download, clock)
+		result.Download, result.DownloadBins, err = func() (smartDirectionResult, []int64, error) {
+			phaseCtx, release, phaseErr := smartMeasurementDataContext(workCtx)
+			if phaseErr != nil {
+				return smartDirectionResult{}, nil, phaseErr
+			}
+			defer release()
+			return smartMeasureDownload(phaseCtx, dialer, downloadURL, meter, download, clock)
+		}()
 		if err != nil {
 			return
 		}
 	}
 	if plan.Upload != nil {
-		result.Upload, result.UploadPosts, result.UploadUnverified, err = smartMeasureUpload(workCtx, dialer, uploadURL, meter, upload, clock)
+		result.Upload, result.UploadPosts, result.UploadUnverified, err = func() (smartDirectionResult, []smartUploadObservation, bool, error) {
+			phaseCtx, release, phaseErr := smartMeasurementDataContext(workCtx)
+			if phaseErr != nil {
+				return smartDirectionResult{}, nil, false, phaseErr
+			}
+			defer release()
+			return smartMeasureUpload(phaseCtx, dialer, uploadURL, meter, upload, clock)
+		}()
 	}
 	return
 }

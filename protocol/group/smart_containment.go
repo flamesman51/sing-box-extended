@@ -337,6 +337,26 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 			return
 		}
 	}
+	if job.kind == "udp" {
+		lease, err := s.acquireMeasurementLease(workCtx, true)
+		if err != nil {
+			result.err = err
+			result.unexecuted = true
+			return
+		}
+		defer lease.release()
+		workCtx = lease.context()
+	}
+	if job.kind != "throughput" {
+		s.mu.Lock()
+		epoch, loaded := s.measurementLoad.epoch, len(s.measurementLoad.executing) > 0
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			result.loaded = loaded || len(s.measurementLoad.executing) > 0 || epoch != s.measurementLoad.epoch
+			s.mu.Unlock()
+		}()
+	}
 	started = true
 	s.injectPanic("probe/" + job.kind)
 	switch job.kind {

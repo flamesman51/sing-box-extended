@@ -11,6 +11,7 @@ type smartOutageObservation struct {
 	at                                             time.Time
 	pausedTotal                                    time.Duration
 	active                                         bool
+	loaded                                         bool
 	atRisk                                         bool
 }
 
@@ -38,13 +39,15 @@ func (s *Smart) observeOutagesLocked(member *smartMember, now time.Time) {
 		path: path, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: member.generation,
 		at: now, pausedTotal: pausedTotal, active: !s.paused && !s.closed && !s.loopStopped && !s.offline && s.network.Link,
 		atRisk: member.state == "healthy" || member.state == "suspect",
+		loaded: len(s.measurementLoad.executing) > 0,
 	}
 	continuous := observed && previous.active && current.active && samePath && previous.generation == current.generation && previous.configGeneration == current.configGeneration && previous.memberGeneration == current.memberGeneration
 	elapsed := time.Duration(0)
-	if continuous {
+	// Load suspends denominators without interrupting the episode's lifecycle continuity.
+	if continuous && !previous.loaded && !current.loaded {
 		elapsed = max(now.Sub(previous.at)-max(pausedTotal-previous.pausedTotal, 0), 0)
 	}
-	if current.active || elapsed > 0 {
+	if current.active && !current.loaded || elapsed > 0 {
 		for index, key := range s.network.Path {
 			if key == "" || slices.Contains(s.network.Path[:index], key) {
 				continue

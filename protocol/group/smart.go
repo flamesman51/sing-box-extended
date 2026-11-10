@@ -92,6 +92,7 @@ type smartMember struct {
 	generation                                                                uint64
 	state                                                                     string
 	probation                                                                 int
+	suspectOperator                                                           int
 	emergency                                                                 bool
 	quarantineLevel                                                           int
 	quarantineDecayAt                                                         time.Time
@@ -171,6 +172,8 @@ type smartResult struct {
 	udpBurstSizes                                  []int
 	udpBursts                                      int
 	plan                                           smartMeasurementPlan
+	loaded                                         bool
+	unexecuted                                     bool
 }
 
 type smartURLWaiter struct {
@@ -218,6 +221,9 @@ type Smart struct {
 	results                                                                              chan smartResult
 	healthJobs, otherJobs                                                                chan smartJob
 	pending                                                                              []smartJob
+	measurementLoad                                                                      smartMeasurementLoad
+	measurementPrimaryGate                                                               *smartMember
+	measurementPrimaryTimeout                                                            time.Time
 	cancel                                                                               context.CancelFunc
 	workCtx                                                                              context.Context
 	workCancel                                                                           context.CancelFunc
@@ -969,7 +975,16 @@ func (s *Smart) runLoop(ctx context.Context) {
 func (s *Smart) waitLoop(ctx context.Context, paused bool) {
 	var timerC <-chan time.Time
 	if !paused {
-		timer := s.clock.NewTimer(time.Second)
+		s.mu.Lock()
+		delay := time.Second
+		if !s.measurementPrimaryTimeout.IsZero() && len(s.measurementLoad.executing) > 0 {
+			remaining := s.measurementPrimaryTimeout.Add(10 * time.Second).Sub(s.clock.Now())
+			if remaining > 0 {
+				delay = min(delay, remaining)
+			}
+		}
+		s.mu.Unlock()
+		timer := s.clock.NewTimer(delay)
 		defer timer.Stop()
 		timerC = timer.C()
 	}
@@ -1372,6 +1387,7 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 		s.updateNotificationLocked(now)
 		return nil
 	}
+	s.checkMeasurementPrimaryLocked(now)
 	if s.profileEngine() {
 		for _, member := range s.members {
 			s.observeOutagesLocked(member, now)
@@ -1487,7 +1503,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 	if member != nil && member.generation != result.memberGeneration {
 		return nil
 	}
-	if s.profileEngine() && member != nil {
+	if s.profileEngine() && member != nil && (!result.loaded || result.err != nil && !smartProbeTimeout(result.err)) {
 		s.observeOutagesLocked(member, now)
 	}
 	if member != nil {
@@ -1502,6 +1518,9 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 				s.queueLocked(member, "udp443", 0, false, now)
 			}
 		}
+		if result.kind == "throughput" {
+			s.cancelMemberMeasurementLocked(member)
+		}
 	}
 	if result.purpose == smartImprovementConfirmation && !s.improvementConfirmationJobValidLocked(member, result.primaryEpoch, result.improvementEpoch, now) {
 		return nil
@@ -1512,6 +1531,18 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 	}
 	if result.kind == "direct" {
 		s.directInflight = false
+	}
+	if result.unexecuted {
+		return nil
+	}
+	if result.loaded && (result.err == nil || smartProbeTimeout(result.err)) {
+		if result.kind == "tcp" {
+			if result.err != nil && member == s.primary {
+				s.openMeasurementPrimaryGateLocked(now)
+			}
+			s.finishURLWaitersLocked(result)
+		}
+		return nil
 	}
 	if result.contained {
 		if result.kind == "tcp" {
@@ -1572,7 +1603,6 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		}
 		s.dirty = true
 	case "throughput":
-		s.cancelMemberMeasurementLocked(member)
 		s.applyMeasurementResultLocked(result, now)
 	case "tcp":
 		if s.profileEngine() {
@@ -1604,6 +1634,10 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 				if !wasHealthy {
 					member.healthySince = now
 				}
+			}
+			if member == s.primary && member.state == "healthy" {
+				s.measurementPrimaryGate, s.measurementPrimaryTimeout = nil, time.Time{}
+				s.wakeMeasurementLoadLocked()
 			}
 			s.profileMemberStateChangedLocked(member, now)
 			if !s.hasEligiblePrimaryLocked(now) {
@@ -1642,12 +1676,17 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			if !result.confirm {
 				if member.state == "healthy" {
 					member.state = "suspect"
+					if member == s.primary {
+						s.measurementPrimaryGate = member
+						s.wakeMeasurementLoadLocked()
+					}
 					s.cancelMemberMeasurementLocked(member)
 					if episode := s.degradation.episode; episode != nil && (member == episode.primary || member == episode.challenger) {
 						s.clearDegradationLocked()
 					}
 				}
 				s.profileMemberStateChangedLocked(member, now)
+				member.suspectOperator = (result.operator + 1) % 3
 				s.queueLocked(member, "tcp", (result.operator+1)%3, true, now)
 				if member == s.primary && s.standby != nil {
 					s.queueLocked(s.standby, "tcp", (result.operator+1)%3, false, now)
@@ -1911,6 +1950,8 @@ func (s *Smart) switchLocked(member *smartMember, kind, reason string, now time.
 	s.clearDegradationLocked()
 	s.primaryEpoch++
 	s.primary = member
+	s.measurementPrimaryGate, s.measurementPrimaryTimeout = nil, time.Time{}
+	s.wakeMeasurementLoadLocked()
 	s.selectedAt = now
 	s.selectionGeneration++
 	s.eventLocked(kind, previous, member.tag, s.network.Key, reason, now)
@@ -2177,7 +2218,7 @@ func (s *Smart) finishURLWaitersLocked(result smartResult) {
 		if result.contained {
 			waiter.err = errSmartContained
 		}
-		if result.err == nil && !result.contained {
+		if result.err == nil && !result.contained && !result.loaded && !result.unexecuted {
 			waiter.result[result.member.tag] = uint16(min(result.rtt.Milliseconds(), 65535))
 		}
 		if len(waiter.remaining) == 0 {
