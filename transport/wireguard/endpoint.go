@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -16,6 +17,7 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
@@ -126,6 +128,22 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	}, nil
 }
 
+// logDeviceError mirrors wireguard-go's data path for handshake sends, which
+// report the one-time GSO fallback as a failure even when the resend succeeded.
+func logDeviceError(l logger.Logger, format string, args ...any) {
+	for i, arg := range args {
+		var errGSO conn.ErrUDPGSODisabled
+		if err, isErr := arg.(error); isErr && errors.As(err, &errGSO) {
+			l.Debug(errGSO.Error())
+			if errGSO.RetryErr == nil {
+				return
+			}
+			args[i] = errGSO.RetryErr
+		}
+	}
+	l.Error(fmt.Sprintf(strings.ToLower(format), args...))
+}
+
 func (e *Endpoint) Start(postStart bool) error {
 	hasDomainPeer := common.Any(e.peers, func(peer peerConfig) bool {
 		return peer.destination.IsDomain()
@@ -158,7 +176,7 @@ func (e *Endpoint) Start(postStart bool) error {
 			e.options.Logger.Debug(fmt.Sprintf(strings.ToLower(format), args...))
 		},
 		Errorf: func(format string, args ...any) {
-			e.options.Logger.Error(fmt.Sprintf(strings.ToLower(format), args...))
+			logDeviceError(e.options.Logger, format, args...)
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers, e.options.PreallocatedBuffersPerPool, e.options.DisablePauses)
