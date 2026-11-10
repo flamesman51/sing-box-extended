@@ -215,6 +215,8 @@ The gomobile API exposes `OverrideOptions.SmartPolicy string`, `SmartProfiles() 
 
 An empty `SmartPolicy` preserves the subscription configuration. A nonempty value is an object containing only `preference`, `throughput.target_mbps`, `throughput.enabled`, the three profile-owned probe intervals, `interrupt_on_failover`, and `udp.quic_policy`. Before parsing the subscription, the service removes `preference` and all seven profile-owned fields from every `type: "smart"` outbound, then deep-merges this object. Other settings, including budgets, URLs, probe timeouts, member lists, and non-Smart outbounds, are unchanged. For example, `{"preference":{"profile":"balance-speed-4k"}}` replaces a subscription's explicit `target_mbps: 8` with the profile's target of `25`. Configuration comments use the normal parser. Invalid JSON, unknown fields, null values, and invalid policy values fail with `smart policy override: <reason>`; `CheckSmartPolicy` applies the same validation.
 
+Field lookup and removal follow the configuration decoder's case-insensitive Unicode folding. Case variants of profile-owned fields are all removed before the canonical override keys are merged.
+
 `SmartProfiles` returns a JSON array in the built-in table order. Each object contains `name`, `rank`, `min_stability`, `target_mbps`, `throughput_enabled`, `heartbeat_interval`, `standby_interval`, `background_interval`, `interrupt_on_failover`, `quic_policy`, `improvement`, `dwell`, `confirmations`, `confirmation_interval`, `tier_restore`, `hysteresis`, and `speed_margin`. Values come from the core resolver; durations are Go duration strings and numeric values are JSON numbers.
 
 The status `preference` object also includes:

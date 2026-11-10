@@ -107,3 +107,84 @@ func TestSmartPolicyServiceOverride(t *testing.T) {
 		t.Fatalf("service accepted invalid policy: %v", err)
 	}
 }
+
+func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
+	for _, test := range []struct {
+		name, config string
+	}{
+		{"mixed case", `{
+			"log":{"disabled":true},
+			"Outbounds":[
+				{"type":"direct","tag":"direct"},
+				{"Type":"smart","tag":"smart","outbounds":["direct"],
+				 "Preference":{"profile":"data-saver","rank":["latency"]},
+				 "Throughput":{"Target_Mbps":8,"Enabled":false,"other_daily_budget_mb":0,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0},
+				 "Probe":{"Heartbeat_Interval":"40s","Standby_Interval":"3m","Background_Interval":"9m","disable_direct":true},
+				 "Interrupt_On_Failover":false,"UDP":{"Quic_Policy":"off","enabled":false}}
+			]
+		}`},
+		{"case aliases", `{
+			"log":{"disabled":true},
+			"outbounds":[{"type":"direct","tag":"shadowed"}],
+			"OUTBOUNDS":[
+				{"type":"direct","tag":"direct"},
+				{"type":"direct","Type":"smart","tag":"smart","outbounds":["direct"],
+				 "preference":{"profile":"phone"},"PREFERENCE":{"profile":"data-saver"},
+				 "throughput":{"target_mbps":4},"THROUGHPUT":{"target_mbps":8,"Target_Mbps":8,"enabled":false,"ENABLED":false,"other_daily_budget_mb":0,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0},
+				 "probe":{"heartbeat_interval":"50s"},"PROBE":{"heartbeat_interval":"40s","HEARTBEAT_INTERVAL":"40s","standby_interval":"3m","STANDBY_INTERVAL":"3m","background_interval":"9m","BACKGROUND_INTERVAL":"9m","disable_direct":true},
+				 "interrupt_on_failover":false,"INTERRUPT_ON_FAILOVER":false,
+				 "udp":{"quic_policy":"route_only"},"UDP":{"quic_policy":"off","QUIC_POLICY":"off","enabled":false}}
+			]
+		}`},
+		{"unicode folding", `{
+			"log":{"disabled":true},
+			"Outboundſ":[
+				{"type":"direct","tag":"direct"},
+				{"Type":"smart","tag":"smart","outbounds":["direct"],
+				 "preference":{"profile":"data-saver"},
+				 "throughput":{"target_mbpſ":8,"enabled":false,"other_daily_budget_mb":0,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0},
+				 "probe":{"heartbeat_interval":"40s","ſtandby_interval":"3m","background_interval":"9m","disable_direct":true},
+				 "interrupt_on_failover":false,"udp":{"quic_policy":"off","enabled":false}}
+			]
+		}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			ctx := filemanager.WithDefault(baseContext(nil), directory, directory, os.Getuid(), os.Getgid())
+			server := daemon.NewStartedService(daemon.ServiceOptions{Context: ctx, LogMaxLines: 10})
+			t.Cleanup(server.Close)
+			t.Cleanup(func() { _ = server.CloseService() })
+			policy := "{ \"preference\": {\"profile\": \"balance-speed-4k\"} }"
+			if err := server.StartOrReloadService(ctx, test.config, &daemon.OverrideOptions{SmartPolicy: policy}); err != nil {
+				t.Fatal(err)
+			}
+			response, err := server.GetSmartStatus(ctx, &daemon.GetSmartStatusRequest{Tag: "smart"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var status struct {
+				Preference struct {
+					Base, Source string
+					Custom       bool
+					OverrideHash string `json:"override_hash"`
+					Resolved     map[string]any
+				}
+			}
+			if err = json.Unmarshal([]byte(response.GetJson()), &status); err != nil {
+				t.Fatal(err)
+			}
+			preference := status.Preference
+			wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte(policy)))
+			if preference.Base != "balance-speed-4k" || preference.Custom || preference.Source != "override" || preference.OverrideHash != wantHash {
+				t.Fatalf("override metadata = %s", response.GetJson())
+			}
+			resolved := preference.Resolved
+			if !reflect.DeepEqual(resolved["throughput"], map[string]any{"target_mbps": float64(25), "enabled": true}) ||
+				!reflect.DeepEqual(resolved["probe"], map[string]any{"heartbeat_interval": "15s", "standby_interval": "1m0s", "background_interval": "5m0s"}) ||
+				resolved["interrupt_on_failover"] != true ||
+				!reflect.DeepEqual(resolved["udp"], map[string]any{"quic_policy": "auto"}) {
+				t.Fatalf("case variant survived override: %s", response.GetJson())
+			}
+		})
+	}
+}

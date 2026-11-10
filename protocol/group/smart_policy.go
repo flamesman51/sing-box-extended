@@ -3,6 +3,7 @@ package group
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
@@ -113,55 +114,89 @@ func ApplySmartPolicyOverride(config, policy string) (string, error) {
 	if root == nil {
 		return "", fmt.Errorf("decode config: expected an object")
 	}
-	if _, exists := root["outbounds"]; !exists {
+	if !removeSmartPolicyField(root, "outbounds") {
 		return config, nil
 	}
-	var outbounds []map[string]json.RawMessage
-	if err = json.Unmarshal(root["outbounds"], &outbounds); err != nil {
+	var envelope struct {
+		Outbounds []json.RawMessage `json:"outbounds"`
+	}
+	if err = json.Unmarshal([]byte(config), &envelope); err != nil {
 		return "", fmt.Errorf("decode config outbounds: %w", err)
 	}
-	for _, outbound := range outbounds {
-		var outboundType string
-		if err = json.Unmarshal(outbound["type"], &outboundType); err != nil || outboundType != "smart" {
+	for index, content := range envelope.Outbounds {
+		var fields struct {
+			Type       string          `json:"type"`
+			Throughput json.RawMessage `json:"throughput"`
+			Probe      json.RawMessage `json:"probe"`
+			UDP        json.RawMessage `json:"udp"`
+		}
+		if err = json.Unmarshal(content, &fields); err != nil {
+			return "", fmt.Errorf("decode config outbound: %w", err)
+		}
+		if fields.Type != "smart" {
 			continue
 		}
-		delete(outbound, "preference")
-		delete(outbound, "interrupt_on_failover")
+		var outbound map[string]json.RawMessage
+		if err = json.Unmarshal(content, &outbound); err != nil {
+			return "", fmt.Errorf("decode config smart outbound: %w", err)
+		}
+		removeSmartPolicyField(outbound, "type")
+		outbound["type"] = json.RawMessage(`"smart"`)
+		removeSmartPolicyField(outbound, "preference")
+		removeSmartPolicyField(outbound, "interrupt_on_failover")
 		for _, field := range []struct {
-			name string
-			keys []string
+			name    string
+			content json.RawMessage
+			keys    []string
 		}{
-			{"throughput", []string{"target_mbps", "enabled"}},
-			{"probe", []string{"heartbeat_interval", "standby_interval", "background_interval"}},
-			{"udp", []string{"quic_policy"}},
+			{"throughput", fields.Throughput, []string{"target_mbps", "enabled"}},
+			{"probe", fields.Probe, []string{"heartbeat_interval", "standby_interval", "background_interval"}},
+			{"udp", fields.UDP, []string{"quic_policy"}},
 		} {
-			if content, exists := outbound[field.name]; exists {
-				var nested map[string]json.RawMessage
-				if err = json.Unmarshal(content, &nested); err != nil {
-					return "", fmt.Errorf("decode config smart %s: %w", field.name, err)
-				}
-				if nested == nil {
-					continue
-				}
-				for _, key := range field.keys {
-					delete(nested, key)
-				}
-				outbound[field.name], err = json.Marshal(nested)
-				if err != nil {
-					return "", err
-				}
+			if !removeSmartPolicyField(outbound, field.name) {
+				continue
+			}
+			var nested map[string]json.RawMessage
+			if err = json.Unmarshal(field.content, &nested); err != nil {
+				return "", fmt.Errorf("decode config smart %s: %w", field.name, err)
+			}
+			if nested == nil {
+				outbound[field.name] = field.content
+				continue
+			}
+			for _, key := range field.keys {
+				removeSmartPolicyField(nested, key)
+			}
+			outbound[field.name], err = json.Marshal(nested)
+			if err != nil {
+				return "", err
 			}
 		}
 		if err = mergeSmartPolicy(outbound, override); err != nil {
 			return "", err
 		}
+		envelope.Outbounds[index], err = json.Marshal(outbound)
+		if err != nil {
+			return "", err
+		}
 	}
-	root["outbounds"], err = json.Marshal(outbounds)
+	root["outbounds"], err = json.Marshal(envelope.Outbounds)
 	if err != nil {
 		return "", err
 	}
 	content, err := json.Marshal(root)
 	return string(content), err
+}
+
+func removeSmartPolicyField(object map[string]json.RawMessage, name string) bool {
+	found := false
+	for key := range object {
+		if strings.EqualFold(key, name) {
+			delete(object, key)
+			found = true
+		}
+	}
+	return found
 }
 
 func mergeSmartPolicy(destination, override map[string]json.RawMessage) error {
