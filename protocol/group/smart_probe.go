@@ -284,7 +284,12 @@ func smartUDPExchange(ctx context.Context, dialer N.Dialer, destination M.Socksa
 		}
 	}
 	start := time.Now()
-	if _, err = conn.WriteTo(request, destination); err != nil {
+	// Tunnel packet conns (gVisor gonet behind WireGuard) type-assert *net.UDPAddr; pass M.Socksaddr only for FQDNs.
+	var target net.Addr = destination
+	if destination.IsIP() {
+		target = destination.UDPAddr()
+	}
+	if _, err = conn.WriteTo(request, target); err != nil {
 		return 0, smartProbeContextError(ctx, err)
 	}
 	var buffer [2048]byte
