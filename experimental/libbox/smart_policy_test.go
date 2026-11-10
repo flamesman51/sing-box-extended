@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/daemon"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/service/filemanager"
 )
@@ -186,5 +187,42 @@ func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
 				t.Fatalf("case variant survived override: %s", response.GetJson())
 			}
 		})
+	}
+}
+
+func TestSmartPolicyPreservesNonPolicyAliasOrder(t *testing.T) {
+	config := `{
+		"outbounds":[
+			{"type":"direct","tag":"one"},
+			{"type":"direct","tag":"two"},
+			{"type":"smart","tag":"smart","outbounds":["one"],"OUTBOUNDS":["two"],
+			 "probe":{"timeout":"7s","TIMEOUT":"1s"},
+			 "throughput":{"other_daily_budget_mb":7,"OTHER_DAILY_BUDGET_MB":1,
+			               "download_url":"https://first.example/{bytes}","DOWNLOAD_URL":"https://last.example/{bytes}"},
+			 "udp":{"enabled":true,"ENABLED":false}}
+		]
+	}`
+	ctx := baseContext(nil)
+	before, err := parseConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := group.ApplySmartPolicyOverride(config, `{"preference":{"profile":"balance-speed-4k"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := parseConfig(ctx, merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, parsed := range []option.Options{before, after} {
+		smart := parsed.Outbounds[2].Options.(*option.SmartOutboundOptions)
+		if smart.Probe.Timeout.Build().String() != "1s" ||
+			smart.Throughput.OtherDailyBudgetMB == nil || *smart.Throughput.OtherDailyBudgetMB != 1 ||
+			smart.Throughput.DownloadURL != "https://last.example/{bytes}" ||
+			smart.UDP.Enabled == nil || *smart.UDP.Enabled ||
+			!reflect.DeepEqual([]string(smart.Outbounds), []string{"two"}) {
+			t.Fatalf("non-policy alias precedence changed: %#v; merged=%s", smart, merged)
+		}
 	}
 }

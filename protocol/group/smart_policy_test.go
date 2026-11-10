@@ -152,3 +152,30 @@ func TestSmartPolicyPreferenceStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestSmartPolicyStrictJSON(t *testing.T) {
+	for _, test := range []struct {
+		name, input, path string
+	}{
+		{"line comment", "{\n// comment\n\"preference\":{\"profile\":\"phone\"}}", "policy"},
+		{"block comment", `{"preference":/* comment */{"profile":"phone"}}`, "preference"},
+		{"trailing comma", `{"preference":{"profile":"phone",}}`, "preference"},
+		{"top level case", `{"Preference":{"profile":"phone"}}`, "Preference"},
+		{"nested case", `{"preference":{"Profile":"phone"}}`, "preference.Profile"},
+		{"switch case", `{"preference":{"switch":{"Dwell":"1m"}}}`, "preference.switch.Dwell"},
+		{"top level duplicate", `{"preference":{},"preference":{"profile":"phone"}}`, "preference"},
+		{"nested duplicate", `{"preference":{"switch":{"dwell":"1m","dwell":"2m"}}}`, "preference.switch.dwell"},
+		{"escaped duplicate", `{"preference":{"profile":"phone","\u0070rofile":"server"}}`, "preference.profile"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := CheckSmartPolicy(test.input)
+			if err == nil || !strings.HasPrefix(err.Error(), "smart policy override: ") || !strings.Contains(err.Error(), test.path) {
+				t.Fatalf("strict JSON error does not name %s: %v", test.path, err)
+			}
+			_, appliedErr := ApplySmartPolicyOverride(`{"outbounds":[]}`, test.input)
+			if appliedErr == nil || appliedErr.Error() != err.Error() {
+				t.Fatalf("application validation differs: check=%v apply=%v", err, appliedErr)
+			}
+		})
+	}
+}

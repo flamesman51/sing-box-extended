@@ -1,12 +1,16 @@
 package group
 
 import (
+	"bytes"
+	stdjson "encoding/json"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/common/json/badjson"
 )
 
 func smartPreferenceHasLeaves(preference *option.SmartPreferenceOptions) bool {
@@ -26,20 +30,21 @@ func CheckSmartPolicy(policy string) error {
 	return err
 }
 
-func parseSmartPolicy(policy string) (map[string]json.RawMessage, error) {
-	var object map[string]any
-	if err := json.Unmarshal([]byte(policy), &object); err != nil {
+func parseSmartPolicy(policy string) (*badjson.JSONObject, error) {
+	decoder := stdjson.NewDecoder(strings.NewReader(policy))
+	decoder.UseNumber()
+	if err := checkSmartPolicyValue(decoder, ""); err != nil {
 		return nil, fmt.Errorf("smart policy override: %w", err)
 	}
-	if object == nil {
-		return nil, fmt.Errorf("smart policy override: expected an object")
-	}
-	if err := checkSmartPolicyKeys(object, ""); err != nil {
-		return nil, fmt.Errorf("smart policy override: %w", err)
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("unexpected value after policy object")
+		}
+		return nil, fmt.Errorf("smart policy override: policy: %w", err)
 	}
 	var options option.SmartOutboundOptions
 	if err := json.UnmarshalDisallowUnknownFields([]byte(policy), &options); err != nil {
-		return nil, fmt.Errorf("smart policy override: %w", err)
+		return nil, fmt.Errorf("smart policy override: policy: %w", err)
 	}
 	// Override fields must be valid even when the selected base uses the legacy engine.
 	if err := options.ValidateProfileFields(); err != nil {
@@ -48,18 +53,26 @@ func parseSmartPolicy(policy string) (map[string]json.RawMessage, error) {
 	if _, err := resolveSmartPreference(&options); err != nil {
 		return nil, fmt.Errorf("smart policy override: %w", err)
 	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(policy), &raw); err != nil {
-		return nil, fmt.Errorf("smart policy override: %w", err)
+	raw, err := decodeSmartPolicyObject([]byte(policy))
+	if err != nil {
+		return nil, fmt.Errorf("smart policy override: policy: %w", err)
 	}
 	return raw, nil
 }
 
-func checkSmartPolicyKeys(object map[string]any, path string) error {
+func checkSmartPolicyValue(decoder *stdjson.Decoder, path string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("%s: %w", pathOrPolicy(path), err)
+	}
 	var allowed []string
 	switch path {
 	case "":
 		allowed = []string{"preference", "throughput", "probe", "interrupt_on_failover", "udp"}
+	case "preference":
+		allowed = []string{"profile", "rank", "min_stability", "speed_floor_hysteresis", "switch"}
+	case "preference.switch":
+		allowed = []string{"improvement", "dwell", "confirmations", "confirmation_interval", "tier_restore", "speed_margin"}
 	case "throughput":
 		allowed = []string{"target_mbps", "enabled"}
 	case "probe":
@@ -67,28 +80,46 @@ func checkSmartPolicyKeys(object map[string]any, path string) error {
 	case "udp":
 		allowed = []string{"quic_policy"}
 	}
-	for key, value := range object {
-		if allowed != nil && !slices.Contains(allowed, key) {
-			return fmt.Errorf("unknown field %q in %s", key, pathOrPolicy(path))
-		}
-		field := key
-		if path != "" {
-			field = path + "." + key
-		}
-		if value == nil {
-			return fmt.Errorf("%s must not be null", field)
-		}
-		switch value := value.(type) {
-		case map[string]any:
-			if err := checkSmartPolicyKeys(value, field); err != nil {
+	if allowed != nil && token != stdjson.Delim('{') {
+		return fmt.Errorf("%s: expected an object", pathOrPolicy(path))
+	}
+	switch token {
+	case nil:
+		return fmt.Errorf("%s must not be null", pathOrPolicy(path))
+	case stdjson.Delim('{'):
+		seen := make(map[string]bool)
+		for decoder.More() {
+			token, err = decoder.Token()
+			if err != nil {
+				return fmt.Errorf("%s: %w", pathOrPolicy(path), err)
+			}
+			key := token.(string)
+			field := key
+			if path != "" {
+				field = path + "." + key
+			}
+			if seen[key] {
+				return fmt.Errorf("duplicate key %s", field)
+			}
+			seen[key] = true
+			if !slices.Contains(allowed, key) {
+				return fmt.Errorf("unknown key %s", field)
+			}
+			if err = checkSmartPolicyValue(decoder, field); err != nil {
 				return err
 			}
-		case []any:
-			for _, item := range value {
-				if item == nil {
-					return fmt.Errorf("%s must not contain null", field)
-				}
+		}
+		if _, err = decoder.Token(); err != nil {
+			return fmt.Errorf("%s: %w", pathOrPolicy(path), err)
+		}
+	case stdjson.Delim('['):
+		for index := 0; decoder.More(); index++ {
+			if err = checkSmartPolicyValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
 			}
+		}
+		if _, err = decoder.Token(); err != nil {
+			return fmt.Errorf("%s: %w", pathOrPolicy(path), err)
 		}
 	}
 	return nil
@@ -107,12 +138,9 @@ func ApplySmartPolicyOverride(config, policy string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var root map[string]json.RawMessage
-	if err = json.Unmarshal([]byte(config), &root); err != nil {
+	root, err := decodeSmartPolicyObject([]byte(config))
+	if err != nil {
 		return "", fmt.Errorf("decode config: %w", err)
-	}
-	if root == nil {
-		return "", fmt.Errorf("decode config: expected an object")
 	}
 	if !removeSmartPolicyField(root, "outbounds") {
 		return config, nil
@@ -136,12 +164,12 @@ func ApplySmartPolicyOverride(config, policy string) (string, error) {
 		if fields.Type != "smart" {
 			continue
 		}
-		var outbound map[string]json.RawMessage
-		if err = json.Unmarshal(content, &outbound); err != nil {
+		outbound, err := decodeSmartPolicyObject(content)
+		if err != nil {
 			return "", fmt.Errorf("decode config smart outbound: %w", err)
 		}
 		removeSmartPolicyField(outbound, "type")
-		outbound["type"] = json.RawMessage(`"smart"`)
+		outbound.Put("type", json.RawMessage(`"smart"`))
 		removeSmartPolicyField(outbound, "preference")
 		removeSmartPolicyField(outbound, "interrupt_on_failover")
 		for _, field := range []struct {
@@ -156,21 +184,22 @@ func ApplySmartPolicyOverride(config, policy string) (string, error) {
 			if !removeSmartPolicyField(outbound, field.name) {
 				continue
 			}
-			var nested map[string]json.RawMessage
-			if err = json.Unmarshal(field.content, &nested); err != nil {
-				return "", fmt.Errorf("decode config smart %s: %w", field.name, err)
-			}
-			if nested == nil {
-				outbound[field.name] = field.content
+			if bytes.Equal(bytes.TrimSpace(field.content), []byte("null")) {
+				outbound.Put(field.name, field.content)
 				continue
+			}
+			nested, err := decodeSmartPolicyObject(field.content)
+			if err != nil {
+				return "", fmt.Errorf("decode config smart %s: %w", field.name, err)
 			}
 			for _, key := range field.keys {
 				removeSmartPolicyField(nested, key)
 			}
-			outbound[field.name], err = json.Marshal(nested)
+			content, err := json.Marshal(nested)
 			if err != nil {
 				return "", err
 			}
+			outbound.Put(field.name, json.RawMessage(content))
 		}
 		if err = mergeSmartPolicy(outbound, override); err != nil {
 			return "", err
@@ -180,51 +209,90 @@ func ApplySmartPolicyOverride(config, policy string) (string, error) {
 			return "", err
 		}
 	}
-	root["outbounds"], err = json.Marshal(envelope.Outbounds)
+	content, err := json.Marshal(envelope.Outbounds)
 	if err != nil {
 		return "", err
 	}
-	content, err := json.Marshal(root)
+	root.Put("outbounds", json.RawMessage(content))
+	content, err = json.Marshal(root)
 	return string(content), err
 }
 
-func removeSmartPolicyField(object map[string]json.RawMessage, name string) bool {
+func removeSmartPolicyField(object *badjson.JSONObject, name string) bool {
 	found := false
-	for key := range object {
+	for _, key := range object.Keys() {
 		if strings.EqualFold(key, name) {
-			delete(object, key)
+			object.Remove(key)
 			found = true
 		}
 	}
 	return found
 }
 
-func mergeSmartPolicy(destination, override map[string]json.RawMessage) error {
-	for key, value := range override {
-		var nested map[string]json.RawMessage
-		if json.Unmarshal(value, &nested) == nil && nested != nil {
-			var existing map[string]json.RawMessage
-			if content, exists := destination[key]; exists {
-				if err := json.Unmarshal(content, &existing); err != nil {
-					return fmt.Errorf("decode config smart %s: %w", key, err)
+func mergeSmartPolicy(destination, override *badjson.JSONObject) error {
+	for _, entry := range override.Entries() {
+		value := entry.Value.(json.RawMessage)
+		if bytes.HasPrefix(bytes.TrimSpace(value), []byte("{")) {
+			nested, err := decodeSmartPolicyObject(value)
+			if err != nil {
+				return err
+			}
+			existing := new(badjson.JSONObject)
+			if content, exists := destination.Get(entry.Key); exists && !bytes.Equal(bytes.TrimSpace(content.(json.RawMessage)), []byte("null")) {
+				existing, err = decodeSmartPolicyObject(content.(json.RawMessage))
+				if err != nil {
+					return fmt.Errorf("decode config smart %s: %w", entry.Key, err)
 				}
 			}
-			if existing == nil {
-				existing = make(map[string]json.RawMessage)
-			}
-			if err := mergeSmartPolicy(existing, nested); err != nil {
+			if err = mergeSmartPolicy(existing, nested); err != nil {
 				return err
 			}
 			content, err := json.Marshal(existing)
 			if err != nil {
 				return err
 			}
-			destination[key] = content
+			destination.Put(entry.Key, json.RawMessage(content))
 		} else {
-			destination[key] = value
+			destination.Put(entry.Key, value)
 		}
 	}
 	return nil
+}
+
+// Raw values preserve untouched ordering, number precision, and empty objects.
+func decodeSmartPolicyObject(content []byte) (*badjson.JSONObject, error) {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token != json.Delim('{') {
+		return nil, fmt.Errorf("expected an object")
+	}
+	object := new(badjson.JSONObject)
+	for decoder.More() {
+		token, err = decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key := token.(string)
+		var value json.RawMessage
+		if err = decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		object.Remove(key)
+		object.Put(key, value)
+	}
+	if _, err = decoder.Token(); err != nil {
+		return nil, err
+	}
+	if _, err = decoder.Token(); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("unexpected value after object")
+		}
+		return nil, err
+	}
+	return object, nil
 }
 
 func (s *Smart) resolvedSmartPolicy() map[string]any {
