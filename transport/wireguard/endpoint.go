@@ -302,6 +302,13 @@ func (e *Endpoint) Start(postStart bool) error {
 	for _, peer := range e.peers {
 		ipcConf.WriteString(peer.GenerateIpcLines())
 	}
+	// Come up before IpcSet so a listen_port conflict fails here. If the TUN EventUp
+	// goroutine bound it later, it would only log the error and reset the port to 0.
+	err = wgDevice.Up()
+	if err != nil {
+		wgDevice.Close()
+		return E.Cause(err, "start wireguard device")
+	}
 	err = wgDevice.IpcSet(ipcConf.String())
 	if err != nil {
 		wgDevice.Close()
