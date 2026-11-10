@@ -72,6 +72,10 @@ func (e smartEvidence) value(now time.Time) string {
 	return e.state
 }
 
+// smartTCPVerdictTTL keeps the display-only TCP verdict as the latest result across probe
+// cadence changes: two of the slowest (idle, 30 min) intervals. No decision reads it.
+const smartTCPVerdictTTL = time.Hour
+
 type smartThroughput struct {
 	Download, Upload             float64
 	At                           time.Time
@@ -1542,7 +1546,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			}
 			if result.err == nil && member != nil {
 				// Display-only verdict; no decision reads member.tcp, so load cannot bias selection.
-				member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(2 * s.memberIntervalLocked(member, now))}
+				member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(smartTCPVerdictTTL)}
 			}
 			s.finishURLWaitersLocked(result)
 		}
@@ -1616,7 +1620,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			s.syncDegraded = false
 			wasHealthy := member.state == "healthy"
 			member.lastOK = now
-			member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(2 * s.memberIntervalLocked(member, now))}
+			member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(smartTCPVerdictTTL)}
 			member.rtts = append(member.rtts, result.rtt.Seconds()*1000)
 			if len(member.rtts) > 64 {
 				member.rtts = member.rtts[len(member.rtts)-64:]
@@ -1703,7 +1707,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			}
 			member.lastFail = now
 			member.quarantineDecayAt = now
-			member.tcp = smartEvidence{state: "failed", at: now, expires: now.Add(2 * s.heartbeat)}
+			member.tcp = smartEvidence{state: "failed", at: now, expires: now.Add(smartTCPVerdictTTL)}
 			member.emergency = false
 			if s.profileEngine() && (member.state == "healthy" || member.state == "suspect") {
 				s.openOutageLocked(member, now)

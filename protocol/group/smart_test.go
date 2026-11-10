@@ -381,12 +381,19 @@ func TestSmartQuarantineDecayKeepsFailureTimestamp(t *testing.T) {
 	}
 }
 
-func TestSmartStandbyEvidenceUsesStandbyCadence(t *testing.T) {
+func TestSmartTCPVerdictSurvivesIdleCadence(t *testing.T) {
 	s, clock := smartTestGroup()
-	standby := s.standby
-	s.applyResultLocked(smartResult{member: standby, generation: 1, memberGeneration: 1, configGeneration: 1, kind: "tcp", rtt: time.Millisecond}, clock.now)
-	if got := standby.tcp.expires.Sub(clock.now); got != 2*time.Minute {
-		t.Fatalf("standby TCP TTL=%v", got)
+	primary := s.primary
+	s.lastDemand = clock.now
+	s.applyResultLocked(smartResult{member: primary, generation: 1, memberGeneration: 1, configGeneration: 1, kind: "tcp", rtt: time.Millisecond}, clock.now)
+	// Demand stops: the next probe comes at the idle cadence, far beyond 2x heartbeat.
+	clock.Advance(5 * time.Minute)
+	if got := primary.tcp.value(clock.now); got != "ok" {
+		t.Fatalf("verdict between idle probes=%s", got)
+	}
+	clock.Advance(smartTCPVerdictTTL)
+	if got := primary.tcp.value(clock.now); got != "unknown" {
+		t.Fatalf("verdict after an hour without checks=%s", got)
 	}
 }
 
