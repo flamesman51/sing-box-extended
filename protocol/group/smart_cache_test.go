@@ -42,6 +42,40 @@ func newSmartCacheTestGroup(t *testing.T, cache adapter.CacheFile, tag string) *
 	return group
 }
 
+func TestSmartUsesCacheRegisteredAfterConstruction(t *testing.T) {
+	ctx := service.ContextWithDefaultRegistry(context.Background())
+	ctx = service.ContextWith[adapter.OutboundManager](ctx, &smartCacheTestManager{member: &smartFakeOutbound{tag: "member"}})
+	ctx = service.ContextWith[adapter.SmartIdentityProvider](ctx, smartTestIdentityProvider{})
+	created, err := NewSmart(ctx, nil, nil, "auto", option.SmartOutboundOptions{GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"member"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := created.(*Smart)
+	// box.New registers and initializes the cache file only after every outbound is constructed.
+	cache := cachefile.New(ctx, nil, option.CacheFileOptions{Path: filepath.Join(t.TempDir(), "cache.db")})
+	service.MustRegister[adapter.CacheFile](ctx, cache)
+	scope := adapter.NewScope(ctx, nil)
+	if err = cache.Start(adapter.StartStateInitialize, scope); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := scope.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := group.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err = group.Start(adapter.StartStateStart, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = cache.LoadSmartMetadata(); err != nil {
+		t.Fatalf("installation metadata was not persisted: %v", err)
+	}
+}
+
 func TestSmartStartsWithMissingCacheDocuments(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "cache.db")

@@ -219,7 +219,7 @@ func NewSmart(ctx context.Context, _ adapter.Router, logger log.ContextLogger, t
 	s := &Smart{
 		Adapter: outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds), ctx: ctx,
 		outbound: service.FromContext[adapter.OutboundManager](ctx), logger: logger, options: options, clock: smartRealClock{},
-		history: newSmartHistory(), urlHistory: service.PtrFromContext[urltest.HistoryStorage](ctx), cache: service.FromContext[adapter.CacheFile](ctx),
+		history: newSmartHistory(), urlHistory: service.PtrFromContext[urltest.HistoryStorage](ctx),
 		pauseManager: service.FromContext[pause.Manager](ctx), providerManager: service.FromContext[adapter.ProviderManager](ctx),
 		generation: 1, configGeneration: 1, selectionGeneration: 1, leases: make(map[*smartMember]map[*smartLease]struct{}),
 		kick: make(chan struct{}, 1), requests: make(chan smartRequest, 64), results: make(chan smartResult, 64), healthJobs: make(chan smartJob, 3), otherJobs: make(chan smartJob, 2),
@@ -304,6 +304,10 @@ func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				return *p
 			}
 			return d
+		}
+		if s.cache == nil {
+			// box.New registers the cache file only after constructing every outbound.
+			s.cache = service.FromContext[adapter.CacheFile](s.ctx)
 		}
 		ledger, err := acquireSmartLedger(s.cache, s.Tag(), map[string]float64{"wifi": value(s.options.Throughput.WIFIDailyBudgetMB, 300), "cellular": value(s.options.Throughput.CellularDailyBudgetMB, 50), "other": value(s.options.Throughput.OtherDailyBudgetMB, 300)})
 		if err != nil {
