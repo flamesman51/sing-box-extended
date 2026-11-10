@@ -92,14 +92,6 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 	ctx = service.ExtendContext(ctx)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
 	ctx, cancel := context.WithCancel(ctx)
-	if overrideOptions != nil && overrideOptions.SmartPolicy != "" {
-		var err error
-		profileContent, err = group.ApplySmartPolicyOverride(profileContent, overrideOptions.SmartPolicy)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-	}
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
 		cancel()
@@ -107,9 +99,15 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 	}
 	if overrideOptions != nil {
 		if overrideOptions.SmartPolicy != "" {
+			policy, err := group.ParseSmartPolicy(overrideOptions.SmartPolicy)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
 			hash := fmt.Sprintf("%x", sha256.Sum256([]byte(overrideOptions.SmartPolicy)))
 			for _, outbound := range options.Outbounds {
 				if smartOptions, isSmart := outbound.Options.(*option.SmartOutboundOptions); isSmart && outbound.Type == C.TypeSmart {
+					smartOptions.ApplySmartPolicy(policy)
 					smartOptions.SmartPolicyOverrideHash = hash
 				}
 			}

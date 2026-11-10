@@ -12,46 +12,25 @@ import (
 )
 
 func TestSmartPolicyOverride(t *testing.T) {
-	config := `{
-		// Subscription values must not shadow the selected policy.
-		"outbounds": [
-			{"type":"smart","tag":"one","outbounds":["direct"],"preference":{"profile":"phone","rank":["latency"]},"throughput":{"target_mbps":8,"enabled":false,"wifi_daily_budget_mb":123},"probe":{"heartbeat_interval":"40s","standby_interval":"3m","background_interval":"9m","timeout":"7s","disable_direct":true},"interrupt_on_failover":false,"udp":{"quic_policy":"off","enabled":false},"notify_all_dead":false},
-			{"type":"smart","tag":"two","throughput":{"target_mbps":8}},
-			{"type":"direct","tag":"direct","domain_strategy":"prefer_ipv4"}
-		]
-	}`
-	override := `{"preference":{"profile":"balance-speed-4k"},"probe":{"standby_interval":"45s"}}`
-	merged, err := ApplySmartPolicyOverride(config, override)
+	policy, err := ParseSmartPolicy(`{"preference":{"profile":"balance-speed-4k"},"probe":{"standby_interval":"45s"}}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var before, after map[string]json.RawMessage
-	if err = json.Unmarshal([]byte(config), &before); err != nil {
-		t.Fatal(err)
-	}
-	if err = json.Unmarshal([]byte(merged), &after); err != nil {
-		t.Fatal(err)
-	}
-	var original, outbounds []map[string]json.RawMessage
-	_ = json.Unmarshal(before["outbounds"], &original)
-	_ = json.Unmarshal(after["outbounds"], &outbounds)
-	if !reflect.DeepEqual(original[2], outbounds[2]) {
-		t.Fatal("non-smart outbound changed")
-	}
-	for i := range 2 {
-		delete(outbounds[i], "type")
-		delete(outbounds[i], "tag")
-		content, _ := json.Marshal(outbounds[i])
+	for i, input := range []string{
+		`{"outbounds":["direct"],"preference":{"profile":"phone","rank":["latency"]},"throughput":{"target_mbps":8,"enabled":false,"wifi_daily_budget_mb":123},"probe":{"heartbeat_interval":"40s","standby_interval":"3m","background_interval":"9m","timeout":"7s","disable_direct":true},"interrupt_on_failover":false,"udp":{"quic_policy":"off","enabled":false},"notify_all_dead":false}`,
+		`{"throughput":{"target_mbps":0},"probe":{"heartbeat_interval":"0s","standby_interval":"0s","background_interval":"0s"},"udp":{"quic_policy":""}}`,
+	} {
 		var options option.SmartOutboundOptions
-		if err = json.Unmarshal(content, &options); err != nil {
+		if err = json.Unmarshal([]byte(input), &options); err != nil {
 			t.Fatal(err)
 		}
+		options.ApplySmartPolicy(policy)
 		s := &Smart{options: options}
 		if err = s.configure(); err != nil {
 			t.Fatal(err)
 		}
 		if s.targetMbps != 25 || !s.throughputEnabled || !s.interrupt || s.quicPolicy != "auto" || s.heartbeat.String() != "15s" || s.standbyInterval.String() != "45s" || s.backgroundInterval.String() != "5m0s" {
-			t.Fatalf("profile-owned values survived removal: %#v", s.preferenceStatusLocked())
+			t.Fatalf("profile-owned values survived replacement: %#v", s.preferenceStatusLocked())
 		}
 		if i == 0 && (s.options.Throughput.WIFIDailyBudgetMB == nil || *s.options.Throughput.WIFIDailyBudgetMB != 123 || s.options.Probe.Timeout.Build().String() != "7s" || !s.options.Probe.DisableDirect || s.udpEnabled || s.notify) {
 			t.Fatal("non-policy fields changed")
@@ -74,7 +53,7 @@ func TestCheckSmartPolicyInvalid(t *testing.T) {
 			if err := CheckSmartPolicy(input); err == nil || !strings.HasPrefix(err.Error(), "smart policy override: ") {
 				t.Fatalf("invalid policy accepted or missing error prefix: %v", err)
 			}
-			if _, err := ApplySmartPolicyOverride(`{"outbounds":[]}`, input); err == nil || !strings.HasPrefix(err.Error(), "smart policy override: ") {
+			if _, err := ParseSmartPolicy(input); err == nil || !strings.HasPrefix(err.Error(), "smart policy override: ") {
 				t.Fatalf("start validation differs: %v", err)
 			}
 		})
@@ -172,7 +151,7 @@ func TestSmartPolicyStrictJSON(t *testing.T) {
 			if err == nil || !strings.HasPrefix(err.Error(), "smart policy override: ") || !strings.Contains(err.Error(), test.path) {
 				t.Fatalf("strict JSON error does not name %s: %v", test.path, err)
 			}
-			_, appliedErr := ApplySmartPolicyOverride(`{"outbounds":[]}`, test.input)
+			_, appliedErr := ParseSmartPolicy(test.input)
 			if appliedErr == nil || appliedErr.Error() != err.Error() {
 				t.Fatalf("application validation differs: check=%v apply=%v", err, appliedErr)
 			}

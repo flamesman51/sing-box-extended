@@ -57,9 +57,11 @@ func TestSmartPolicyServiceOverride(t *testing.T) {
 	policy := "{ \"preference\": {\"profile\": \"balance-speed-4k\"} }"
 	config := `{
 		"log":{"disabled":true},
+		"log":{"level":"debug"},
 		"outbounds":[
 			{"type":"direct","tag":"direct"},
-			{"type":"smart","tag":"smart","outbounds":["direct"],"throughput":{"target_mbps":8,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0,"other_daily_budget_mb":0},"probe":{"disable_direct":true}}
+			{"type":"smart","tag":"smart","outbounds":["direct"],"throughput":{"target_mbps":8,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0,"other_daily_budget_mb":0},"probe":{"disable_direct":true}},
+			{"type":"smart","tag":"smart-two","outbounds":["direct"],"throughput":{"target_mbps":8,"enabled":false,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0,"other_daily_budget_mb":0},"probe":{"heartbeat_interval":"40s","standby_interval":"3m","background_interval":"9m","disable_direct":true},"interrupt_on_failover":false,"udp":{"quic_policy":"off"}}
 		]
 	}`
 	if err := server.StartOrReloadService(ctx, config, &daemon.OverrideOptions{SmartPolicy: policy}); err != nil {
@@ -91,6 +93,16 @@ func TestSmartPolicyServiceOverride(t *testing.T) {
 	if err = CheckSmartPolicy(string(preference.Resolved)); err != nil {
 		t.Fatalf("resolved policy rejected: %v", err)
 	}
+	response, err = server.GetSmartStatus(ctx, &daemon.GetSmartStatusRequest{Tag: "smart-two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal([]byte(response.GetJson()), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Preference.Base != "balance-speed-4k" || status.Preference.Custom || status.Preference.OverrideHash != wantHash || status.Preference.TargetMbps != 25 {
+		t.Fatalf("second Smart outbound was not overridden: %s", response.GetJson())
+	}
 	if err = server.StartOrReloadService(ctx, config, &daemon.OverrideOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +129,7 @@ func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
 			"log":{"disabled":true},
 			"Outbounds":[
 				{"type":"direct","tag":"direct"},
-				{"Type":"smart","tag":"smart","outbounds":["direct"],
+				{"type":"smart","tag":"smart","outbounds":["direct"],
 				 "Preference":{"profile":"data-saver","rank":["latency"]},
 				 "Throughput":{"Target_Mbps":8,"Enabled":false,"other_daily_budget_mb":0,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0},
 				 "Probe":{"Heartbeat_Interval":"40s","Standby_Interval":"3m","Background_Interval":"9m","disable_direct":true},
@@ -129,7 +141,7 @@ func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
 			"outbounds":[{"type":"direct","tag":"shadowed"}],
 			"OUTBOUNDS":[
 				{"type":"direct","tag":"direct"},
-				{"type":"direct","Type":"smart","tag":"smart","outbounds":["direct"],
+				{"type":"smart","tag":"smart","outbounds":["direct"],
 				 "preference":{"profile":"phone"},"PREFERENCE":{"profile":"data-saver"},
 				 "throughput":{"target_mbps":4},"THROUGHPUT":{"target_mbps":8,"Target_Mbps":8,"enabled":false,"ENABLED":false,"other_daily_budget_mb":0,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0},
 				 "probe":{"heartbeat_interval":"50s"},"PROBE":{"heartbeat_interval":"40s","HEARTBEAT_INTERVAL":"40s","standby_interval":"3m","STANDBY_INTERVAL":"3m","background_interval":"9m","BACKGROUND_INTERVAL":"9m","disable_direct":true},
@@ -141,7 +153,7 @@ func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
 			"log":{"disabled":true},
 			"Outboundſ":[
 				{"type":"direct","tag":"direct"},
-				{"Type":"smart","tag":"smart","outbounds":["direct"],
+				{"type":"smart","tag":"smart","outbounds":["direct"],
 				 "preference":{"profile":"data-saver"},
 				 "throughput":{"target_mbpſ":8,"enabled":false,"other_daily_budget_mb":0,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":0},
 				 "probe":{"heartbeat_interval":"40s","ſtandby_interval":"3m","background_interval":"9m","disable_direct":true},
@@ -192,6 +204,9 @@ func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
 
 func TestSmartPolicyPreservesNonPolicyAliasOrder(t *testing.T) {
 	config := `{
+		// The normal decoder merges these exact duplicate objects.
+		"log":{"disabled":true},
+		"log":{"level":"debug"},
 		"outbounds":[
 			{"type":"direct","tag":"one"},
 			{"type":"direct","tag":"two"},
@@ -207,13 +222,20 @@ func TestSmartPolicyPreservesNonPolicyAliasOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	merged, err := group.ApplySmartPolicyOverride(config, `{"preference":{"profile":"balance-speed-4k"}}`)
+	after, err := parseConfig(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, err := parseConfig(ctx, merged)
+	policy, err := group.ParseSmartPolicy(`{"preference":{"profile":"balance-speed-4k"}}`)
 	if err != nil {
 		t.Fatal(err)
+	}
+	after.Outbounds[2].Options.(*option.SmartOutboundOptions).ApplySmartPolicy(policy)
+	if !reflect.DeepEqual(before.Log, after.Log) || after.Log == nil || !after.Log.Disabled || after.Log.Level != "debug" {
+		t.Fatalf("duplicate log objects no longer merge: before=%#v after=%#v", before.Log, after.Log)
+	}
+	if !reflect.DeepEqual(before.Outbounds[:2], after.Outbounds[:2]) {
+		t.Fatal("non-smart outbounds changed")
 	}
 	for _, parsed := range []option.Options{before, after} {
 		smart := parsed.Outbounds[2].Options.(*option.SmartOutboundOptions)
@@ -222,7 +244,7 @@ func TestSmartPolicyPreservesNonPolicyAliasOrder(t *testing.T) {
 			smart.Throughput.DownloadURL != "https://last.example/{bytes}" ||
 			smart.UDP.Enabled == nil || *smart.UDP.Enabled ||
 			!reflect.DeepEqual([]string(smart.Outbounds), []string{"two"}) {
-			t.Fatalf("non-policy alias precedence changed: %#v; merged=%s", smart, merged)
+			t.Fatalf("non-policy alias precedence changed: %#v", smart)
 		}
 	}
 }

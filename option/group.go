@@ -164,6 +164,23 @@ func (o *SmartOutboundOptions) HasProfileOwnedFields() bool {
 		o.UDP.quicPolicySet || o.UDP.QUICPolicy != ""
 }
 
+// ApplySmartPolicy replaces only profile-owned values and their presence metadata.
+func (o *SmartOutboundOptions) ApplySmartPolicy(policy *SmartOutboundOptions) {
+	o.Preference = policy.Preference
+	o.InterruptOnFailover = policy.InterruptOnFailover
+	o.Throughput.Enabled = policy.Throughput.Enabled
+	o.Throughput.TargetMbps = policy.Throughput.TargetMbps
+	o.Throughput.targetMbpsSet = policy.Throughput.targetMbpsSet
+	o.Probe.HeartbeatInterval = policy.Probe.HeartbeatInterval
+	o.Probe.heartbeatIntervalSet = policy.Probe.heartbeatIntervalSet
+	o.Probe.StandbyInterval = policy.Probe.StandbyInterval
+	o.Probe.standbyIntervalSet = policy.Probe.standbyIntervalSet
+	o.Probe.BackgroundInterval = policy.Probe.BackgroundInterval
+	o.Probe.backgroundIntervalSet = policy.Probe.backgroundIntervalSet
+	o.UDP.QUICPolicy = policy.UDP.QUICPolicy
+	o.UDP.quicPolicySet = policy.UDP.quicPolicySet
+}
+
 // ValidateProfileFields applies presence-aware validation only for the profile engine.
 func (o *SmartOutboundOptions) ValidateProfileFields() error {
 	for _, field := range []struct {
