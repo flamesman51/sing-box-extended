@@ -26,11 +26,14 @@ func smartProbeTimeout(err error) bool {
 	if err == context.DeadlineExceeded {
 		return true
 	}
+	// quic-go timeout errors report Timeout() but unwrap to net.ErrClosed.
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		return true
+	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
 		return smartProbeTimeout(wrapped.Unwrap())
 	}
-	timeout, ok := err.(net.Error)
-	return ok && timeout.Timeout()
+	return false
 }
 
 func (s *Smart) measurementGateClosedLocked() bool {

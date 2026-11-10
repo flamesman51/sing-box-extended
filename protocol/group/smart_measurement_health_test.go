@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"syscall"
@@ -10,6 +11,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -260,8 +262,15 @@ func TestSmartMeasurementTimeoutClassificationPreservesHardErrors(t *testing.T) 
 			t.Fatalf("hard error classified as timeout: %v", cause)
 		}
 	}
-	if !smartProbeTimeout(&net.OpError{Op: "read", Net: "tcp", Err: context.DeadlineExceeded}) {
-		t.Fatal("wrapped timeout missed")
+	for _, cause := range []error{
+		&net.OpError{Op: "read", Net: "tcp", Err: context.DeadlineExceeded},
+		&quic.IdleTimeoutError{},
+		&quic.HandshakeTimeoutError{},
+		fmt.Errorf("probe: %w", &quic.IdleTimeoutError{}),
+	} {
+		if !smartProbeTimeout(cause) {
+			t.Fatalf("timeout missed: %v", cause)
+		}
 	}
 }
 
