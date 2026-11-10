@@ -591,3 +591,27 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 	}
 	return nil
 }
+
+func (s *Smart) preferenceStatusLocked() map[string]any {
+	profile, rank, floor, improvement := s.preference.profile, s.preference.rank, "none", s.preference.improvement
+	if !s.profileEngine() {
+		profile, rank, improvement = "default", []string{"stability", "throughput", "latency"}, true
+	} else if s.preference.minStability >= 0 {
+		floor = string(rune('A' + s.preference.minStability))
+	}
+	engine, base, source := "legacy", profile, "config"
+	if s.profileEngine() {
+		engine = "profile"
+	}
+	if base == "custom" {
+		base = "default"
+	}
+	if s.options.SmartPolicyOverrideHash != "" {
+		source = "override"
+	}
+	return map[string]any{
+		"profile": profile, "rank": rank, "min_stability": floor, "target_mbps": s.targetMbps, "improvement": improvement,
+		"engine": engine, "base": base, "custom": s.profileEngine() && s.preferenceCustom,
+		"source": source, "override_hash": s.options.SmartPolicyOverrideHash, "resolved": s.resolvedSmartPolicy(),
+	}
+}

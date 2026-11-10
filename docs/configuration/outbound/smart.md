@@ -209,6 +209,25 @@ Failover chooses the first eligible member in profile order. Tier restoration re
 
 Status includes `preference: {profile, rank, min_stability, target_mbps, improvement}`. Relevant member fields include `download_bucket`, `meets_floor`, and `outages: {episodes, exposure_hours, class}`.
 
+#### App policy overrides and status
+
+The gomobile API exposes `OverrideOptions.SmartPolicy string`, `SmartProfiles() (string, error)`, and `CheckSmartPolicy(json string) error`.
+
+An empty `SmartPolicy` preserves the subscription configuration. A nonempty value is an object containing only `preference`, `throughput.target_mbps`, `throughput.enabled`, the three profile-owned probe intervals, `interrupt_on_failover`, and `udp.quic_policy`. Before parsing the subscription, the service removes `preference` and all seven profile-owned fields from every `type: "smart"` outbound, then deep-merges this object. Other settings, including budgets, URLs, probe timeouts, member lists, and non-Smart outbounds, are unchanged. For example, `{"preference":{"profile":"balance-speed-4k"}}` replaces a subscription's explicit `target_mbps: 8` with the profile's target of `25`. Configuration comments use the normal parser. Invalid JSON, unknown fields, null values, and invalid policy values fail with `smart policy override: <reason>`; `CheckSmartPolicy` applies the same validation.
+
+`SmartProfiles` returns a JSON array in the built-in table order. Each object contains `name`, `rank`, `min_stability`, `target_mbps`, `throughput_enabled`, `heartbeat_interval`, `standby_interval`, `background_interval`, `interrupt_on_failover`, `quic_policy`, `improvement`, `dwell`, `confirmations`, `confirmation_interval`, `tier_restore`, `hysteresis`, and `speed_margin`. Values come from the core resolver; durations are Go duration strings and numeric values are JSON numbers.
+
+The status `preference` object also includes:
+
+- `engine`: `legacy` or `profile`.
+- `base`: the built-in profile name, or `default` for a Classic-based custom policy.
+- `custom`: true only on the profile engine when a preference leaf other than `profile`, or a profile-owned existing field, was explicitly supplied. Presence counts even when the value equals its default; an empty `switch` object does not count. Legacy policies always report false.
+- `source`: `override` when a nonempty app override was applied, otherwise `config`.
+- `override_hash`: lowercase SHA-256 hex of the exact applied `SmartPolicy` string, including whitespace; empty when none was applied. This metadata is internal and cannot be supplied in configuration JSON.
+- `resolved`: the full effective policy in the override object shape, with every value explicit, suitable for `CheckSmartPolicy` and for initializing an editor. It includes `preference.profile`, `rank`, `min_stability`, `speed_floor_hysteresis`, all six `preference.switch` fields, both profile-owned throughput fields, all three probe intervals, `interrupt_on_failover`, and `udp.quic_policy`.
+
+Saving a fully explicit Classic-based `resolved` policy selects the profile engine, as described above for default plus overrides; the legacy comparator itself is not representable as a custom rank.
+
 ### Selection and recovery
 
 The unchanged legacy policy (`default`, without preference overrides) compares eligible members in this order:

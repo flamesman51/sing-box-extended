@@ -3,6 +3,8 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
 
 	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -14,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/service/powerreport"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -80,6 +83,7 @@ type OverrideOptions struct {
 	AutoRedirect   bool
 	IncludePackage []string
 	ExcludePackage []string
+	SmartPolicy    string
 }
 
 func (s *StartedService) newInstance(ctx context.Context, profileContent string, overrideOptions *OverrideOptions, reloading bool) (*Instance, error) {
@@ -88,12 +92,28 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 	ctx = service.ExtendContext(ctx)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
 	ctx, cancel := context.WithCancel(ctx)
+	if overrideOptions != nil && overrideOptions.SmartPolicy != "" {
+		var err error
+		profileContent, err = group.ApplySmartPolicyOverride(profileContent, overrideOptions.SmartPolicy)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	if overrideOptions != nil {
+		if overrideOptions.SmartPolicy != "" {
+			hash := fmt.Sprintf("%x", sha256.Sum256([]byte(overrideOptions.SmartPolicy)))
+			for _, outbound := range options.Outbounds {
+				if smartOptions, isSmart := outbound.Options.(*option.SmartOutboundOptions); isSmart && outbound.Type == C.TypeSmart {
+					smartOptions.SmartPolicyOverrideHash = hash
+				}
+			}
+		}
 		for _, inbound := range options.Inbounds {
 			if tunInboundOptions, isTUN := inbound.Options.(*option.TunInboundOptions); isTUN {
 				tunInboundOptions.AutoRedirect = overrideOptions.AutoRedirect

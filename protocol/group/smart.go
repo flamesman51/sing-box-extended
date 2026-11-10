@@ -233,6 +233,7 @@ type Smart struct {
 	primaryEpoch                                                                         uint64
 	urlWaiters                                                                           []*smartURLWaiter
 	preference                                                                           smartPreference
+	preferenceCustom                                                                     bool
 	improvementCandidate                                                                 *smartMember
 	improvementEpoch                                                                     uint64
 	udpPoolAt                                                                            [2]time.Time
@@ -257,6 +258,7 @@ func NewSmart(ctx context.Context, _ adapter.Router, logger log.ContextLogger, t
 }
 
 func (s *Smart) configure() error {
+	s.preferenceCustom = s.options.HasProfileOwnedFields() || smartPreferenceHasLeaves(s.options.Preference)
 	preference, err := resolveSmartPreference(&s.options)
 	if err != nil {
 		return err

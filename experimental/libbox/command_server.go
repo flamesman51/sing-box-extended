@@ -205,6 +205,7 @@ type OverrideOptions struct {
 	AutoRedirect   bool
 	IncludePackage StringIterator
 	ExcludePackage StringIterator
+	SmartPolicy    string
 }
 
 func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
@@ -216,6 +217,7 @@ func (s *CommandServer) StartOrReloadService(configContent string, options *Over
 		AutoRedirect:   options.AutoRedirect,
 		IncludePackage: iteratorToArray(options.IncludePackage),
 		ExcludePackage: iteratorToArray(options.ExcludePackage),
+		SmartPolicy:    options.SmartPolicy,
 	})
 	if err != nil {
 		return E.Cause(err, "start or reload service")

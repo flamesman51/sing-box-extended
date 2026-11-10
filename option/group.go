@@ -25,13 +25,14 @@ type URLTestOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	MemberOptions       map[string]SmartMemberOptions `json:"member_options,omitempty"`
-	Probe               SmartProbeOptions             `json:"probe,omitempty"`
-	UDP                 SmartUDPOptions               `json:"udp,omitempty"`
-	Throughput          SmartThroughputOptions        `json:"throughput,omitempty"`
-	Preference          *SmartPreferenceOptions       `json:"preference,omitempty"`
-	InterruptOnFailover *bool                         `json:"interrupt_on_failover,omitempty"`
-	NotifyAllDead       *bool                         `json:"notify_all_dead,omitempty"`
+	MemberOptions           map[string]SmartMemberOptions `json:"member_options,omitempty"`
+	Probe                   SmartProbeOptions             `json:"probe,omitempty"`
+	UDP                     SmartUDPOptions               `json:"udp,omitempty"`
+	Throughput              SmartThroughputOptions        `json:"throughput,omitempty"`
+	Preference              *SmartPreferenceOptions       `json:"preference,omitempty"`
+	InterruptOnFailover     *bool                         `json:"interrupt_on_failover,omitempty"`
+	NotifyAllDead           *bool                         `json:"notify_all_dead,omitempty"`
+	SmartPolicyOverrideHash string                        `json:"-"`
 }
 
 type SmartPreferenceOptions struct {
@@ -151,6 +152,16 @@ func (o *SmartThroughputOptions) UnmarshalJSON(content []byte) error {
 	}
 	*o = SmartThroughputOptions(decoded.throughputOptions)
 	return nil
+}
+
+// HasProfileOwnedFields reports explicit profile-owned fields before defaults are applied.
+func (o *SmartOutboundOptions) HasProfileOwnedFields() bool {
+	return o.InterruptOnFailover != nil || o.Throughput.Enabled != nil ||
+		o.Throughput.targetMbpsSet || o.Throughput.TargetMbps != 0 ||
+		o.Probe.heartbeatIntervalSet || o.Probe.HeartbeatInterval != 0 ||
+		o.Probe.standbyIntervalSet || o.Probe.StandbyInterval != 0 ||
+		o.Probe.backgroundIntervalSet || o.Probe.BackgroundInterval != 0 ||
+		o.UDP.quicPolicySet || o.UDP.QUICPolicy != ""
 }
 
 // ValidateProfileFields applies presence-aware validation only for the profile engine.

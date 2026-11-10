@@ -36,11 +36,8 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 	if configured.Profile != nil {
 		preference.profile = *configured.Profile
 	}
-	if preference.profile == "default" && configured.Rank == nil && configured.MinStability == nil && configured.SpeedFloorHysteresis == nil {
-		switches := configured.Switch
-		if switches == nil || (switches.Improvement == nil && switches.Dwell == nil && switches.Confirmations == nil && switches.ConfirmationInterval == nil && switches.TierRestore == nil && switches.SpeedMargin == nil) {
-			return preference, nil
-		}
+	if preference.profile == "default" && !smartPreferenceHasLeaves(configured) {
+		return preference, nil
 	}
 	preference.legacy = false
 	if err := options.ValidateProfileFields(); err != nil {
@@ -49,49 +46,37 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 	target := 25.0
 	heartbeat, standby, background := 15*time.Second, time.Minute, 5*time.Minute
 	interrupt, throughputEnabled := true, true
-	switch preference.profile {
-	case "default":
+	if preference.profile == "default" {
 		preference.profile = "custom"
-	case "stability-downtime":
-		preference.rank = []string{"stability", "outages", "latency"}
-		target, heartbeat, standby = 4, 10*time.Second, 30*time.Second
-	case "stability-connections":
-		preference.rank = []string{"stability", "outages", "latency"}
-		target, interrupt = 4, false
-		preference.dwell, preference.confirmations = 30*time.Minute, 3
-	case "balance-speed-720p", "balance-speed-1080p", "balance-speed-1440p", "balance-speed-4k", "phone", "desktop", "server":
-		preference.rank = []string{"speed_floor", "stability", "download", "latency"}
-		preference.minStability = 2
-		switch preference.profile {
-		case "balance-speed-720p":
-			target = 4
-		case "balance-speed-1080p", "phone":
-			target = 8
-		case "balance-speed-1440p":
-			target = 15
-		case "server":
-			heartbeat, standby = 10*time.Second, 30*time.Second
+	} else {
+		var definition *smartProfileDefinition
+		for index := range smartProfiles {
+			if smartProfiles[index].name == preference.profile {
+				definition = &smartProfiles[index]
+				break
+			}
 		}
-	case "speed-max":
-		preference.rank = []string{"download", "stability", "latency"}
-		preference.minStability, preference.dwell = 2, 5*time.Minute
-	case "responsive":
-		preference.rank = []string{"latency", "stability", "download"}
-		preference.minStability, target = 2, 4
-	case "realtime-calls":
-		preference.rank = []string{"udp", "stability", "rtt_spread", "latency", "speed_floor"}
-		preference.minStability, target = 2, 4
-		heartbeat, standby, interrupt = 10*time.Second, 30*time.Second, false
-	case "realtime-gaming":
-		preference.rank = []string{"udp", "latency", "rtt_spread", "stability"}
-		preference.minStability, target = 2, 2
-		heartbeat, standby, interrupt = 10*time.Second, 30*time.Second, false
-	case "data-saver":
-		preference.rank = []string{"stability", "latency"}
-		target, throughputEnabled = 4, false
-		heartbeat, standby, background = 30*time.Second, 2*time.Minute, 15*time.Minute
-	default:
-		return smartPreference{}, fmt.Errorf("unknown smart preference profile: %q", preference.profile)
+		if definition == nil {
+			return smartPreference{}, fmt.Errorf("unknown smart preference profile: %q", preference.profile)
+		}
+		preference.rank, preference.minStability = definition.rank, definition.minStability
+		target = definition.target
+		interrupt, throughputEnabled = !definition.noInterrupt, !definition.noThroughput
+		if definition.heartbeat != 0 {
+			heartbeat = definition.heartbeat
+		}
+		if definition.standby != 0 {
+			standby = definition.standby
+		}
+		if definition.background != 0 {
+			background = definition.background
+		}
+		if definition.dwell != 0 {
+			preference.dwell = definition.dwell
+		}
+		if definition.confirmations != 0 {
+			preference.confirmations = definition.confirmations
+		}
 	}
 	if configured.Rank != nil {
 		preference.rank = *configured.Rank

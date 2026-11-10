@@ -408,16 +408,6 @@ func smartUDPRetry(refresh *smartUDPRefresh, now time.Time) {
 	refresh.retries++
 }
 
-func (s *Smart) preferenceStatusLocked() map[string]any {
-	profile, rank, floor, improvement := s.preference.profile, s.preference.rank, "none", s.preference.improvement
-	if !s.profileEngine() {
-		profile, rank, improvement = "default", []string{"stability", "throughput", "latency"}, true
-	} else if s.preference.minStability >= 0 {
-		floor = string(rune('A' + s.preference.minStability))
-	}
-	return map[string]any{"profile": profile, "rank": rank, "min_stability": floor, "target_mbps": s.targetMbps, "improvement": improvement}
-}
-
 func (s *Smart) observeAllOutagesLocked(now time.Time) {
 	if s.profileEngine() {
 		for _, member := range s.members {
