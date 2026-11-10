@@ -23,7 +23,7 @@ type smartHistoryTransactionGate struct {
 	release chan struct{}
 }
 
-func (g *smartHistoryTransactionGate) Debugf(format string, args ...interface{}) {
+func (g *smartHistoryTransactionGate) Debugf(format string, args ...any) {
 	// bbolt emits this message before acquiring its writer lock or opening a transaction.
 	if format != "Starting a new transaction [writable: %t]" || len(args) != 1 || args[0] != true {
 		return
