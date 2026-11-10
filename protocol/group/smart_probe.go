@@ -148,7 +148,7 @@ func smartResolveMember(ctx context.Context, dialer N.Dialer, host string) ([]ne
 		conn, err := dialer.DialContext(attempt, N.NetworkTCP, M.ParseSocksaddr(server))
 		var addresses []netip.Addr
 		if err == nil {
-			stop := context.AfterFunc(attempt, func() { _ = conn.Close() })
+			stop := context.AfterFunc(attempt, func() { smartCloseCallback(attempt, conn) })
 			client := &mDNS.Client{Net: "tcp"}
 			for _, qtype := range []uint16{mDNS.TypeA, mDNS.TypeAAAA} {
 				message := new(mDNS.Msg).SetQuestion(mDNS.Fqdn(host), qtype)
@@ -259,7 +259,7 @@ func smartUDPExchange(ctx context.Context, dialer N.Dialer, destination M.Socksa
 		return 0, err
 	}
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	stop := context.AfterFunc(ctx, func() { smartCloseCallback(ctx, conn) })
 	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
@@ -500,7 +500,8 @@ type smartResolvingDialer struct {
 	resolve func(context.Context, string) ([]netip.Addr, error)
 }
 
-func (d *smartResolvingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+func (d *smartResolvingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (connection net.Conn, err error) {
+	defer smartContextRecover(ctx, "probe-dial", &err)
 	if !destination.IsDomain() {
 		return d.Dialer.DialContext(ctx, network, destination)
 	}
@@ -551,10 +552,12 @@ func (m *smartMeasureMeter) available() int64 { m.mu.Lock(); defer m.mu.Unlock()
 
 type smartMeasureConn struct {
 	net.Conn
+	ctx   context.Context
 	meter *smartMeasureMeter
 }
 
-func (c *smartMeasureConn) Read(p []byte) (int, error) {
+func (c *smartMeasureConn) Read(p []byte) (n int, err error) {
+	defer smartContextRecover(c.ctx, "throughput-read", &err)
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -562,12 +565,13 @@ func (c *smartMeasureConn) Read(p []byte) (int, error) {
 	if allowed == 0 {
 		return 0, errSmartMeasureCap
 	}
-	n, err := c.Conn.Read(p[:allowed])
+	n, err = c.Conn.Read(p[:allowed])
 	c.meter.account(allowed, n)
 	return n, err
 }
 
-func (c *smartMeasureConn) Write(p []byte) (int, error) {
+func (c *smartMeasureConn) Write(p []byte) (n int, err error) {
+	defer smartContextRecover(c.ctx, "throughput-write", &err)
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -575,7 +579,7 @@ func (c *smartMeasureConn) Write(p []byte) (int, error) {
 	if allowed == 0 {
 		return 0, errSmartMeasureCap
 	}
-	n, err := c.Conn.Write(p[:allowed])
+	n, err = c.Conn.Write(p[:allowed])
 	c.meter.account(allowed, n)
 	if err == nil && n < len(p) {
 		err = errSmartMeasureCap
@@ -588,7 +592,8 @@ type smartMeasureDialer struct {
 	meter *smartMeasureMeter
 }
 
-func (d *smartMeasureDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+func (d *smartMeasureDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (connection net.Conn, err error) {
+	defer smartContextRecover(ctx, "throughput-dial", &err)
 	if destination.Port != 53 {
 		d.meter.mu.Lock()
 		if d.meter.dials >= d.meter.maxDials {
@@ -602,7 +607,12 @@ func (d *smartMeasureDialer) DialContext(ctx context.Context, network string, de
 	if err != nil {
 		return nil, err
 	}
-	return &smartMeasureConn{Conn: conn, meter: d.meter}, nil
+	return &smartMeasureConn{Conn: conn, meter: d.meter, ctx: ctx}, nil
+}
+
+func (c *smartMeasureConn) Close() (err error) {
+	defer smartContextRecover(c.ctx, "throughput-close", &err)
+	return c.Conn.Close()
 }
 
 type smartZeroReader struct{}
@@ -630,7 +640,7 @@ func smartMeasure(ctx context.Context, dialer N.Dialer, downloadURL, uploadURL s
 		meter.mu.Lock()
 		bytes = (meter.used*11 + 9) / 10
 		meter.mu.Unlock()
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !errors.Is(err, errSmartContained) {
 			err = ctx.Err()
 		}
 	}()

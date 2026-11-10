@@ -83,13 +83,14 @@ func smartRTTs(values []float64) (any, any) {
 	return p50, p90
 }
 
-func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag string) (string, error) {
+func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag string) (response string, err error) {
+	guard := smartAPIGuard{site: "status"}
+	defer guard.finish(&err)
 	s, err := smartFind(outbounds, tag)
 	if err != nil {
 		return "", err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	guard.lock(s)
 	now := s.clock.Now()
 	priors := s.priorsLocked()
 	state := "starting"
@@ -164,12 +165,21 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 		events = append(events, s.history.Events[i])
 	}
 	budget := smartBudget{}
+	budgets := make(map[string]smartBudget, 3)
+	for _, networkType := range []string{"wifi", "cellular", "other"} {
+		value := smartBudget{NetworkType: networkType, Day: now.In(time.FixedZone("", s.network.Offset)).Format("2006-01-02")}
+		if s.ledger != nil {
+			value = s.ledger.Snapshot(networkType, now, s.network.Offset)
+		}
+		budgets[networkType] = value
+	}
 	if s.ledger != nil {
 		budget = s.ledger.Snapshot(s.network.Type, now, s.network.Offset)
 	}
 	timeline := s.timelineLocked(now)
 	return smartJSON(map[string]any{
 		"version": 1, "group": s.Tag(), "now": now.Unix(), "state": state, "generation": s.selectionGeneration,
+		"panics": s.panicSnapshot(), "degraded": s.degradedLocked(), "budgets": budgets,
 		"selected": map[string]any{"tcp": primary, "standby": standby, "udp": udp, "udp443": udp443},
 		"network":  map[string]any{"key": s.network.Key, "type": s.network.Type, "label": smartNullable(s.network.Label), "carrier": smartNullable(s.network.Carrier), "radio": smartNullable(s.network.Radio), "country": smartNullable(s.network.Country)},
 		"direct":   map[string]any{"state": s.direct.value(now), "checked_at": smartTime(s.direct.at), "rtt_ms": smartNumber(float64(s.directRTT) / float64(time.Millisecond)), "download_mbps": nil}, "budget": budget, "members": members, "events": events, "timeline": timeline,
@@ -199,13 +209,14 @@ func (s *Smart) timelineLocked(now time.Time) map[string]any {
 	return map[string]any{"bucket_seconds": 900, "start": start, "members": members}
 }
 
-func SmartNetworks(_ context.Context, outbounds adapter.OutboundManager, tag string) (string, error) {
+func SmartNetworks(_ context.Context, outbounds adapter.OutboundManager, tag string) (response string, err error) {
+	guard := smartAPIGuard{site: "networks"}
+	defer guard.finish(&err)
 	s, err := smartFind(outbounds, tag)
 	if err != nil {
 		return "", err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	guard.lock(s)
 	now := s.clock.Now()
 	priors := s.priorsLocked()
 	networks := make([]map[string]any, 0, len(s.history.Networks))
@@ -275,7 +286,9 @@ type smartExportDocument struct {
 	Groups     map[string]smartExportGroup `json:"groups"`
 }
 
-func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool) (string, error) {
+func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool) (response string, err error) {
+	guard := smartAPIGuard{site: "export"}
+	defer guard.finish(&err)
 	groups := smartGroups(outbounds)
 	document := smartExportDocument{Version: 1, ExportedAt: time.Now().Unix(), Redacted: !raw, Device: map[string]string{"model": "", "android": "", "app": ""}, Groups: make(map[string]smartExportGroup)}
 	pointer := func(value string) *string {
@@ -285,7 +298,7 @@ func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool)
 		return &value
 	}
 	for _, s := range groups {
-		s.mu.Lock()
+		guard.lock(s)
 		now := s.clock.Now()
 		document.ExportedAt = now.Unix()
 		if document.InstallID == "" {
@@ -351,7 +364,7 @@ func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool)
 			return strings.Compare(a.ServerIdentity, b.ServerIdentity)
 		})
 		document.Groups[s.Tag()] = group
-		s.mu.Unlock()
+		guard.unlock()
 	}
 	return smartJSON(document)
 }
@@ -377,7 +390,9 @@ type smartImportReport struct {
 
 var smartMutationAccess sync.Mutex
 
-func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data string, trust float64) (string, error) {
+func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data string, trust float64) (response string, err error) {
+	guard := smartAPIGuard{site: "import"}
+	defer guard.finish(&err)
 	smartMutationAccess.Lock()
 	defer smartMutationAccess.Unlock()
 	if len(data) > 2*1024*1024 {
@@ -402,7 +417,7 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 		if s.ledger == nil {
 			continue
 		}
-		s.mu.Lock()
+		guard.lock(s)
 		now := s.clock.Now()
 		known := make(map[string]bool)
 		for _, member := range s.members {
@@ -472,7 +487,7 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 		}
 		metadata := s.ledger.Metadata()
 		priors, sources, replaced := smartReplacePriors(metadata.Priors[s.Tag()], metadata.PriorSources[s.Tag()], document.InstallID, incoming, now)
-		s.mu.Unlock()
+		guard.unlock()
 		if err := s.ledger.UpdatePriors(s.Tag(), priors, sources); err != nil {
 			return "", err
 		}
@@ -480,7 +495,7 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 		for _, entry := range applied {
 			report.Applied = append(report.Applied, *entry)
 		}
-		s.mu.Lock()
+		guard.lock(s)
 		s.priors = slices.Clone(priors)
 		for key, network := range importedNetworks {
 			if s.history.Networks[key] == nil {
@@ -493,13 +508,15 @@ func SmartImport(_ context.Context, outbounds adapter.OutboundManager, data stri
 		}
 		s.eventLocked("import", "", "", s.network.Key, "imported historical priors", now)
 		s.notifyUpdatedLocked()
-		s.mu.Unlock()
+		guard.unlock()
 	}
 	slices.SortFunc(report.Applied, func(a, b smartImportApplied) int { return strings.Compare(a.Network, b.Network) })
 	return smartJSON(report)
 }
 
-func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string) error {
+func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string) (err error) {
+	guard := smartAPIGuard{site: "reset"}
+	defer guard.finish(&err)
 	smartMutationAccess.Lock()
 	defer smartMutationAccess.Unlock()
 	groups := smartGroups(outbounds)
@@ -516,29 +533,29 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 				return err
 			}
 		}
-		s.persistenceMu.Lock()
-		s.mu.Lock()
+		guard.lockPersistence(s)
+		guard.lock(s)
 		generation := s.historyGeneration
-		s.mu.Unlock()
+		guard.unlock()
 		var resetErr error
 		if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
 			generation, resetErr = generations.ResetSmartHistoryGeneration(s.Tag(), generation)
 		} else if s.cache != nil {
 			resetErr = s.cache.ResetSmartHistory(s.Tag())
 		}
-		s.mu.Lock()
+		guard.lock(s)
 		s.historyGeneration = generation
 		if resetErr != nil {
-			s.mu.Unlock()
-			s.persistenceMu.Unlock()
+			guard.unlock()
+			guard.unlockPersistence()
 			return resetErr
 		}
 		s.priors = nil
 		s.history.Reset()
 		s.eventLocked("reset", "", "", s.network.Key, "learned history reset; live health and budget retained", s.clock.Now())
 		s.notifyUpdatedLocked()
-		s.mu.Unlock()
-		s.persistenceMu.Unlock()
+		guard.unlock()
+		guard.unlockPersistence()
 	}
 	return nil
 }

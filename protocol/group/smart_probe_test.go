@@ -30,6 +30,7 @@ type smartProbeTestDialer struct {
 	badFirst              bool
 	block                 bool
 	failUDP, failFirstUDP bool
+	strictUDP             bool
 	packetStarted         chan struct{}
 	resolves              atomic.Int32
 	packets               atomic.Int32
@@ -87,7 +88,7 @@ func (d *smartProbeTestDialer) ListenPacket(ctx context.Context, destination M.S
 	if d.packetStarted != nil {
 		close(d.packetStarted)
 	}
-	return &smartProbeTestPacket{destination: destination, packets: make(chan []byte, 2), done: make(chan struct{}), badFirst: d.badFirst, block: d.block, fail: d.failUDP || d.failFirstUDP && count == 1}, nil
+	return &smartProbeTestPacket{destination: destination, packets: make(chan []byte, 2), done: make(chan struct{}), badFirst: d.badFirst, block: d.block, fail: d.failUDP || d.failFirstUDP && count == 1, strictUDP: d.strictUDP}, nil
 }
 
 type smartProbeTestPacket struct {
@@ -97,6 +98,7 @@ type smartProbeTestPacket struct {
 	once            sync.Once
 	badFirst, block bool
 	fail            bool
+	strictUDP       bool
 }
 
 func (p *smartProbeTestPacket) ReadFrom(b []byte) (int, net.Addr, error) {
@@ -111,7 +113,13 @@ func (p *smartProbeTestPacket) ReadFrom(b []byte) (int, net.Addr, error) {
 	}
 }
 
-func (p *smartProbeTestPacket) WriteTo(b []byte, _ net.Addr) (int, error) {
+func (p *smartProbeTestPacket) WriteTo(b []byte, target net.Addr) (int, error) {
+	if p.strictUDP {
+		resolved := target.(*net.UDPAddr)
+		if M.SocksaddrFromNet(resolved).Unwrap() != p.destination.Unwrap() {
+			return 0, errors.New("wrong resolved UDP address")
+		}
+	}
 	if p.block {
 		return len(b), nil
 	}
@@ -190,6 +198,38 @@ func TestSmartUDPValidatesIDsAndIndependentResolution(t *testing.T) {
 		}
 		if dialer.resolves.Load() != 1 || dialer.packets.Load() != 1 {
 			t.Fatal("probe bypassed member DNS or failed to ignore wrong IDs")
+		}
+	}
+}
+
+func TestSmartUDPExchangeUsesConcreteResolvedAddress(t *testing.T) {
+	for _, target := range []string{"192.0.2.1:3478", "[2001:db8::1]:3478"} {
+		for _, quic := range []bool{false, true} {
+			dialer := &smartProbeTestDialer{strictUDP: true}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_, err := smartUDPExchange(ctx, dialer, M.ParseSocksaddr(target), quic)
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dialer.resolves.Load() != 0 {
+				t.Fatal("resolved exchange unexpectedly used DNS")
+			}
+		}
+	}
+}
+
+func TestSmartUDPFQDNProbeResolvesBeforeStrictPacketConn(t *testing.T) {
+	for _, quic := range []bool{false, true} {
+		dialer := &smartProbeTestDialer{strictUDP: true}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := smartUDPProbe(ctx, dialer, quic)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dialer.resolves.Load() != 1 || dialer.packets.Load() != 1 {
+			t.Fatal("FQDN probe did not resolve through its member")
 		}
 	}
 }

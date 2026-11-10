@@ -135,6 +135,7 @@ type smartResult struct {
 	bytes                                          int64
 	reservation                                    string
 	admission                                      *smartAdmission
+	contained                                      bool
 }
 
 type smartURLWaiter struct {
@@ -152,6 +153,10 @@ type Smart struct {
 	options                                                                              option.SmartOutboundOptions
 	mu                                                                                   sync.Mutex
 	persistenceMu                                                                        sync.Mutex
+	panicMu                                                                              sync.Mutex
+	panics                                                                               smartPanics
+	generationContained, syncDegraded, loopStopped                                       bool
+	testHook                                                                             func(string)
 	persistenceKick, persistenceStop, persistenceDone                                    chan struct{}
 	persistenceAbandoned                                                                 bool
 	members                                                                              []*smartMember
@@ -482,31 +487,60 @@ var smartRequestNames = []string{"network", "pause", "provider", "udp443", "stal
 
 type smartDepthKey struct{}
 
-func (s *Smart) SelectMember(ctx context.Context, network string, destination M.Socksaddr) (adapter.SmartDecision, error) {
+func (s *Smart) SelectMember(ctx context.Context, network string, destination M.Socksaddr) (decision adapter.SmartDecision, err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			s.recordPanic(smartCapturePanic("select", value))
+			var member *smartMember
+			func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				s.syncDegraded = true
+				if s.closed || s.ctx.Err() != nil {
+					return
+				}
+				member = s.fallbackLocked()
+				if member != nil {
+					decision = adapter.NewSmartDecision(member.outbound, []adapter.SmartSelection{{Group: s, Member: member.tag, Generation: member.generation}})
+				}
+			}()
+			if member == nil {
+				decision, err = adapter.SmartDecision{}, net.ErrClosed
+				return
+			}
+			err = nil
+		}
+	}()
 	depth, _ := ctx.Value(smartDepthKey{}).(int)
 	if depth >= 8 {
 		return adapter.SmartDecision{}, E.New("smart group nesting exceeds 8")
 	}
 	ctx = context.WithValue(ctx, smartDepthKey{}, depth+1)
-	s.mu.Lock()
-	if s.closed || s.ctx.Err() != nil {
-		s.mu.Unlock()
-		return adapter.SmartDecision{}, net.ErrClosed
-	}
-	now := s.clock.Now()
-	if network == N.NetworkUDP && destination.Port == 443 && s.udpEnabled && s.quicPolicy != "off" {
-		s.request("udp443")
-	}
-	member, err := s.selectLocked(network, destination, now)
+	var member *smartMember
+	var token uint64
+	var selected adapter.Outbound
+	err = func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.injectPanic("select")
+		if s.closed || s.ctx.Err() != nil {
+			return net.ErrClosed
+		}
+		if network == N.NetworkUDP && destination.Port == 443 && s.udpEnabled && s.quicPolicy != "off" {
+			s.request("udp443")
+		}
+		var selectErr error
+		member, selectErr = s.selectLocked(network, destination, s.clock.Now())
+		if selectErr != nil {
+			return selectErr
+		}
+		token, selected = member.generation, member.outbound
+		return nil
+	}()
 	if err != nil {
-		s.mu.Unlock()
 		return adapter.SmartDecision{}, err
 	}
-	token := member.generation
-	selected := member.outbound
-	s.mu.Unlock()
-	chain := []adapter.SmartSelection{{Group: s, Member: member.tag, Generation: token}}
-	return s.resolveDecision(ctx, selected, chain, network, destination)
+	return s.resolveDecision(ctx, selected, []adapter.SmartSelection{{Group: s, Member: member.tag, Generation: token}}, network, destination)
 }
 
 func (s *Smart) resolveDecision(ctx context.Context, selected adapter.Outbound, chain []adapter.SmartSelection, network string, destination M.Socksaddr) (adapter.SmartDecision, error) {
@@ -532,11 +566,27 @@ func (s *Smart) resolveDecision(ctx context.Context, selected adapter.Outbound, 
 }
 
 func (s *Smart) selectLocked(network string, destination M.Socksaddr, now time.Time) (*smartMember, error) {
+	if s.loopStopped {
+		if member := s.fallbackLocked(); member != nil {
+			return member, nil
+		}
+	}
 	primary := s.primary
+	if s.generationContained && !s.generationSucceeded && now.Sub(s.startedAt) >= 10*time.Second {
+		var first *smartMember
+		for _, member := range s.members {
+			if member.state == "unknown" && (first == nil || member.tier < first.tier || member.tier == first.tier && member.configOrder < first.configOrder) {
+				first = member
+			}
+		}
+		if first != nil {
+			primary = first
+		}
+	}
 	if primary == nil || primary.state == "quarantined" || primary.state == "probation" && !primary.emergency {
 		return nil, E.New("smart: no reachable member")
 	}
-	if primary.state == "unknown" && now.Sub(s.startedAt) >= 10*time.Second {
+	if primary.state == "unknown" && now.Sub(s.startedAt) >= 10*time.Second && !s.generationContained {
 		return nil, E.New("smart: startup validation pending")
 	}
 	if network != N.NetworkUDP || !s.udpEnabled {
@@ -567,15 +617,21 @@ func (s *Smart) selectLocked(network string, destination M.Socksaddr, now time.T
 	return primary, nil
 }
 
-func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (connection net.Conn, err error) {
+	defer s.recoverError("dial", &err)
+	s.injectPanic("dial")
 	decision, err := s.SelectMember(ctx, network, destination)
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	timeout := s.memberTimeoutLocked(s.primary)
-	standby := s.standby
-	s.mu.Unlock()
+	var timeout time.Duration
+	var standby *smartMember
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		timeout = s.memberTimeoutLocked(s.primary)
+		standby = s.standby
+	}()
 	total := 2 * timeout
 	if deadline, ok := ctx.Deadline(); ok {
 		total = time.Until(deadline)
@@ -598,10 +654,14 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if standby == nil || !smartRetryable(err) || totalCtx.Err() != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	eligible := !s.closed && s.ctx.Err() == nil && (standby.state == "healthy" || standby.state == "probation" && standby.probation >= 1)
-	token := standby.generation
-	s.mu.Unlock()
+	var eligible bool
+	var token uint64
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		eligible = !s.closed && s.ctx.Err() == nil && (standby.state == "healthy" || standby.state == "probation" && standby.probation >= 1)
+		token = standby.generation
+	}()
 	if !eligible {
 		return nil, err
 	}
@@ -628,7 +688,9 @@ func smartRetryable(err error) bool {
 	return strings.Contains(message, "handshake") || strings.Contains(message, "tls")
 }
 
-func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (connection net.PacketConn, err error) {
+	defer s.recoverError("listen", &err)
+	s.injectPanic("listen")
 	decision, err := s.SelectMember(ctx, N.NetworkUDP, destination)
 	if err != nil {
 		return nil, err
@@ -651,7 +713,13 @@ type smartLease struct {
 	stalled                      bool
 }
 
-func (s *Smart) Attach(decision adapter.SmartDecision, closer io.Closer) adapter.SmartLease {
+func (s *Smart) Attach(decision adapter.SmartDecision, closer io.Closer) (attached adapter.SmartLease) {
+	defer func() {
+		if value := recover(); value != nil {
+			s.recordPanic(smartCapturePanic("attach", value))
+			attached = &smartLease{group: s}
+		}
+	}()
 	var selection adapter.SmartSelection
 	found := false
 	for _, entry := range decision.Selections() {
@@ -662,18 +730,22 @@ func (s *Smart) Attach(decision adapter.SmartDecision, closer io.Closer) adapter
 		}
 	}
 	lease := &smartLease{group: s, closer: closer}
-	s.mu.Lock()
-	now := s.clock.Now()
-	lease.started, lease.lastRead, lease.lastWrite = now, now, now
-	lease.generation = s.generation
-	for _, member := range s.members {
-		if member.tag == selection.Member {
-			lease.member = member
-			break
+	valid := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.injectPanic("attach")
+		now := s.clock.Now()
+		lease.started, lease.lastRead, lease.lastWrite = now, now, now
+		lease.generation = s.generation
+		for _, member := range s.members {
+			if member.tag == selection.Member {
+				lease.member = member
+				break
+			}
 		}
-	}
-	valid := !s.closed && s.ctx.Err() == nil && found && lease.member != nil && lease.member.generation == selection.Generation
-	if valid {
+		if s.closed || s.ctx.Err() != nil || !found || lease.member == nil || lease.member.generation != selection.Generation {
+			return false
+		}
 		if s.leases == nil {
 			s.leases = make(map[*smartMember]map[*smartLease]struct{})
 		}
@@ -682,10 +754,10 @@ func (s *Smart) Attach(decision adapter.SmartDecision, closer io.Closer) adapter
 		}
 		s.leases[lease.member][lease] = struct{}{}
 		s.lastDemand = now
-	}
-	s.mu.Unlock()
+		return true
+	}()
 	if !valid {
-		_ = closer.Close()
+		s.closeContained(closer)
 	}
 	if valid {
 		s.request("demand")
@@ -694,19 +766,27 @@ func (s *Smart) Attach(decision adapter.SmartDecision, closer io.Closer) adapter
 }
 
 func (l *smartLease) Close() error {
-	l.once.Do(func() { l.group.mu.Lock(); delete(l.group.leases[l.member], l); l.group.mu.Unlock() })
+	l.group.contain("lease-close", func() {
+		l.once.Do(func() { l.group.mu.Lock(); defer l.group.mu.Unlock(); delete(l.group.leases[l.member], l) })
+	})
 	return nil
 }
 func (l *smartLease) CountRead(n int)  { l.count(n, true) }
 func (l *smartLease) CountWrite(n int) { l.count(n, false) }
 func (l *smartLease) count(n int, read bool) {
-	if n <= 0 {
+	if n <= 0 || l.member == nil {
 		return
 	}
 	s := l.group
+	defer func() {
+		if value := recover(); value != nil {
+			s.recordPanic(smartCapturePanic("passive", value))
+		}
+	}()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.injectPanic("passive")
 	if s.closed {
-		s.mu.Unlock()
 		return
 	}
 	now := s.clock.Now()
@@ -730,7 +810,6 @@ func (l *smartLease) count(n int, read bool) {
 			l.member.throughput = smartThroughput{Download: rate, At: now, Source: "passive"}
 		}
 	}
-	s.mu.Unlock()
 	if stall {
 		s.request("stall")
 	}
@@ -753,6 +832,11 @@ func (s *Smart) revokeLocked(member *smartMember) []io.Closer {
 
 func (s *Smart) worker(ctx context.Context, reserved bool) {
 	defer s.workers.Done()
+	defer func() {
+		if value := recover(); value != nil {
+			s.recordPanic(smartCapturePanic("worker", value))
+		}
+	}()
 	for {
 		var job smartJob
 		if reserved {
@@ -779,29 +863,7 @@ func (s *Smart) worker(ctx context.Context, reserved bool) {
 			}
 			return
 		}
-		result := smartResult{member: job.member, kind: job.kind, operator: job.operator, confirm: job.confirm, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, reservation: job.reservation}
-		workCtx, cancel := context.WithTimeout(job.ctx, job.timeout)
-		if job.ctx.Err() != nil {
-			result.err = job.ctx.Err()
-		} else {
-			switch job.kind {
-			case "tcp":
-				result.rtt, result.err = s.probe(workCtx, job.member.outbound, job.operator)
-			case "udp", "udp443":
-				result.rtt, result.err = s.udpProbe(workCtx, job.member.outbound, job.kind == "udp443")
-			case "direct":
-				result.rtt, result.err = s.directProbe(workCtx, job.country, s.directSeed)
-			case "throughput":
-				result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.networkType == "wifi" || s.cellularUploadAllowed())
-			}
-		}
-		cancel()
-		if job.kind == "throughput" && s.ledger != nil {
-			s.mu.Lock()
-			uncertain := job.generation != s.generation || job.networkType != s.network.Type
-			s.mu.Unlock()
-			result.err = errors.Join(result.err, s.reconcileReservation(job.reservation, result.bytes, uncertain))
-		}
+		result := s.runJob(job)
 		select {
 		case s.results <- result:
 		case <-ctx.Done():
@@ -814,8 +876,7 @@ func (s *Smart) cellularUploadAllowed() bool {
 	return s.options.Throughput.CellularDailyBudgetMB != nil && *s.options.Throughput.CellularDailyBudgetMB >= 500
 }
 
-func (s *Smart) loop(ctx context.Context) {
-	defer close(s.loopDone)
+func (s *Smart) runLoop(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -826,43 +887,46 @@ func (s *Smart) loop(ctx context.Context) {
 				s.handleRequest(smartRequest{kind})
 			}
 		}
-		s.mu.Lock()
-		now := s.clock.Now()
-		closers := s.tickLocked(now)
-		s.dispatchLocked()
-		paused := s.paused
-		s.mu.Unlock()
+		var paused bool
+		closers := func() []io.Closer {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			closers := s.tickLocked(s.clock.Now())
+			s.dispatchLocked()
+			paused = s.paused
+			return closers
+		}()
 		for _, closer := range closers {
-			_ = closer.Close()
+			s.closeContained(closer)
 		}
 		s.requestHistoryFlush()
-		var timer smartTimer
-		var timerC <-chan time.Time
-		if !paused {
-			timer = s.clock.NewTimer(time.Second)
-			timerC = timer.C()
-		}
-		select {
-		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
-			return
-		case result := <-s.results:
+		s.waitLoop(ctx, paused)
+	}
+}
+
+func (s *Smart) waitLoop(ctx context.Context, paused bool) {
+	var timerC <-chan time.Time
+	if !paused {
+		timer := s.clock.NewTimer(time.Second)
+		defer timer.Stop()
+		timerC = timer.C()
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case result := <-s.results:
+		closers := func() []io.Closer {
 			s.mu.Lock()
-			closers = s.applyResultLocked(result, s.clock.Now())
-			s.mu.Unlock()
-			for _, closer := range closers {
-				_ = closer.Close()
-			}
-		case request := <-s.requests:
-			s.handleRequest(request)
-		case <-s.kick:
-		case <-timerC:
+			defer s.mu.Unlock()
+			return s.applyResultLocked(result, s.clock.Now())
+		}()
+		for _, closer := range closers {
+			s.closeContained(closer)
 		}
-		if timer != nil {
-			timer.Stop()
-		}
+	case request := <-s.requests:
+		s.handleRequest(request)
+	case <-s.kick:
+	case <-timerC:
 	}
 }
 
@@ -873,8 +937,8 @@ func (s *Smart) handleRequest(request smartRequest) {
 		}
 		network := smartReadNetwork(s.ctx, s.seed, s.clock.Now())
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		if s.closed {
-			s.mu.Unlock()
 			return
 		}
 		now := s.clock.Now()
@@ -924,21 +988,19 @@ func (s *Smart) handleRequest(request smartRequest) {
 			}
 		}
 		s.timezone = time.FixedZone("", s.network.Offset)
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
 		return
 	}
 	var closers []io.Closer
+	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
 		for _, closer := range closers {
-			_ = closer.Close()
+			s.closeContained(closer)
 		}
 	}()
+	if s.closed {
+		return
+	}
 	now := s.clock.Now()
 	switch request.kind {
 	case "provider":
@@ -996,6 +1058,7 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 	s.network = network
 	s.startedAt = now
 	s.generationSucceeded = false
+	s.generationContained = false
 	s.offline = false
 	s.ambiguousSince = time.Time{}
 	s.allDeadSince = time.Time{}
@@ -1134,6 +1197,7 @@ func smartJobPriority(job smartJob) int {
 }
 
 func (s *Smart) dispatchLocked() {
+	s.injectPanic("dispatch")
 	slices.SortStableFunc(s.pending, func(a, b smartJob) int { return smartJobPriority(a) - smartJobPriority(b) })
 	for len(s.pending) > 0 {
 		job := s.pending[0]
@@ -1166,6 +1230,7 @@ func (s *Smart) memberIntervalLocked(member *smartMember, now time.Time) time.Du
 }
 
 func (s *Smart) tickLocked(now time.Time) []io.Closer {
+	s.injectPanic("tick")
 	if s.closed || s.ctx.Err() != nil || s.paused {
 		return nil
 	}
@@ -1263,6 +1328,7 @@ func (s *Smart) memberTimeoutLocked(member *smartMember) time.Duration {
 }
 
 func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer {
+	s.injectPanic("apply")
 	if result.kind == "admission" {
 		s.applyAdmissionLocked(result, now)
 		return nil
@@ -1289,6 +1355,24 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 	}
 	if result.kind == "direct" {
 		s.directInflight = false
+	}
+	if result.contained {
+		if result.kind == "tcp" {
+			s.generationContained = true
+			if !s.generationSucceeded && (s.primary == nil || s.primary.state == "unknown") {
+				var first *smartMember
+				for _, candidate := range s.members {
+					if candidate.state == "unknown" && (first == nil || candidate.tier < first.tier || candidate.tier == first.tier && candidate.configOrder < first.configOrder) {
+						first = candidate
+					}
+				}
+				if first != nil {
+					s.switchLocked(first, "failover", "contained validation; no health evidence", now)
+				}
+			}
+			s.finishURLWaitersLocked(result)
+		}
+		return nil
 	}
 	if result.kind == "tcp" && (result.err == nil || result.confirm || errors.Is(result.err, context.Canceled) || errors.Is(result.err, errSmartResolve)) {
 		s.finishURLWaitersLocked(result)
@@ -1372,6 +1456,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			}
 			if !s.generationSucceeded {
 				s.generationSucceeded = true
+				s.syncDegraded = false
 				if member.state == "healthy" {
 					s.switchLocked(member, "recover", "first success this network", now)
 				}
@@ -1821,10 +1906,10 @@ func (s *Smart) startHistoryPersistenceLocked() {
 		for {
 			select {
 			case <-s.persistenceStop:
-				s.flushHistory(true)
+				s.contain("history", func() { s.flushHistory(true) })
 				return
 			case <-s.persistenceKick:
-				s.flushHistory(false)
+				s.contain("history", func() { s.flushHistory(false) })
 			}
 		}
 	}()
@@ -1849,55 +1934,66 @@ func (s *Smart) flushHistory(force bool) {
 	}
 	s.persistenceMu.Lock()
 	defer s.persistenceMu.Unlock()
-	s.mu.Lock()
-	now := s.clock.Now()
-	if s.persistenceAbandoned || !s.dirty || !force && now.Sub(s.lastWrite) < time.Minute {
-		s.mu.Unlock()
+	var snapshot *smartHistory
+	var generation uint64
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		now := s.clock.Now()
+		if s.persistenceAbandoned || !s.dirty || !force && now.Sub(s.lastWrite) < time.Minute {
+			return
+		}
+		snapshot = cloneSmartHistory(s.history)
+		generation = s.historyGeneration
+		s.dirty = false
+		s.lastWrite = now
+	}()
+	if snapshot == nil {
 		return
 	}
-	snapshot := cloneSmartHistory(s.history)
-	generation := s.historyGeneration
-	s.dirty = false
-	s.lastWrite = now
-	s.mu.Unlock()
 	data, err := snapshot.Encode()
 	if err == nil {
 		err = s.cache.SaveSmartHistory(s.Tag(), &adapter.SmartHistory{Data: data, Generation: generation})
 	}
 	if err != nil {
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
+		func() { s.mu.Lock(); defer s.mu.Unlock(); s.dirty = true }()
 		if s.logger != nil {
 			s.logger.Error("save smart history: ", err)
 		}
 	}
 }
 
-func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
+func (s *Smart) URLTest(ctx context.Context) (results map[string]uint16, err error) {
+	defer s.recoverError("urltest", &err)
 	waiter := &smartURLWaiter{remaining: make(map[*smartMember]bool), result: make(map[string]uint16), done: make(chan struct{})}
-	s.mu.Lock()
-	if s.closed || s.ctx.Err() != nil {
-		s.mu.Unlock()
-		return nil, net.ErrClosed
+	err = func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closed || s.ctx.Err() != nil {
+			return net.ErrClosed
+		}
+		if s.paused || !s.network.Link {
+			return E.New("smart probes unavailable while paused or offline")
+		}
+		for _, member := range s.members {
+			waiter.remaining[member] = true
+		}
+		s.urlWaiters = append(s.urlWaiters, waiter)
+		return nil
+	}()
+	if err != nil {
+		return nil, err
 	}
-	if s.paused || !s.network.Link {
-		s.mu.Unlock()
-		return nil, E.New("smart probes unavailable while paused or offline")
-	}
-	for _, member := range s.members {
-		waiter.remaining[member] = true
-	}
-	s.urlWaiters = append(s.urlWaiters, waiter)
-	s.mu.Unlock()
 	s.request("force")
 	select {
 	case <-waiter.done:
 		return waiter.result, waiter.err
 	case <-ctx.Done():
-		s.mu.Lock()
-		s.urlWaiters = slices.DeleteFunc(s.urlWaiters, func(other *smartURLWaiter) bool { return other == waiter })
-		s.mu.Unlock()
+		func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.urlWaiters = slices.DeleteFunc(s.urlWaiters, func(other *smartURLWaiter) bool { return other == waiter })
+		}()
 		return nil, ctx.Err()
 	}
 }
@@ -1908,7 +2004,10 @@ func (s *Smart) finishURLWaitersLocked(result smartResult) {
 			continue
 		}
 		delete(waiter.remaining, result.member)
-		if result.err == nil {
+		if result.contained {
+			waiter.err = errSmartContained
+		}
+		if result.err == nil && !result.contained {
 			waiter.result[result.member.tag] = uint16(min(result.rtt.Milliseconds(), 65535))
 		}
 		if len(waiter.remaining) == 0 {
@@ -1926,43 +2025,56 @@ func (s *Smart) cancelURLWaitersLocked(err error) {
 	s.urlWaiters = nil
 }
 
-func (s *Smart) Close() error {
+func (s *Smart) Close() (err error) {
+	defer s.recoverError("shutdown", &err)
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), smartShutdownTimeout)
 	defer shutdownCancel()
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	var persistenceDone chan struct{}
+	var closers []io.Closer
+	alreadyClosed := false
+	s.contain("shutdown", func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closed {
+			alreadyClosed = true
+			return
+		}
+		s.closed = true
+		for _, member := range s.members {
+			s.memberGeneration++
+			member.generation = s.memberGeneration
+		}
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.workCancel != nil {
+			s.workCancel()
+		}
+		s.clearPendingLocked()
+		s.discardBufferedJobsLocked()
+		if s.cache != nil {
+			s.startHistoryPersistenceLocked()
+			close(s.persistenceStop)
+		}
+		persistenceDone = s.persistenceDone
+		s.cancelURLWaitersLocked(context.Canceled)
+		for _, entries := range s.leases {
+			for lease := range entries {
+				closers = append(closers, lease.closer)
+			}
+		}
+		s.injectPanic("shutdown")
+	})
+	if alreadyClosed {
 		return nil
 	}
-	s.closed = true
-	for _, member := range s.members {
-		s.memberGeneration++
-		member.generation = s.memberGeneration
-	}
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if s.workCancel != nil {
-		s.workCancel()
-	}
-	s.clearPendingLocked()
-	s.discardBufferedJobsLocked()
-	if s.cache != nil {
-		s.startHistoryPersistenceLocked()
-		close(s.persistenceStop)
-	}
-	persistenceDone := s.persistenceDone
-	s.cancelURLWaitersLocked(context.Canceled)
-	s.updateNotificationLocked(s.clock.Now())
-	var closers []io.Closer
-	for _, entries := range s.leases {
-		for lease := range entries {
-			closers = append(closers, lease.closer)
-		}
-	}
-	s.mu.Unlock()
+	s.contain("shutdown-notification", func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.updateNotificationLocked(s.clock.Now())
+	})
 	for _, closer := range closers {
-		_ = closer.Close()
+		s.closeContained(closer)
 	}
 	if s.loopDone != nil {
 		select {
@@ -1971,27 +2083,25 @@ func (s *Smart) Close() error {
 		}
 	}
 	if s.pauseManager != nil && s.pauseCallback != nil {
-		s.pauseManager.UnregisterCallback(s.pauseCallback)
+		s.contain("pause-callback", func() { s.pauseManager.UnregisterCallback(s.pauseCallback) })
 	}
 	for provider, callback := range s.providerCallbacks {
-		provider.UnregisterCallback(callback)
+		s.contain("provider-callback", func() { provider.UnregisterCallback(callback) })
 	}
 	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		s.workers.Wait()
 		s.admissionWorkers.Wait()
 		s.accountingWorkers.Wait()
 		if persistenceDone != nil {
 			<-persistenceDone
 		}
-		close(finished)
 	}()
 	select {
 	case <-finished:
 	case <-shutdownCtx.Done():
-		s.mu.Lock()
-		s.persistenceAbandoned = true
-		s.mu.Unlock()
+		func() { s.mu.Lock(); defer s.mu.Unlock(); s.persistenceAbandoned = true }()
 		if s.logger != nil {
 			s.logger.Error("smart persistence shutdown exceeded ", smartShutdownTimeout, "; abandoning final writes")
 		}

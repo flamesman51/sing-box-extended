@@ -110,6 +110,31 @@ At startup or on a new network generation, the two best-ranked members are check
 
 A recovered lower-numbered tier must stay healthy for `60s` before tier restoration. An ordinary stability or throughput improvement needs two distinct observations at least `30s` apart and a primary dwell of at least `10m`; healthy primaries are not replaced merely for a lower ping. Sustained demand on an actively measured slow primary can trigger a challenger test in a light-traffic window within `5m` and waive the dwell when the challenger meets the target. This waiver cannot override tier, health state, or stability priority.
 
+### Internal panic containment
+
+Smart contains its own probe, throughput, scheduler, persistence, callback, and synchronous-entry panics. A contained probe is **no data**, not a successful check or a member failure: queued and in-flight state is cleared without suspecting or quarantining the member. URL-test callers receive a containment error rather than a fabricated latency. Throughput reservations settle at the known consumed bytes, or the full reserved cap when consumption is unknown; work that never started settles at zero.
+
+The scheduler releases its state locks before recovery, cancels and clears interrupted work, and restarts after `1s`, doubling up to `5m`. One supervisor owns shutdown completion. After ten interrupted loop attempts within an hour, scheduling stops and selection freezes on the current primary, or the first reachable member in declared tier order when no primary exists. Status marks containment degradation separately from ordinary tier or health degradation.
+
+If contained probes prevent validation at startup or after a network change, the `10s` startup deadline no longer rejects unknown members. Smart uses unknown members in declared tier and configuration order, with `degraded: true`, without recording successful health evidence. Known failures remain failures. Normal selection resumes when a real successful result arrives.
+
+Containment contracts for caller-owned execution:
+
+- `SelectMember` returns the current primary, or the first member in declared tier and configuration order, and marks the group degraded.
+- Dial and packet-listen wrappers return a containment error when their own execution panics. They do not retry a panic as a member-health failure.
+- An interrupted `Attach` leaves the connection running untracked and returns an inert lease whose `Close` succeeds. Passive accounting skips that attachment.
+- Status, networks, export, import, reset, and URL-test APIs return a containment error.
+- Cancellation callbacks, ledger admission/accounting, and passive counter callbacks drop the interrupted sample. Durable throughput reservations remain reserved until reconciliation succeeds.
+
+Panic diagnostics are logged at error level and exposed as additive **version 1** status fields:
+
+- `panics`: `{ "total": N, "recent": [{ "at": "RFC3339 UTC", "site": "...", "message": "...", "stack": "..." }] }`. The ring holds at most `20` entries; messages are at most `512` UTF-8 bytes and stacks at most `4096` bytes.
+- `degraded`: boolean indicating containment fallback or a stopped scheduler.
+- `budgets`: current ledger snapshots for **all three** keys, `wifi`, `cellular`, and `other`, each containing `day`, `used_mb`, `reserved_mb`, and `limit_mb` (plus the existing budget metadata). Remaining budget is `max(0, limit_mb - used_mb - reserved_mb)`. The existing current-network `budget` field is unchanged.
+
+Messages replace URLs, IP addresses, and host/domain names with `<url>`, `<ip>`, and `<host>` before logging or status storage. Stacks retain only function names and source basenames with line numbers, not arguments, memory addresses, or build paths. Containment is a last-resort availability guard, not proof that an interrupted operation completed.
+
+
 #### Failure bound and reconnect time
 
 With demand, the default heartbeat and adaptive timeout remove a dead primary from selection within:

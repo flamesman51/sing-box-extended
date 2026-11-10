@@ -39,21 +39,27 @@ func (s *Smart) startThroughputAdmissionLocked(member *smartMember, now time.Tim
 	s.admission = admission
 	ledger, networkType, offset := s.ledger, s.network.Type, s.network.Offset
 	s.admissionWorkers.Go(func() {
-		id, capBytes, err := ledger.Reserve(ctx, networkType, now, offset)
+		id, capBytes, err := func() (id string, capBytes int64, err error) {
+			defer s.recoverError("ledger-admission", &err)
+			s.injectPanic("ledger-admission")
+			return ledger.Reserve(context.WithValue(ctx, smartContainmentKey{}, s), networkType, now, offset)
+		}()
 		admission.job.reservation, admission.job.capBytes = id, capBytes
-		result := smartResult{kind: "admission", admission: admission, err: err}
+		result := smartResult{kind: "admission", admission: admission, err: err, contained: errors.Is(err, errSmartContained)}
 		accepted := false
 		select {
 		case s.results <- result:
 			select {
 			case accepted = <-admission.ack:
 			case <-ctx.Done():
-				s.mu.Lock()
-				select {
-				case accepted = <-admission.ack:
-				default:
-				}
-				s.mu.Unlock()
+				func() {
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					select {
+					case accepted = <-admission.ack:
+					default:
+					}
+				}()
 			}
 		case <-ctx.Done():
 		}
@@ -127,10 +133,12 @@ func (s *Smart) throughputAllowedLocked(now time.Time) bool {
 	return s.ledger.Snapshot(s.network.Type, now, s.network.Offset).ActiveTests
 }
 
-func (s *Smart) reconcileReservation(id string, bytes int64, uncertain bool) error {
+func (s *Smart) reconcileReservation(id string, bytes int64, uncertain bool) (err error) {
+	defer s.recoverError("ledger-accounting", &err)
+	s.injectPanic("ledger-accounting")
 	ctx, cancel := context.WithTimeout(context.Background(), smartShutdownTimeout)
 	defer cancel()
-	return s.ledger.Reconcile(ctx, id, bytes, uncertain)
+	return s.ledger.Reconcile(context.WithValue(ctx, smartContainmentKey{}, s), id, bytes, uncertain)
 }
 
 func (s *Smart) discardReservation(id string) {

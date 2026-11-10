@@ -339,7 +339,10 @@ func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.
 	accepted := make(chan bool, 1)
 	go func() {
 		defer l.releaseOperation()
-		id, bytes, err := l.reserve(ctx, networkType, now, offset)
+		id, bytes, err := func() (id string, bytes int64, err error) {
+			defer smartContextRecover(ctx, "ledger-reserve", &err)
+			return l.reserve(ctx, networkType, now, offset)
+		}()
 		select {
 		case result <- admission{id: id, bytes: bytes, err: err}:
 			if <-accepted {
@@ -351,7 +354,11 @@ func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.
 			l.mu.Lock()
 			l.pending = smartReconciliation{id: id}
 			l.mu.Unlock()
-			_ = l.reconcilePending()
+			func() {
+				var err error
+				defer smartContextRecover(ctx, "ledger-discard", &err)
+				_ = l.reconcilePending()
+			}()
 		}
 	}()
 	select {
@@ -453,7 +460,10 @@ func (l *smartLedger) Reconcile(ctx context.Context, id string, bytes int64, unc
 			pending := l.pending.id == id
 			l.mu.Unlock()
 			if pending {
-				attempt.err = l.reconcilePending()
+				attempt.err = func() (err error) {
+					defer smartContextRecover(ctx, "ledger-reconcile", &err)
+					return l.reconcilePending()
+				}()
 			}
 			l.mu.Lock()
 			if l.attempt == attempt {
