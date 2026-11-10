@@ -106,6 +106,12 @@ type smartMember struct {
 	rankLatency                                                               float64
 	passiveRead                                                               int64
 	degradationQueued                                                         *smartDegradationEpisode
+	improvementCriterion                                                      string
+	floorDegraded                                                             bool
+	rankFloor                                                                 bool
+	rankDownload, rankSpread, rankOutages                                     int
+	confirmationCancel                                                        context.CancelFunc
+	udpRefresh                                                                [2]smartUDPRefresh
 }
 
 type (
@@ -116,6 +122,7 @@ type (
 		operator                                       int
 		confirm                                        bool
 		generation, memberGeneration, configGeneration uint64
+		primaryEpoch, improvementEpoch                 uint64
 		ctx                                            context.Context
 		timeout                                        time.Duration
 		capBytes                                       int64
@@ -133,6 +140,7 @@ type smartResult struct {
 	operator                                       int
 	confirm                                        bool
 	generation, memberGeneration, configGeneration uint64
+	primaryEpoch, improvementEpoch                 uint64
 	rtt                                            time.Duration
 	err                                            error
 	download, upload                               float64
@@ -224,6 +232,11 @@ type Smart struct {
 	degradation                                                                          smartDegradationState
 	primaryEpoch                                                                         uint64
 	urlWaiters                                                                           []*smartURLWaiter
+	preference                                                                           smartPreference
+	improvementCandidate                                                                 *smartMember
+	improvementEpoch                                                                     uint64
+	udpPoolAt                                                                            [2]time.Time
+	udpPoolNext                                                                          [2]int
 }
 
 func NewSmart(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -244,6 +257,11 @@ func NewSmart(ctx context.Context, _ adapter.Router, logger log.ContextLogger, t
 }
 
 func (s *Smart) configure() error {
+	preference, err := resolveSmartPreference(&s.options)
+	if err != nil {
+		return err
+	}
+	s.preference = preference
 	boolDefault := func(v *bool) bool { return v == nil || *v }
 	s.interrupt, s.notify = boolDefault(s.options.InterruptOnFailover), boolDefault(s.options.NotifyAllDead)
 	s.udpEnabled, s.throughputEnabled = boolDefault(s.options.UDP.Enabled), boolDefault(s.options.Throughput.Enabled)
@@ -605,7 +623,7 @@ func (s *Smart) selectLocked(network string, destination M.Socksaddr, now time.T
 			return primary, nil
 		}
 		for _, member := range s.members {
-			if member.state == "healthy" && member.udp.value(now) == "ok" {
+			if s.udpFallbackEligibleLocked(member, primary, false, now) {
 				return member, nil
 			}
 		}
@@ -615,7 +633,7 @@ func (s *Smart) selectLocked(network string, destination M.Socksaddr, now time.T
 		return primary, nil
 	}
 	for _, member := range s.members {
-		if member.state == "healthy" && member.tier == primary.tier && member.udp443.value(now) == "ok" && s.throughputClass(member, now) <= s.throughputClass(primary, now)+1 {
+		if s.udpFallbackEligibleLocked(member, primary, true, now) {
 			return member, nil
 		}
 	}
@@ -953,6 +971,7 @@ func (s *Smart) handleRequest(request smartRequest) {
 			return
 		}
 		now := s.clock.Now()
+		s.observeAllOutagesLocked(now)
 		paused := s.pauseManager != nil && s.pauseManager.IsPaused()
 		if paused && !s.paused {
 			s.clearDegradationLocked()
@@ -995,12 +1014,16 @@ func (s *Smart) handleRequest(request smartRequest) {
 			keyChanged := network.Key != s.network.Key
 			s.network = network
 			if keyChanged {
+				if s.profileEngine() {
+					s.resetProfileImprovementLocked()
+				}
 				s.clearDegradationLocked()
 				s.restoreThroughputLocked(now)
 				s.lastChallenger = time.Time{}
 			}
 		}
 		s.timezone = time.FixedZone("", s.network.Offset)
+		s.observeAllOutagesLocked(now)
 		return
 	}
 	var closers []io.Closer
@@ -1017,6 +1040,10 @@ func (s *Smart) handleRequest(request smartRequest) {
 	now := s.clock.Now()
 	switch request.kind {
 	case "provider":
+		s.observeAllOutagesLocked(now)
+		if s.profileEngine() {
+			s.resetProfileImprovementLocked()
+		}
 		if s.workCancel != nil {
 			s.workCancel()
 		}
@@ -1040,6 +1067,10 @@ func (s *Smart) handleRequest(request smartRequest) {
 		s.lastUDP443Demand = now
 		if s.lastDiscovery.IsZero() || now.Sub(s.lastDiscovery) >= 10*time.Minute {
 			s.lastDiscovery = now
+			if s.profileEngine() {
+				s.queueProfileUDPLocked(now, true)
+				return
+			}
 			for _, member := range s.members {
 				if member.state == "healthy" {
 					s.queueLocked(member, "udp443", 0, false, now)
@@ -1060,6 +1091,12 @@ func (s *Smart) handleRequest(request smartRequest) {
 }
 
 func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
+	s.observeAllOutagesLocked(now)
+	if s.profileEngine() {
+		s.resetProfileImprovementLocked()
+		s.udpPoolAt = [2]time.Time{}
+		s.udpPoolNext = [2]int{}
+	}
 	s.clearDegradationLocked()
 	if s.workCancel != nil {
 		s.workCancel()
@@ -1089,6 +1126,11 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 	s.timezone = time.FixedZone("", network.Offset)
 	s.cancelURLWaitersLocked(context.Canceled)
 	for _, member := range s.members {
+		member.floorDegraded = false
+		if s.profileEngine() {
+			member.lastUDP, member.lastUDP443 = time.Time{}, time.Time{}
+			member.udpRefresh = [2]smartUDPRefresh{}
+		}
 		s.memberGeneration++
 		member.generation = s.memberGeneration
 		member.state = "unknown"
@@ -1112,6 +1154,7 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 		s.primary = s.members[0]
 	}
 	s.eventLocked("network_change", "", "", network.Key, "default network changed", now)
+	s.observeAllOutagesLocked(now)
 }
 
 func (s *Smart) clearPendingLocked() {
@@ -1125,6 +1168,7 @@ func (s *Smart) clearPendingLocked() {
 
 func (s *Smart) restoreThroughputLocked(now time.Time) {
 	for _, member := range s.members {
+		member.floorDegraded = false
 		member.throughput = smartThroughput{}
 		member.lastThroughput = time.Time{}
 		if stat := s.history.Stats[s.network.Key][member.identity]; stat != nil {
@@ -1252,9 +1296,14 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 		s.request("snapshot")
 	}
 	if !s.network.Link {
-		s.offline = true
+		s.setOfflineLocked(true, now)
 		s.updateNotificationLocked(now)
 		return nil
+	}
+	if s.profileEngine() {
+		for _, member := range s.members {
+			s.observeOutagesLocked(member, now)
+		}
 	}
 	demand := now.Sub(s.lastDemand) <= 30*time.Second
 	if demand {
@@ -1278,6 +1327,7 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 				member.state = "probation"
 				member.probation = 0
 				member.lastProbation = time.Time{}
+				s.profileMemberStateChangedLocked(member, now)
 			}
 			interval := s.memberIntervalLocked(member, now)
 			if member.state == "unknown" {
@@ -1300,6 +1350,9 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 			s.primary.lastUDP443 = now
 			s.queueLocked(s.primary, "udp443", 0, false, now)
 		}
+	}
+	if s.udpEnabled && s.profileEngine() {
+		s.queueProfileUDPLocked(now, false)
 	}
 	if !s.options.Probe.DisableDirect && demand && (s.lastDirect.IsZero() || now.Sub(s.lastDirect) >= 5*time.Minute) {
 		s.queueLocked(nil, "direct", 0, false, now)
@@ -1357,6 +1410,9 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 	if member != nil && member.generation != result.memberGeneration {
 		return nil
 	}
+	if s.profileEngine() && member != nil {
+		s.observeOutagesLocked(member, now)
+	}
 	if member != nil {
 		delete(member.queued, result.kind)
 		if result.kind == "tcp" {
@@ -1365,10 +1421,17 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		if result.kind == "udp443" {
 			retry := member.discoveryPreempted && errors.Is(result.err, context.Canceled)
 			member.discoveryPreempted = false
-			if retry {
+			if retry && !s.profileEngine() {
 				s.queueLocked(member, "udp443", 0, false, now)
 			}
 		}
+	}
+	if result.purpose == smartImprovementConfirmation && !s.improvementConfirmationJobValidLocked(member, result.primaryEpoch, result.improvementEpoch, now) {
+		return nil
+	}
+	if result.purpose == smartImprovementConfirmation && member.confirmationCancel != nil {
+		member.confirmationCancel()
+		member.confirmationCancel = nil
 	}
 	if result.kind == "direct" {
 		s.directInflight = false
@@ -1422,9 +1485,12 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		}
 	case "throughput":
 		member.lastThroughput = now
-		if result.err == nil {
+		if result.err == nil && (!s.profileEngine() || result.download > 0) {
 			member.throughput = smartThroughput{Download: result.download, Upload: result.upload, At: now, Source: "active"}
 			member.lastThroughput = now
+			if s.profileEngine() && result.download >= s.targetMbps {
+				member.floorDegraded = false
+			}
 			s.eventLocked("speedtest", "", member.tag, s.network.Key, "active throughput measurement", now)
 			s.dirty = true
 			for _, key := range s.network.Path {
@@ -1440,6 +1506,9 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			s.history.IdentityServers[member.identity] = member.serverIdentity
 		}
 	case "tcp":
+		if s.profileEngine() {
+			s.observeOutageRecoveryLocked(member, result.err == nil, now)
+		}
 		if result.err == nil {
 			s.syncDegraded = false
 			wasHealthy := member.state == "healthy"
@@ -1467,6 +1536,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 					member.healthySince = now
 				}
 			}
+			s.profileMemberStateChangedLocked(member, now)
 			if !s.hasEligiblePrimaryLocked(now) {
 				member.emergency = member.state != "healthy"
 				s.switchLocked(member, "recover", "first reachable member", now)
@@ -1488,7 +1558,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			if s.urlHistory != nil {
 				s.urlHistory.StoreURLTestHistory(member.tag, &adapter.URLTestHistory{Time: now, Delay: uint16(min(result.rtt.Milliseconds(), 65535))})
 			}
-			s.offline = false
+			s.setOfflineLocked(false, now)
 			s.ambiguousSince = time.Time{}
 		} else {
 			if !s.options.Probe.DisableDirect && !s.generationSucceeded && s.direct.value(now) == "failed" {
@@ -1496,7 +1566,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 					s.ambiguousSince = now
 				}
 				if now.Sub(s.ambiguousSince) >= time.Minute {
-					s.offline = true
+					s.setOfflineLocked(true, now)
 				}
 				return nil
 			}
@@ -1504,6 +1574,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 				if member.state == "healthy" {
 					member.state = "suspect"
 				}
+				s.profileMemberStateChangedLocked(member, now)
 				s.queueLocked(member, "tcp", (result.operator+1)%3, true, now)
 				if member == s.primary && s.standby != nil {
 					s.queueLocked(s.standby, "tcp", (result.operator+1)%3, false, now)
@@ -1518,7 +1589,11 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			member.quarantineDecayAt = now
 			member.tcp = smartEvidence{state: "failed", at: now, expires: now.Add(2 * s.heartbeat)}
 			member.emergency = false
+			if s.profileEngine() && (member.state == "healthy" || member.state == "suspect") {
+				s.openOutageLocked(member, now)
+			}
 			member.state = "quarantined"
+			s.profileMemberStateChangedLocked(member, now)
 			member.probation = 0
 			member.healthySince = time.Time{}
 			backoff := min(30*time.Second*time.Duration(1<<min(member.quarantineLevel, 5)), 15*time.Minute)
@@ -1592,6 +1667,10 @@ func smartRTTQuantiles(values []float64) (p50, p90 float64) {
 }
 
 func (s *Smart) rankLocked(now time.Time) {
+	if s.profileEngine() {
+		s.rankProfileLocked(now)
+		return
+	}
 	priors := s.priorsLocked()
 	previousCountry := ""
 	if s.primary != nil {
@@ -1698,6 +1777,13 @@ func (s *Smart) chooseLocked(now time.Time) {
 		}
 	}
 	if s.primary == nil {
+		if s.profileEngine() {
+			s.resetProfileImprovementLocked()
+		}
+		return
+	}
+	if s.profileEngine() {
+		s.chooseProfileImprovementLocked(now)
 		return
 	}
 	for _, candidate := range s.members {
@@ -1739,6 +1825,9 @@ func (s *Smart) chooseLocked(now time.Time) {
 func (s *Smart) switchLocked(member *smartMember, kind, reason string, now time.Time) {
 	if s.primary == member {
 		return
+	}
+	if s.profileEngine() {
+		s.resetProfileImprovementLocked()
 	}
 	previous := s.primaryTagLocked()
 	s.clearDegradationLocked()
@@ -2044,6 +2133,7 @@ func (s *Smart) Close() (err error) {
 			alreadyClosed = true
 			return
 		}
+		s.observeAllOutagesLocked(s.clock.Now())
 		s.closed = true
 		s.clearDegradationLocked()
 		for _, member := range s.members {

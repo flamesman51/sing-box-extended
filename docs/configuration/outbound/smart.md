@@ -70,7 +70,7 @@ Generic UDP and UDP/443 are tested separately: a server can carry DNS or STUN su
 #### throughput
 
 - `enabled`: enables throughput measurement; default `true`.
-- `target_mbps`: sufficient download rate in Mbit/s; default `25`, and must be positive. Smart does not continuously maximize speed after the target is met.
+- `target_mbps`: sufficient download rate in Mbit/s; default `25`, and must be positive. Profiles can supply a different default. The legacy policy stops favoring throughput improvements after this target is met; profile criteria can rank measured download speed separately.
 - `download_url`: default `https://speed.cloudflare.com/__down?bytes={bytes}`. It must be a valid URL containing the literal `{bytes}` placeholder.
 - `upload_url`: default `https://speed.cloudflare.com/__up`; it must be a valid URL.
 - `wifi_daily_budget_mb`: default `300`.
@@ -78,6 +78,8 @@ Generic UDP and UDP/443 are tested separately: a server can carry DNS or STUN su
 - `other_daily_budget_mb`: default `300`, including Ethernet.
 
 Budgets use decimal MB (`1 MB = 1,000,000 bytes`) and must be nonnegative. An explicit `0` disables active throughput tests for that network type; it is not replaced by the default. See [Budgets and cache](#budgets-and-cache).
+
+Without a platform interface, Smart classifies the network as `other`, regardless of the default interface's type. This makes `other_daily_budget_mb` apply to server and desktop environments without platform-provided network classification.
 
 #### interrupt_on_failover
 
@@ -89,15 +91,133 @@ Attachment tokens identify the exact member instance. Connections completing aft
 
 Default `true`. Notify only after every member has corroborated failures, the interface is up, and a fresh direct HTTPS probe confirms that direct Internet access works, continuously for at least `45s`. Recovery cancels the notification. Paused, offline, captive, and unknown-direct states do not produce this notification.
 
+### Profiles
+
+`preference` selects a built-in policy and optionally overrides its raw values:
+
+```json
+{
+  "preference": {
+    "profile": "balance-speed-1080p",
+    "rank": ["speed_floor", "stability", "download", "latency"],
+    "min_stability": "C",
+    "speed_floor_hysteresis": 0.2,
+    "switch": {
+      "improvement": true,
+      "dwell": "10m",
+      "confirmations": 2,
+      "confirmation_interval": "30s",
+      "tier_restore": "60s",
+      "speed_margin": 1.25
+    }
+  }
+}
+```
+
+Precedence is **explicit field, then profile value, then built-in default**. This applies to every preference leaf and to the profile-owned existing fields: `throughput.target_mbps`, `throughput.enabled`, `probe.heartbeat_interval`, `probe.standby_interval`, `probe.background_interval`, `interrupt_on_failover`, and `udp.quic_policy`. Explicit `false`, `0`, `"0s"`, and `"none"` are never replaced by a profile default; they must still satisfy that field's validation rules. In particular, an explicit zero target or probe interval is invalid, not an omitted value. Profiles never set or increase throughput budgets.
+
+No `preference`, an empty `preference` object, or only `profile: "default"` retains the unchanged legacy policy, including the meaning of explicitly configured existing fields. Engine selection depends only on new preference leaves: for example, `throughput.target_mbps: 8` without `preference` still uses the legacy engine. Empty `switch` objects add no override. `default` keeps the legacy tier/state/stability/throughput/p90 comparison, improvement signature, dwell, confirmations, and degradation evidence.
+
+**Default plus overrides uses the profile engine; latency is p50-bucketed and confirmations are per decisive criterion.** Any new preference leaf with the default base, including a rank without a profile or `{"switch":{"improvement":false}}`, selects this engine and reports `profile: "custom"` in status. Its base is rank `stability, throughput, latency`, no minimum stability, target `25`, and the switch defaults below. `custom` is a resolved status value, not a built-in profile name.
+
+#### Built-in policies
+
+Unless a row says otherwise, defaults are: heartbeat `15s`, standby `1m`, background `5m`, `interrupt_on_failover: true`, `udp.quic_policy: "auto"`, throughput enabled, improvement enabled, dwell `10m`, two confirmations at least `30s` apart, tier restoration hold `60s`, speed-floor hysteresis `0.2`, and download speed margin `1.25`.
+
+| Profile | Intent | Rank | Minimum stability | Target Mbit/s | Other defaults |
+| --- | --- | --- | --- | --- | --- |
+| `default` | Unchanged legacy behavior | Legacy order | none | 25 | Legacy behavior |
+| `stability-downtime` | Stay online with fast failover | stability, outages, latency | none | 4 | Heartbeat `10s`, standby `30s` |
+| `stability-connections` | Preserve running connections; choose steadier servers for new connections | stability, outages, latency | none | 4 | Interrupt `false`, dwell `30m`, confirmations `3` |
+| `balance-speed-720p` | Most stable server sufficient for 720p, otherwise the fastest acceptable server | speed_floor, stability, download, latency | C | 4 | |
+| `balance-speed-1080p` | Most stable server sufficient for 1080p, otherwise the fastest acceptable server | speed_floor, stability, download, latency | C | 8 | |
+| `balance-speed-1440p` | Most stable server sufficient for 1440p, otherwise the fastest acceptable server | speed_floor, stability, download, latency | C | 15 | |
+| `balance-speed-4k` | Most stable server sufficient for 4K, otherwise the fastest acceptable server | speed_floor, stability, download, latency | C | 25 | |
+| `speed-max` | Raw measured download speed | download, stability, latency | C | 25 | Dwell `5m`; target drives degradation detection, not a speed ceiling |
+| `responsive` | Responsive browsing | latency, stability, download | C | 4 | |
+| `realtime-calls` | Voice and video calls | udp, stability, rtt_spread, latency, speed_floor | C | 4 | Heartbeat `10s`, standby `30s`, interrupt `false` |
+| `realtime-gaming` | Games | udp, latency, rtt_spread, stability | C | 2 | Heartbeat `10s`, standby `30s`, interrupt `false` |
+| `data-saver` | Metered plans and minimal probing | stability, latency | none | 4 | Throughput disabled, heartbeat `30s`, standby `2m`, background `15m` |
+| `phone` | Phone default; same policy as balance-speed-1080p | speed_floor, stability, download, latency | C | 8 | |
+| `desktop` | Desktop default; same policy as balance-speed-4k | speed_floor, stability, download, latency | C | 25 | |
+| `server` | Shared proxy with bulk traffic and availability | speed_floor, stability, download, latency | C | 25 | Heartbeat `10s`, standby `30s` |
+
+For `stability-connections`: **The selector never closes running connections itself, and new connections move only to steadier servers. Connections can still end if their server fails, the network changes or the VPN restarts.**
+
+That guarantee describes the unmodified profile. Explicit overrides, including `interrupt_on_failover: true`, take precedence. Switching by itself never closes established connections; `interrupt_on_failover` alone controls closing on quarantine. No upload profile is provided: upload is recorded from a `1 MB` sample but is not ranked.
+
+`speed-max` ranks raw download speed without stopping at its target. Its `25 Mbit/s` default target drives degradation detection and stays within the existing `25 MB` proof cap.
+
+#### Raw preference fields
+
+- `profile`: one of the built-in names above; omitted means `default`.
+- `rank`: a nonempty list of known, unique criteria. An explicit list replaces the profile's entire rank, rather than extending it.
+- `min_stability`: `A`, `B`, `C`, `D`, or `none`; `none` clears a profile's floor. Within the same tier and health state, members meeting the floor sort before those below it. This gate does not make an unavailable member reachable.
+- `speed_floor_hysteresis`: a finite number in `[0, 0.5]`, default `0.2`. A challenger must meet the full target; the current primary retains floor credit while its latest fresh measurement is at least `(1 - hysteresis) × target`. Expired evidence always loses credit.
+- `switch.improvement`: default `true`. When `false`, no improvement or degradation switch occurs; failover and enabled tier restoration still work.
+- `switch.dwell`: positive duration, default `10m`; minimum primary selection time before an ordinary improvement switch.
+- `switch.confirmations`: integer at least `1`, default `2`.
+- `switch.confirmation_interval`: positive duration, default `30s`; minimum spacing between confirmations.
+- `switch.tier_restore`: nonnegative duration, default `60s`. Explicit `"0s"` disables tier restoration; it does not restore immediately.
+- `switch.speed_margin`: finite number at least `1`, default `1.25`; a download improvement requires at least this multiple of the primary's measured download rate.
+
+#### Profile criteria and evidence
+
+All profile policies compare **tier first, then health state**. Reachability is never traded for speed, latency, or stability. The minimum-stability gate follows, then the resolved rank, previous-primary country stickiness, and configuration order.
+
+| Criterion | Comparison and evidence |
+| --- | --- |
+| `stability` | Existing A–D stability classes, including local-hour history buckets. |
+| `speed_floor` | At this criterion's position in the rank, fresh measured download meeting the target sorts first. Active evidence lasts `24h`; passive evidence lasts `6h`. The primary gets the hysteresis allowance described above. When both members miss the floor, their download buckets decide before later criteria; unknown follows every measured result. Earlier rank criteria always retain priority. |
+| `download` | Fresh measured download in logarithmic buckets: `floor(log(Mbit/s) / log(1.25))`, higher first. Unknown follows every measured result. This is separate from the legacy throughput class. |
+| `throughput` | Existing throughput class: meets target, unknown, then progressively slower target fractions. |
+| `latency` | Nearest-rank p50 probe time in `25ms` buckets; unknown with fewer than three samples. The profile estimator guarantees p50 is no greater than p90. |
+| `rtt_spread` | Nearest-rank `(p90 - p50)` in `25ms` buckets; unknown with fewer than eight samples. This measures HTTP/TLS probe-time spread, **not packet jitter**. |
+| `udp` | Generic UDP evidence: working, unknown, failed. |
+| `quic` | Separate UDP/443 evidence: working, unknown, failed. Generic UDP success does not prove QUIC reachability. |
+| `outages` | Outage episodes per effective at-risk hour: class 0 below `0.05/h`, class 1 below `0.25/h`, class 2 below `1/h`, otherwise class 3. Evidence is unknown until effective at-risk exposure reaches `2h`, even when episodes have already occurred. |
+
+Unknown reachability evidence sits after known-good and before known-bad evidence. Measured-download ordering has an explicit exception: any measured result precedes an unknown result. Thus, with target `8 Mbit/s`, a measured `3 Mbit/s` member ranks ahead of an unmeasured member in the below-floor download fallback. The unmeasured member is still eligible for safe exploration. In balance profiles, where `speed_floor` comes first, the fastest acceptable measured member wins when no member meets the target; for example, `20 Mbit/s` beats `3 Mbit/s` at a `25 Mbit/s` target even if the latter is more stable. A custom rank or `realtime-calls` still honors every criterion before `speed_floor`.
+
+An outage episode opens when a previously usable healthy or suspect member becomes quarantined. It closes after three successful TCP probes spaced at least `20s` apart, with no failure between them. A failure resets this recovery count, not the episode count. Both the open episode and its recovery count persist across restarts; the health state machine remains unchanged, so a member can become usable before its episode closes. Failed probation and repeated quarantines before confirmed recovery remain one episode. Episodes and exposure are recorded at every distinct network-path level. Ranking uses only the most specific level with at least `2h` of effective exposure, falling back to a parent if necessary; overlapping levels are never added together. Matching imported evidence contributes before this exposure check. Decay uses a `72h` half-life; decay and imported-history trust scale episode count and exposure equally, preserving their ratio while reducing evidence mass. Stall signals are not a ranking criterion.
+
+Exposure, the outage-rate denominator, accrues only while the member is healthy or suspect and usable, the group is running and unpaused, and it is on that path. Quarantine, probation, paused, offline, stopped, and other-path time does not count. Total observed time is tracked separately for diagnostics only. If an open episode's member and path remain unobserved for more than `30m`, the next observation censors that episode: it ends without recovery success, its episode count remains, and a later loss starts a new episode. A short restart with at most `30m` unobserved preserves both the open episode and its recovery count.
+
+When `udp` or `quic` appears in the rank, the new engine refreshes a bounded fixed pool: the standby, the next ranked eligible member, and the pinned pending improvement candidate until its confirmation finishes or is discarded. Generic UDP refresh runs every `20m` against a `30m` TTL; QUIC refresh runs every `8m` against a `10m` TTL. These fixed members refresh below TTL with slack. A cancelled, preempted, or dropped fixed-pool refresh retries after `30s`, then `60s`, then `2m`, until it succeeds or the evidence deadline passes. Queuing a job does not count as refreshing evidence.
+
+One additional exploration slot rotates through the other healthy same-tier members in configuration order, first those meeting `min_stability`. Meeting-floor exploration runs normally; below-floor members join the rotation only when no existing fallback is accepted by the forwarding policy. For QUIC, an accepted fallback is healthy, at the primary's tier, has positive UDP/443 evidence, and is no more than one throughput class worse than the primary; for generic UDP, it is healthy with positive generic-UDP evidence. This keeps forwarding-compatible fallbacks discoverable below the soft stability floor. Exploration is best effort: its evidence may expire to unknown between visits, and maximum revisit is the rotation-member count times the refresh interval, subject to the bounded queue and priorities.
+
+Demand-triggered UDP/443 discovery uses the same pool, probes due fixed members, and advances the rotating slot at most once per `10m`. Legacy discovery is unchanged.
+
+#### Profile switching and degradation
+
+An improvement compares the bucketed criteria in order. The first differing rank entry is decisive. A download comparison, including the embedded download bucket when both members miss `speed_floor`, also requires the challenger to meet `speed_margin`. A decision made by that embedded download comparison reports decisive criterion `speed_floor`, not `download`. Confirmations count only while the same challenger remains better on the same decisive criterion, with new relevant evidence and at least `confirmation_interval` between observations. A switch needs the configured confirmation count and primary dwell.
+
+Download, speed-floor, and throughput-class confirmations are scheduled explicitly: up to `confirmations - 1` additional challenger throughput tests, spaced by the confirmation interval. They bypass ordinary per-member `24h` test spacing but still obey ledger budgets, admission gates, and the four-starts-per-hour limit. Budget, rate, or busy denials leave confirmations pending rather than resetting them; pending confirmations expire with their measurement TTL. Probe-fed criteria use normal probe cadence.
+
+Confirmation jobs measure download only, with no upload phase. Routine heartbeat preemption does not cancel them. Pause, a network-generation change, the candidate leaving healthy state, shutdown, or their existing bounded `30s` admission/job timeout does cancel them. Reserved health-worker priority is unchanged.
+
+Pending confirmations exist only in memory and are never persisted or restored. They are scoped to the network generation, configuration/provider membership generation, candidate identity, and primary epoch. A change to any of these discards pending confirmations; existing job tokens reject late results.
+
+For profiles ranking `speed_floor`, `download`, or `throughput`, degradation starts below `(1 - hysteresis) × target`, not the legacy half-target threshold. Confirmed below-threshold results remove the primary's floor credit. Exploration requires a healthy same-tier member meeting the minimum-stability floor, but no existing speed measurement; unmeasured members can therefore be tested. After paired fresh measurement, a degradation switch requires both `switch.improvement: true` and a better challenger under the resolved criteria. It waives dwell, but never bypasses tier, health, or ranking. A below-floor challenger can win through the download fallback rather than having to reach the target.
+
+A confirmed throughput result must be positive and satisfy the measurement's existing duration and data minimums. Zero or failed measurements are inconclusive: they do not remove floor credit and never count as a confirmation; health probes handle reachability failures.
+
+Degradation pairs run only when the existing ledger admits them; profiles never raise budgets. With the default `300 MB` Wi-Fi and `50 MB` cellular budgets, the pair flow is effectively unavailable on cellular and on Wi-Fi becomes possible only after regular spending lowers the ordinary test cap. Balance profiles converge opportunistically through regular tests and scheduled confirmations in admitted idle windows, with every lease idle for at least `2s`. Continuous traffic leaves a better member pending until an idle window; convergence is not guaranteed while that traffic continues.
+
+Failover chooses the first eligible member in profile order. Tier restoration retains its configured healthy hold and is skipped when disabled. Existing connections remain on their selected member.
+
+Status includes `preference: {profile, rank, min_stability, target_mbps, improvement}`. Relevant member fields include `download_bucket`, `meets_floor`, and `outages: {episodes, exposure_hours, class}`.
+
 ### Selection and recovery
 
-Smart compares eligible members in this order:
+The unchanged legacy policy (`default`, without preference overrides) compares eligible members in this order:
 
 1. Lower tier.
 2. Health state: healthy, emergency, then the current suspect primary.
 3. Stability class: A (`≥ 98%`), B (`≥ 93%`), C (`≥ 80%`), D (below `80%`). Low-confidence local history lowers the class by one step, but not below C.
 4. Throughput class: meets the target, unknown, `75–100%`, `50–75%`, `25–50%`, below `25%` of the target.
-5. Median latency plus jitter.
+5. p90 probe latency, computed by the legacy RTT estimator.
 6. Same country as the previous primary.
 7. Configuration order.
 
@@ -185,6 +305,8 @@ Reservations are persisted before testing, reconciled afterward, and charged in 
 Active speed results last `24h`. A passive result needs a busy window of at least `10s`, proves only a lower bound on achieved speed, and lasts `6h`; a newer active result supersedes older passive observations. Expired results become unknown.
 
 #### Degradation checks
+
+This subsection describes the legacy `default` path. Profile thresholds and eligibility differences are described under [Profile switching and degradation](#profile-switching-and-degradation); budgets, accounting, and admission limits still apply.
 
 Smart can recheck a primary before its active estimate expires. A rolling 20-second window must stay below half `target_mbps` (12.5 Mbit/s at the default 25 Mbit/s target), transfer at least 128 KiB (about 52.4 kbit/s), and keep at least one current-generation flow open and at least ten seconds old. This byte floor admits extreme throttling near 50 kbit/s while rejecting a 16 kbit/s trickle. Coverage measures elapsed time with an open flow, including zero-byte samples as slow samples. A contiguous read stall of up to eight seconds is allowed: TCP loss recovery can back off through roughly 1, 2, and 4 seconds without the application becoming idle. A longer stall or no eligible open flows resets the window. Sampling still tolerates intervals of 0.5–3 seconds, uses actual elapsed time, and resets after a sampling gap longer than three seconds. Partial oldest samples are weighted by their overlap with the window. Rates aggregate concurrent primary flows; passive observations never demote the server.
 

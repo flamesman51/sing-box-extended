@@ -26,14 +26,15 @@ const (
 )
 
 type smartHistory struct {
-	Networks        map[string]*smartHistoryNetwork            `json:"networks"`
-	Stats           map[string]map[string]*smartStatistic      `json:"stats"`
-	Events          []smartEvent                               `json:"events"`
-	Labels          map[string]string                          `json:"labels,omitempty"`
-	Timeline        map[string]map[string][]smartTimelinePoint `json:"timeline,omitempty"`
-	IdentityServers map[string]string                          `json:"identity_servers,omitempty"`
-	recency         map[string]uint64
-	sequence        uint64
+	Networks           map[string]*smartHistoryNetwork            `json:"networks"`
+	Stats              map[string]map[string]*smartStatistic      `json:"stats"`
+	Events             []smartEvent                               `json:"events"`
+	Labels             map[string]string                          `json:"labels,omitempty"`
+	Timeline           map[string]map[string][]smartTimelinePoint `json:"timeline,omitempty"`
+	IdentityServers    map[string]string                          `json:"identity_servers,omitempty"`
+	recency            map[string]uint64
+	sequence           uint64
+	outageObservations map[string]smartOutageObservation
 }
 
 type smartHistoryNetwork struct {
@@ -55,20 +56,27 @@ type smartTimelinePoint struct {
 }
 
 type smartStatistic struct {
-	S             float64       `json:"S"`
-	W             float64       `json:"W"`
-	UpdatedAt     int64         `json:"updated_at"`
-	LastResult    int64         `json:"last_result"`
-	RTTs          []float64     `json:"rtts,omitempty"`
-	Download      float64       `json:"download_mbps,omitempty"`
-	Upload        float64       `json:"upload_mbps,omitempty"`
-	ThroughputAt  int64         `json:"throughput_at,omitempty"`
-	Hours         [6][2]float64 `json:"hours"`
-	HourUpdatedAt [6]int64      `json:"hour_updated_at"`
-	Flaps         []int64       `json:"flaps,omitempty"`
-	HasResult     bool          `json:"has_result,omitempty"`
-	LastSuccess   bool          `json:"last_success,omitempty"`
-	pauseAtResult time.Duration
+	S                       float64       `json:"S"`
+	W                       float64       `json:"W"`
+	UpdatedAt               int64         `json:"updated_at"`
+	LastResult              int64         `json:"last_result"`
+	RTTs                    []float64     `json:"rtts,omitempty"`
+	Download                float64       `json:"download_mbps,omitempty"`
+	Upload                  float64       `json:"upload_mbps,omitempty"`
+	ThroughputAt            int64         `json:"throughput_at,omitempty"`
+	Hours                   [6][2]float64 `json:"hours"`
+	HourUpdatedAt           [6]int64      `json:"hour_updated_at"`
+	Flaps                   []int64       `json:"flaps,omitempty"`
+	HasResult               bool          `json:"has_result,omitempty"`
+	LastSuccess             bool          `json:"last_success,omitempty"`
+	OutageEpisodes          float64       `json:"outage_episodes,omitempty"`
+	OutageExposureHours     float64       `json:"outage_exposure_hours,omitempty"`
+	OutageObservedHours     float64       `json:"outage_observed_hours,omitempty"`
+	OutageOpen              bool          `json:"outage_open,omitempty"`
+	OutageRecoverySuccesses int           `json:"outage_recovery_successes,omitempty"`
+	OutageRecoveryAtNS      int64         `json:"outage_recovery_at_ns,omitempty"`
+	OutageObservedAtNS      int64         `json:"outage_observed_at_ns,omitempty"`
+	pauseAtResult           time.Duration
 }
 
 type smartEvent struct {
@@ -81,12 +89,15 @@ type smartEvent struct {
 }
 
 type smartPrior struct {
-	Network        string  `json:"network"`
-	ServerIdentity string  `json:"server_identity"`
-	Source         string  `json:"source"`
-	S              float64 `json:"S"`
-	W              float64 `json:"W"`
-	At             int64   `json:"at"`
+	Network             string  `json:"network"`
+	ServerIdentity      string  `json:"server_identity"`
+	Source              string  `json:"source"`
+	S                   float64 `json:"S"`
+	W                   float64 `json:"W"`
+	At                  int64   `json:"at"`
+	OutageEpisodes      float64 `json:"outage_episodes,omitempty"`
+	OutageExposureHours float64 `json:"outage_exposure_hours,omitempty"`
+	OutageObservedHours float64 `json:"outage_observed_hours,omitempty"`
 }
 
 type smartPriorSource struct {
@@ -95,16 +106,19 @@ type smartPriorSource struct {
 }
 
 type smartExportStatistic struct {
-	Network        string        `json:"network"`
-	ServerIdentity string        `json:"server_identity"`
-	S              float64       `json:"S"`
-	W              float64       `json:"W"`
-	RTTP50         *float64      `json:"rtt_p50_ms"`
-	RTTP90         *float64      `json:"rtt_p90_ms"`
-	Download       *float64      `json:"download_mbps"`
-	Upload         *float64      `json:"upload_mbps"`
-	ThroughputAt   *int64        `json:"throughput_at"`
-	Hours          [6][2]float64 `json:"hours"`
+	Network             string        `json:"network"`
+	ServerIdentity      string        `json:"server_identity"`
+	S                   float64       `json:"S"`
+	W                   float64       `json:"W"`
+	RTTP50              *float64      `json:"rtt_p50_ms"`
+	RTTP90              *float64      `json:"rtt_p90_ms"`
+	Download            *float64      `json:"download_mbps"`
+	Upload              *float64      `json:"upload_mbps"`
+	ThroughputAt        *int64        `json:"throughput_at"`
+	Hours               [6][2]float64 `json:"hours"`
+	OutageEpisodes      float64       `json:"outage_episodes,omitempty"`
+	OutageExposureHours float64       `json:"outage_exposure_hours,omitempty"`
+	OutageObservedHours float64       `json:"outage_observed_hours,omitempty"`
 }
 
 func newSmartHistory() *smartHistory {
@@ -207,6 +221,9 @@ func (h *smartHistory) statistic(key, identity string, now time.Time) *smartStat
 	decay := smartDecay(statistic.UpdatedAt, now)
 	statistic.S *= decay
 	statistic.W *= decay
+	statistic.OutageEpisodes *= decay
+	statistic.OutageExposureHours *= decay
+	statistic.OutageObservedHours *= decay
 	statistic.UpdatedAt = max(statistic.UpdatedAt, now.Unix())
 	cutoff := now.Add(-24 * time.Hour).Unix()
 	statistic.Flaps = slices.DeleteFunc(statistic.Flaps, func(at int64) bool { return at < cutoff })
@@ -237,6 +254,7 @@ func (h *smartHistory) removeUnusedIdentity(identity string) {
 		}
 	}
 	delete(h.IdentityServers, identity)
+	delete(h.outageObservations, identity)
 }
 
 // Observe receives the group's cumulative paused time; each key keeps its own baseline.
@@ -430,8 +448,14 @@ func decodeSmartHistory(data []byte) (*smartHistory, error) {
 	}
 	for _, statistics := range history.Stats {
 		for _, statistic := range statistics {
-			if statistic == nil || !smartValidSums(statistic.S, statistic.W) || !smartNonnegative(statistic.Download) || !smartNonnegative(statistic.Upload) {
+			if statistic == nil || !smartValidSums(statistic.S, statistic.W) || !smartNonnegative(statistic.Download) || !smartNonnegative(statistic.Upload) || !smartNonnegative(statistic.OutageEpisodes) || !smartNonnegative(statistic.OutageExposureHours) || !smartNonnegative(statistic.OutageObservedHours) {
 				return nil, errors.New("invalid smart statistic")
+			}
+			if statistic.OutageRecoverySuccesses < 0 || statistic.OutageRecoverySuccesses > 2 || statistic.OutageRecoveryAtNS < 0 || (statistic.OutageRecoverySuccesses == 0) != (statistic.OutageRecoveryAtNS == 0) || statistic.OutageRecoverySuccesses > 0 && !statistic.OutageOpen {
+				return nil, errors.New("invalid smart outage recovery")
+			}
+			if statistic.OutageObservedAtNS < 0 {
+				return nil, errors.New("invalid smart outage observation time")
 			}
 			for _, rtt := range statistic.RTTs {
 				if !smartNonnegative(rtt) {
@@ -531,14 +555,22 @@ func smartHashedPart(value, prefix string) bool {
 }
 
 func smartImportedPrior(record smartExportStatistic, source string, exportedAt int64, trust float64, now time.Time) (smartPrior, bool) {
-	if source == "" || record.ServerIdentity == "" || !smartImportNetworkAllowed(record.Network, true) || !smartValidSums(record.S, record.W) || record.W == 0 || !smartFinite(trust) || trust <= 0 || trust > 0.5 || exportedAt < 0 || exportedAt > now.Unix() {
+	if source == "" || record.ServerIdentity == "" || !smartImportNetworkAllowed(record.Network, true) || !smartValidSums(record.S, record.W) || !smartNonnegative(record.OutageEpisodes) || !smartNonnegative(record.OutageExposureHours) || !smartNonnegative(record.OutageObservedHours) || !smartFinite(trust) || trust <= 0 || trust > 0.5 || exportedAt < 0 || exportedAt > now.Unix() {
 		return smartPrior{}, false
 	}
-	weight := trust * min(record.W*smartDecay(exportedAt, now), 12)
-	if weight <= 0 {
+	decay := smartDecay(exportedAt, now)
+	weight := trust * min(record.W*decay, 12)
+	episodes := record.OutageEpisodes * decay * trust
+	exposureHours := record.OutageExposureHours * decay * trust
+	observedHours := record.OutageObservedHours * decay * trust
+	if weight <= 0 && episodes <= 0 && exposureHours <= 0 && observedHours <= 0 {
 		return smartPrior{}, false
 	}
-	return smartPrior{Network: record.Network, ServerIdentity: record.ServerIdentity, Source: source, S: weight * (record.S / record.W), W: weight, At: now.Unix()}, true
+	prior := smartPrior{Network: record.Network, ServerIdentity: record.ServerIdentity, Source: source, W: weight, At: now.Unix(), OutageEpisodes: episodes, OutageExposureHours: exposureHours, OutageObservedHours: observedHours}
+	if record.W > 0 {
+		prior.S = weight * (record.S / record.W)
+	}
+	return prior, true
 }
 
 func smartReplacePriors(existing []smartPrior, sources []smartPriorSource, source string, incoming []smartPrior, now time.Time) ([]smartPrior, []smartPriorSource, bool) {

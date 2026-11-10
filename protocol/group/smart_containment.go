@@ -186,7 +186,13 @@ func (s *Smart) loop(ctx context.Context) {
 	defer close(s.loopDone)
 	defer func() {
 		if value := recover(); value != nil {
-			func() { s.mu.Lock(); defer s.mu.Unlock(); s.loopStopped = true }()
+			func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				s.observeAllOutagesLocked(s.clock.Now())
+				s.loopStopped = true
+				s.observeAllOutagesLocked(s.clock.Now())
+			}()
 			s.recordPanic(smartCapturePanic("supervisor", value))
 		}
 	}()
@@ -200,6 +206,10 @@ func (s *Smart) loop(ctx context.Context) {
 		s.contain("restart", func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
+			s.observeAllOutagesLocked(s.clock.Now())
+			if s.profileEngine() {
+				s.resetProfileImprovementLocked()
+			}
 			s.clearDegradationLocked()
 			if s.workCancel != nil {
 				s.workCancel()
@@ -214,6 +224,7 @@ func (s *Smart) loop(ctx context.Context) {
 				member.discoveryPreempted = false
 				member.lastProbe = time.Time{}
 			}
+			s.observeAllOutagesLocked(s.clock.Now())
 			s.directInflight = false
 			s.cancelURLWaitersLocked(errSmartContained)
 			if !s.closed && ctx.Err() == nil {
@@ -234,7 +245,9 @@ func (s *Smart) loop(ctx context.Context) {
 			func() {
 				s.mu.Lock()
 				defer s.mu.Unlock()
+				s.observeAllOutagesLocked(s.clock.Now())
 				s.loopStopped = true
+				s.observeAllOutagesLocked(s.clock.Now())
 				if s.primary == nil {
 					for _, member := range s.members {
 						if member.state == "healthy" && (s.primary == nil || member.tier < s.primary.tier || member.tier == s.primary.tier && member.configOrder < s.primary.configOrder) {
@@ -279,6 +292,7 @@ type smartContainmentKey struct{}
 
 func (s *Smart) runOperation(job smartJob) (result smartResult) {
 	result = smartResult{member: job.member, kind: job.kind, operator: job.operator, confirm: job.confirm, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, reservation: job.reservation, episode: job.episode, purpose: job.purpose}
+	result.primaryEpoch, result.improvementEpoch = job.primaryEpoch, job.improvementEpoch
 	started := false
 	defer func() {
 		if value := recover(); value != nil {
@@ -305,6 +319,17 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 		result.err = context.Canceled
 		return
 	}
+	if job.purpose == smartImprovementConfirmation {
+		valid := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.improvementConfirmationJobValidLocked(job.member, job.primaryEpoch, job.improvementEpoch, s.clock.Now())
+		}()
+		if !valid {
+			result.err = context.Canceled
+			return
+		}
+	}
 	started = true
 	s.injectPanic("probe/" + job.kind)
 	switch job.kind {
@@ -322,7 +347,7 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 			}
 			result.download, result.bytes, result.err = smartMeasureDegradation(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, job.capBytes, s.targetMbps, passive, s.clock)
 		} else {
-			result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.networkType == "wifi" || s.cellularUploadAllowed())
+			result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.purpose != smartImprovementConfirmation && (job.networkType == "wifi" || s.cellularUploadAllowed()))
 		}
 	}
 	return

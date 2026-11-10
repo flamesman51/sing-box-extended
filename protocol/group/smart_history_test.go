@@ -296,6 +296,14 @@ func TestSmartHistoryRejectsInvalidStatistics(t *testing.T) {
 		`{"stats":{"wifi":{"member":{"S":2,"W":1}}}}`,
 		`{"stats":{"wifi":{"member":{"S":0,"W":-1}}}}`,
 		`{"stats":{"wifi":{"member":null}}}`,
+		`{"stats":{"wifi":{"member":{"outage_episodes":-1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_exposure_hours":-1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_observed_hours":-1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_recovery_successes":-1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_open":true,"outage_recovery_successes":3,"outage_recovery_at_ns":1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_open":true,"outage_recovery_successes":1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_recovery_successes":1,"outage_recovery_at_ns":1}}}}`,
+		`{"stats":{"wifi":{"member":{"outage_recovery_at_ns":-1}}}}`,
 		`{"timeline":{"wifi":{"member":[{"success":1,"weight":0}]}}}`,
 	} {
 		if _, err := decodeSmartHistory([]byte(data)); err == nil {
@@ -418,5 +426,62 @@ func TestSmartHistoryHourBucketChangesClassByOne(t *testing.T) {
 	}
 	if class := history.Class([]string{"wifi"}, "member", "server", now.Add(4*time.Hour), nil); class != 0 {
 		t.Fatalf("unobserved hour must retain class A, got %d", class)
+	}
+}
+
+func TestSmartHistoryOutageRoundTripExcludesOfflineTime(t *testing.T) {
+	s, clock := smartTestGroup()
+	member := s.primary
+	s.observeOutagesLocked(member, clock.now)
+	clock.Advance(3 * time.Hour)
+	s.openOutageLocked(member, clock.now)
+	data, err := s.history.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := decodeSmartHistory(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statistic := restored.Stats["wifi"][member.identity]
+	if statistic.OutageEpisodes != 1 || statistic.OutageExposureHours != 3 || statistic.OutageObservedHours != 3 || !statistic.OutageOpen {
+		t.Fatalf("outage history round trip lost evidence: %+v", statistic)
+	}
+	if len(restored.outageObservations) != 0 {
+		t.Fatal("runtime observation baselines survived serialization")
+	}
+	s.history = restored
+	clock.Advance(72 * time.Hour)
+	s.observeOutagesLocked(member, clock.now)
+	episodes, exposure, class := s.outageEstimateLocked(member, clock.now)
+	if episodes != 0.5 || exposure != 1.5 || statistic.OutageObservedHours != 1.5 || class != -1 || statistic.OutageOpen {
+		t.Fatalf("offline interval accrued exposure or retained an uncensored episode: %v, %v, %d, open=%v", episodes, exposure, class, statistic.OutageOpen)
+	}
+	s.openOutageLocked(member, clock.now)
+	episodes, _, _ = s.outageEstimateLocked(member, clock.now)
+	if episodes != 1.5 {
+		t.Fatalf("loss after a censored episode = %v; want 1.5", episodes)
+	}
+	s.history.Reset()
+	clock.Advance(time.Hour)
+	s.observeOutagesLocked(member, clock.now)
+	episodes, exposure, class = s.outageEstimateLocked(member, clock.now)
+	if episodes != 0 || exposure != 0 || class != -1 {
+		t.Fatalf("reset retained an observation baseline: %v, %v, %d", episodes, exposure, class)
+	}
+}
+
+func TestSmartHistoryImportRejectsInvalidOutageEvidence(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	for _, value := range []float64{-1, math.NaN(), math.Inf(1)} {
+		for _, record := range []smartExportStatistic{
+			{Network: "wifi", ServerIdentity: "server", S: 1, W: 1, OutageEpisodes: value},
+			{Network: "wifi", ServerIdentity: "server", S: 1, W: 1, OutageExposureHours: value},
+			{Network: "wifi", ServerIdentity: "server", S: 1, W: 1, OutageObservedHours: value},
+		} {
+			if prior, ok := smartImportedPrior(record, "source", now.Unix(), 0.25, now); ok {
+				t.Fatalf("accepted invalid outage prior: %+v", prior)
+			}
+		}
 	}
 }

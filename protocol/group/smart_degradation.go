@@ -71,10 +71,29 @@ func (s *Smart) degradationValidLocked(e *smartDegradationEpisode, now time.Time
 	return e != nil && s.degradation.episode == e && e.ctx.Err() == nil && !s.closed && !s.paused && s.network.Link && s.primary == e.primary && s.primaryEpoch == e.epoch && s.network.Key == e.key && s.generation == e.generation && s.configGeneration == e.configGeneration && e.primary.generation == e.memberGeneration && e.primary.state == "healthy" && now.Before(e.until)
 }
 
+func (s *Smart) degradationProbeEligibleLocked(member *smartMember, now time.Time) bool {
+	if s.profileEngine() {
+		return s.safeToProbeLocked(member, s.primary, now)
+	}
+	return s.demandChallengerEligibleLocked(member, now)
+}
+
+func (s *Smart) degradationThresholdLocked() float64 {
+	if !s.profileEngine() {
+		return s.targetMbps * .5
+	}
+	for _, criterion := range s.preference.rank {
+		if criterion == "speed_floor" || criterion == "download" || criterion == "throughput" {
+			return (1 - s.preference.hysteresis) * s.targetMbps
+		}
+	}
+	return 0
+}
+
 func (s *Smart) degradationCandidateLocked(now time.Time) *smartMember {
 	var candidate *smartMember
 	for _, member := range s.members {
-		if !s.demandChallengerEligibleLocked(member, now) {
+		if !s.degradationProbeEligibleLocked(member, now) {
 			continue
 		}
 		if candidate == nil || s.degradation.attempts[member.identity].Before(s.degradation.attempts[candidate.identity]) {
@@ -94,7 +113,7 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		}
 		member, purpose := e.primary, smartDegradationConfirmation
 		if e.confirmed > 0 {
-			if e.challenger == nil || e.challenger.generation != e.challengerGeneration || !s.demandChallengerEligibleLocked(e.challenger, now) {
+			if e.challenger == nil || e.challenger.generation != e.challengerGeneration || !s.degradationProbeEligibleLocked(e.challenger, now) {
 				s.finishDegradationLocked(now, 30*time.Minute, "ineligible")
 				return false
 			}
@@ -105,7 +124,7 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		}
 		return true
 	}
-	if s.primary == nil || s.primary.state != "healthy" || !s.throughputAllowedLocked(now) {
+	if s.primary == nil || s.primary.state != "healthy" || s.degradationThresholdLocked() == 0 || !s.throughputAllowedLocked(now) {
 		return false
 	}
 	if d.scopeKey != s.network.Key || d.scopePrimary != s.primary {
@@ -142,7 +161,7 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 	delta := total - d.previous
 	d.observed = float64(delta) * 8 / sampleInterval.Seconds() / 1e6
 	d.previous = total
-	if d.observed >= s.targetMbps*.5 {
+	if d.observed >= s.degradationThresholdLocked() {
 		d.window = now
 		d.coverage = smartDegradationCoverage{}
 		d.sampled = now
@@ -254,12 +273,29 @@ func (s *Smart) applyDegradationResultLocked(result smartResult, now time.Time) 
 		}
 		if result.download >= s.targetMbps {
 			e.primary.throughput = smartThroughput{Download: result.download, At: now, Source: "active"}
+			e.primary.floorDegraded = false
 			s.finishDegradationLocked(now, time.Hour, "primary_fast")
 			return
 		}
-		if result.download <= 0 || result.download >= s.targetMbps*.5 {
+		if result.download <= 0 || result.download >= s.degradationThresholdLocked() {
 			s.finishDegradationLocked(now, 30*time.Minute, "inconclusive")
 			return
+		}
+		if s.profileEngine() {
+			e.primary.floorDegraded = true
+			e.primary.throughput = smartThroughput{Download: result.download, At: now, Source: "active"}
+			e.primary.lastThroughput = now
+			for _, key := range s.network.Path {
+				stat := s.history.statistic(key, e.primary.identity, now)
+				stat.Download = result.download
+				stat.ThroughputAt = now.Unix()
+				points := s.history.Timeline[key][e.primary.identity]
+				if len(points) > 0 {
+					points[len(points)-1].MBPS = result.download
+				}
+			}
+			s.history.IdentityServers[e.primary.identity] = e.primary.serverIdentity
+			s.eventLocked("speedtest", "", e.primary.tag, s.network.Key, "confirmed primary degradation", now)
 		}
 		e.confirmed = result.download
 		e.checked = now
@@ -277,26 +313,46 @@ func (s *Smart) applyDegradationResultLocked(result smartResult, now time.Time) 
 		e.challengerGeneration = e.challenger.generation
 		return
 	}
-	if result.purpose != smartDegradationChallenger || e.challenger != result.member || result.member.generation != e.challengerGeneration || !s.demandChallengerEligibleLocked(result.member, now) {
+	if result.purpose != smartDegradationChallenger || e.challenger != result.member || result.member.generation != e.challengerGeneration || !s.degradationProbeEligibleLocked(result.member, now) {
 		s.finishDegradationLocked(now, 30*time.Minute, "ineligible")
 		return
 	}
-	if result.download < s.targetMbps {
+	if s.profileEngine() && result.download <= 0 {
+		s.finishDegradationLocked(now, 30*time.Minute, "inconclusive")
+		return
+	}
+	if !s.profileEngine() && result.download < s.targetMbps {
 		s.finishDegradationLocked(now, 30*time.Minute, "shared_bottleneck_suspected")
 		return
 	}
 	e.primary.throughput = smartThroughput{Download: e.confirmed, At: e.checked, Source: "active"}
 	result.member.throughput = smartThroughput{Download: result.download, At: now, Source: "active"}
+	if result.download >= s.targetMbps {
+		result.member.floorDegraded = false
+	}
 	for _, member := range []*smartMember{e.primary, result.member} {
-		member.lastThroughput = now
+		measuredAt := now
+		if s.profileEngine() {
+			measuredAt = member.throughput.At
+		}
+		member.lastThroughput = measuredAt
 		for _, key := range s.network.Path {
 			stat := s.history.statistic(key, member.identity, now)
 			stat.Download = member.throughput.Download
-			stat.ThroughputAt = now.Unix()
+			stat.ThroughputAt = measuredAt.Unix()
 		}
 	}
 	s.eventLocked("speedtest", "", result.member.tag, s.network.Key, "fresh degradation pair", now)
-	s.switchLocked(result.member, "switch", "demand challenger meets target", now)
+	reason := "demand challenger meets target"
+	if s.profileEngine() {
+		better, criterion := s.betterLocked(result.member, e.primary, now)
+		if !s.preference.improvement || !better {
+			s.finishDegradationLocked(now, 30*time.Minute, "no_improvement")
+			return
+		}
+		reason = "confirmed degradation improvement: " + criterion
+	}
+	s.switchLocked(result.member, "switch", reason, now)
 	d.state = "switched"
 	d.blocked = ""
 	d.provisional = 0
@@ -319,7 +375,7 @@ func (s *Smart) degradationPassive(e *smartDegradationEpisode) int64 {
 func (s *Smart) degradationJobValid(job smartJob) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.throughputAllowedLocked(s.clock.Now()) && s.degradationValidLocked(job.episode, s.clock.Now()) && (job.purpose != smartDegradationChallenger || job.member == job.episode.challenger && job.member.generation == job.episode.challengerGeneration && s.demandChallengerEligibleLocked(job.member, s.clock.Now()))
+	return s.throughputAllowedLocked(s.clock.Now()) && s.degradationValidLocked(job.episode, s.clock.Now()) && (job.purpose != smartDegradationChallenger || job.member == job.episode.challenger && job.member.generation == job.episode.challengerGeneration && s.degradationProbeEligibleLocked(job.member, s.clock.Now()))
 }
 
 func (s *Smart) degradationChallengerCooldownKey() string {

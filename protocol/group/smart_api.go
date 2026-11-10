@@ -92,6 +92,7 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 	}
 	guard.lock(s)
 	now := s.clock.Now()
+	s.observeAllOutagesLocked(now)
 	priors := s.priorsLocked()
 	state := "starting"
 	switch {
@@ -137,6 +138,9 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 		probability, weight := s.history.Estimate(s.network.Path, member.identity, member.serverIdentity, now, priors)
 		class := s.history.Class(s.network.Path, member.identity, member.serverIdentity, s.historyTime(now), priors)
 		rtt, p90 := smartRTTs(member.rtts)
+		if s.profileEngine() && len(member.rtts) > 0 {
+			rtt, p90 = smartProfileRTTQuantiles(member.rtts)
+		}
 		memberState := member.state
 		if member.emergency {
 			memberState = "emergency"
@@ -159,6 +163,26 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 			"tcp": member.tcp.value(now), "udp": member.udp.value(now), "udp443": member.udp443.value(now), "rtt_ms": rtt, "rtt_p90_ms": p90, "stability": probability, "stability_class": string(rune('A' + class)), "weight": weight,
 			"download_mbps": download, "upload_mbps": upload, "throughput_class": s.throughputClass(member, now), "throughput_source": source, "throughput_at": at, "last_ok": smartTime(member.lastOK), "last_fail": smartTime(member.lastFail), "rank": rank + 1,
 		})
+		if s.profileEngine() {
+			entry := members[len(members)-1]
+			if slices.Contains(s.preference.rank, "download") || slices.Contains(s.preference.rank, "speed_floor") {
+				entry["download_bucket"] = nil
+				if download, fresh := smartFreshDownload(member, now); fresh && download > 0 {
+					entry["download_bucket"] = int(math.Floor(math.Log(download) / math.Log(1.25)))
+				}
+			}
+			if slices.Contains(s.preference.rank, "speed_floor") {
+				entry["meets_floor"] = s.meetsFloorLocked(member, now)
+			}
+			if slices.Contains(s.preference.rank, "outages") {
+				episodes, exposure, observed, class := s.outageEvidenceLocked(member, now)
+				var value any
+				if class >= 0 {
+					value = class
+				}
+				entry["outages"] = map[string]any{"episodes": episodes, "exposure_hours": exposure, "observed_hours": observed, "class": value}
+			}
+		}
 	}
 	events := make([]smartEvent, 0, min(len(s.history.Events), 100))
 	for i := len(s.history.Events) - 1; i >= 0 && len(events) < 100; i-- {
@@ -182,6 +206,7 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 		"version": 1, "group": s.Tag(), "now": now.Unix(), "state": state, "generation": s.selectionGeneration,
 		"panics": s.panicSnapshot(), "degraded": s.degradedLocked(), "budgets": budgets,
 		"throughput_degradation": s.degradationSnapshotLocked(),
+		"preference":             s.preferenceStatusLocked(),
 		"selected":               map[string]any{"tcp": primary, "standby": standby, "udp": udp, "udp443": udp443},
 		"network":                map[string]any{"key": s.network.Key, "type": s.network.Type, "label": smartNullable(s.network.Label), "carrier": smartNullable(s.network.Carrier), "radio": smartNullable(s.network.Radio), "country": smartNullable(s.network.Country)},
 		"direct":                 map[string]any{"state": s.direct.value(now), "checked_at": smartTime(s.direct.at), "rtt_ms": smartNumber(float64(s.directRTT) / float64(time.Millisecond)), "download_mbps": nil}, "budget": budget, "members": members, "events": events, "timeline": timeline,
@@ -302,6 +327,7 @@ func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool)
 	for _, s := range groups {
 		guard.lock(s)
 		now := s.clock.Now()
+		s.observeAllOutagesLocked(now)
 		document.ExportedAt = now.Unix()
 		if document.InstallID == "" {
 			document.InstallID = s.installID
@@ -332,6 +358,9 @@ func SmartExport(_ context.Context, outbounds adapter.OutboundManager, raw bool)
 				}
 				record.S += stat.S
 				record.W += stat.W
+				record.OutageEpisodes += stat.OutageEpisodes
+				record.OutageExposureHours += stat.OutageExposureHours
+				record.OutageObservedHours += stat.OutageObservedHours
 				if p50, p90 := smartRTTs(stat.RTTs); p50 != nil {
 					a, b := p50.(float64), p90.(float64)
 					record.RTTP50 = &a
