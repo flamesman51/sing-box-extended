@@ -222,7 +222,9 @@ Stored history is bounded: at most `48` network keys, `32` identities per key, `
 
 ### Development
 
-The Linux real-component harness uses in-process client and server boxes, user-space WireGuard/gVisor endpoints, per-member UDP fault relays, and protocol-correct HTTPS, TCP DNS, STUN, and QUIC version-negotiation fixtures. It requires no Internet access, TUN device, or root privileges. A temporary test CA is trusted through `SSL_CERT_FILE`; direct-connectivity probes are disabled with `probe.disable_direct`.
+The Linux real-component harness uses in-process client and server boxes, user-space WireGuard/gVisor endpoints, per-member UDP fault relays, and protocol-correct HTTPS, TCP DNS, STUN, and QUIC version-negotiation fixtures. It requires no Internet access, TUN device, or root privileges. It lives in the separate `protocol/group/smartharness` test package, so its temporary CA trust through `SSL_CERT_FILE` and `SSL_CERT_DIR` affects only the harness binary, not other group tests. Direct-connectivity probes are disabled with `probe.disable_direct`.
+
+Server startup retries bind collisions at most five times, closing each failed box before choosing a fresh port. The startup regression test forces both IPv4 and IPv6 wildcard-port collisions.
 
 The harness checks initial selection after 20/5/1.5 Mbit/s calibration at a 10 Mbit/s target, UDP reachability, budget accounting, cache restart persistence, blackhole failover, and panic counts. The rates are scaled down so race-instrumented packet processing does not become the bottleneck; exactly one member must still meet the target. WireGuard retains the phone's `1280`-byte MTU rather than using jumbo packets to hide packet-size failures. The harness does not assert ordinary speed-improvement switching, which has a ten-minute dwell, or mid-session throughput degradation detection.
 
@@ -231,5 +233,5 @@ The harness uses a `30s` primary heartbeat so each calibration can finish before
 ```sh
 GOTOOLCHAIN=go1.26.8 go test -race -count=3 -timeout=9m -ldflags=-checklinkname=0 \
   -tags with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0 \
-  ./protocol/group/ -run '^TestSmartHarness'
+  ./protocol/group/smartharness/
 ```

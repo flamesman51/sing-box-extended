@@ -1,6 +1,6 @@
 //go:build linux && with_wireguard && with_gvisor
 
-package group_test
+package smartharness_test
 
 import (
 	"context"

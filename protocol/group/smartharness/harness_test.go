@@ -1,6 +1,6 @@
 //go:build linux && with_wireguard && with_gvisor
 
-package group_test
+package smartharness_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,29 +36,63 @@ type harnessBox struct {
 	cancel context.CancelFunc
 }
 
-func startHarnessBox(t *testing.T, config map[string]any) *harnessBox {
-	t.Helper()
+func tryStartHarnessBox(config map[string]any) (*harnessBox, error) {
 	ctx, cancel := context.WithCancel(include.Context(service.ContextWithDefaultRegistry(context.Background())))
 	content, err := json.Marshal(config)
 	if err != nil {
-		t.Fatal(err)
+		cancel()
+		return nil, err
 	}
 	var options option.Options
 	if err = sJSON.UnmarshalContext(ctx, content, &options); err != nil {
 		cancel()
-		t.Fatal(err)
+		return nil, err
 	}
 	instance, err := box.New(box.Options{Context: ctx, Options: options})
 	if err != nil {
 		cancel()
-		t.Fatal(err)
+		return nil, err
 	}
-	h := &harnessBox{Box: instance, ctx: ctx, cancel: cancel}
-	t.Cleanup(func() { h.close(t) })
 	if err = instance.Start(); err != nil {
+		closeErr := instance.Close()
+		cancel()
+		if closeErr != nil {
+			return nil, fmt.Errorf("close box after startup failure (%v): %w", err, closeErr)
+		}
+		return nil, err
+	}
+	return &harnessBox{Box: instance, ctx: ctx, cancel: cancel}, nil
+}
+
+func startHarnessBox(t *testing.T, config map[string]any) *harnessBox {
+	t.Helper()
+	h, err := tryStartHarnessBox(config)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { h.close(t) })
 	return h
+}
+
+func startHarnessServer(t *testing.T, config, endpoint map[string]any) uint16 {
+	t.Helper()
+	var err error
+	for attempt := range 5 {
+		if attempt > 0 {
+			endpoint["listen_port"] = reserveUDPPort(t)
+		}
+		var h *harnessBox
+		h, err = tryStartHarnessBox(config)
+		if err == nil {
+			t.Cleanup(func() { h.close(t) })
+			return endpoint["listen_port"].(uint16)
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatal(err)
+		}
+	}
+	t.Fatalf("server bind failed after five complete startup attempts: %v", err)
+	return 0
 }
 
 func (h *harnessBox) close(t *testing.T) {
@@ -239,7 +275,8 @@ func TestSmartHarness(t *testing.T) {
 		}
 		rules = append(rules, map[string]any{"action": "reject"})
 		serverEndpoint := endpointConfig("server", overlay.String()+"/24", serverPrivate, serverPort, map[string]any{"public_key": clientPublic, "allowed_ips": []string{fmt.Sprintf("10.200.%d.2/32", i+1)}})
-		startHarnessBox(t, map[string]any{"log": map[string]any{"disabled": true}, "endpoints": []any{serverEndpoint}, "outbounds": []any{map[string]any{"type": "direct", "tag": "local"}}, "route": map[string]any{"rules": rules}})
+		serverConfig := map[string]any{"log": map[string]any{"disabled": true}, "endpoints": []any{serverEndpoint}, "outbounds": []any{map[string]any{"type": "direct", "tag": "local"}}, "route": map[string]any{"rules": rules}}
+		serverPort = startHarnessServer(t, serverConfig, serverEndpoint)
 		faults := relayFaults{bytesPerSecond: int(entry.mbps * 1_000_000 / 8), delay: entry.delay}
 		relay := newFaultRelay(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(serverPort)}, faults)
 		clientEndpoint := endpointConfig(entry.tag, fmt.Sprintf("10.200.%d.2/24", i+1), clientPrivate, 0, map[string]any{"address": "127.0.0.1", "port": relay.conn.LocalAddr().(*net.UDPAddr).Port, "public_key": serverPublic, "allowed_ips": []string{"0.0.0.0/0"}})
