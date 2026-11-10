@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,6 +166,86 @@ func TestSmartFailedReplacementKeepsLiveHistoryOwnership(t *testing.T) {
 			}
 			if history.Stats[live.network.Key][live.primary.identity] == nil {
 				t.Fatal("failed replacement fenced out the surviving group's history")
+			}
+		})
+	}
+}
+
+type smartStartupHistoryGate struct {
+	*cachefile.CacheFile
+	loaded, release chan struct{}
+}
+
+func (c *smartStartupHistoryGate) LoadSmartHistory(group string) (*adapter.SmartHistory, error) {
+	history, err := c.CacheFile.LoadSmartHistory(group)
+	close(c.loaded)
+	<-c.release
+	return history, err
+}
+
+func TestSmartStartupSerializesHistoryLoadAndClaimWithReset(t *testing.T) {
+	for _, target := range []string{"old", "replacement"} {
+		t.Run(target, func(t *testing.T) {
+			ctx := context.Background()
+			cache := cachefile.New(ctx, nil, option.CacheFileOptions{Path: filepath.Join(t.TempDir(), "cache.db")})
+			scope := adapter.NewScope(ctx, nil)
+			if err := cache.Start(adapter.StartStateInitialize, scope); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = scope.Close() })
+			live := newSmartCacheTestGroup(t, cache, "auto")
+			if err := live.Start(adapter.StartStateStart, scope); err != nil {
+				t.Fatal(err)
+			}
+			live.recordObservationLocked(live.primary, true, time.Millisecond, live.clock.Now())
+			live.flushHistory(true)
+			gate := &smartStartupHistoryGate{CacheFile: cache, loaded: make(chan struct{}), release: make(chan struct{})}
+			replacement := newSmartCacheTestGroup(t, gate, "auto")
+			resume := sync.OnceFunc(func() { close(gate.release) })
+			t.Cleanup(resume)
+			started := make(chan error, 1)
+			go func() { started <- replacement.Start(adapter.StartStateStart, scope) }()
+			smartLedgerWait(t, gate.loaded)
+			if smartMutationAccess.TryLock() {
+				smartMutationAccess.Unlock()
+				t.Fatal("reset can run between history load and generation claim")
+			}
+			group := live
+			if target == "replacement" {
+				group = replacement
+			}
+			resetStarted, resetDone := make(chan struct{}), make(chan error, 1)
+			go func() {
+				close(resetStarted)
+				resetDone <- SmartReset(ctx, smartTestManager{values: []adapter.Outbound{group}}, "")
+			}()
+			smartLedgerWait(t, resetStarted)
+			resume()
+			if err := smartLedgerWait(t, started); err != nil {
+				t.Fatal(err)
+			}
+			err := smartLedgerWait(t, resetDone)
+			if target == "old" {
+				if !errors.Is(err, os.ErrInvalid) {
+					t.Fatalf("old reset after replacement claim = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement.recordObservationLocked(replacement.primary, true, time.Millisecond, replacement.clock.Now())
+			replacement.flushHistory(true)
+			stored, err := cache.LoadSmartHistory("auto")
+			if err != nil {
+				t.Fatal(err)
+			}
+			history, err := decodeSmartHistory(stored.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if statistic := history.Stats[replacement.network.Key][replacement.primary.identity]; statistic == nil || statistic.S != 1 {
+				t.Fatalf("startup restored observations from before the successful reset: %+v", statistic)
 			}
 		})
 	}

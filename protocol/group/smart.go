@@ -297,6 +297,8 @@ func (s *Smart) configure() error {
 func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateStart:
+		smartMutationAccess.Lock()
+		defer smartMutationAccess.Unlock()
 		value := func(p *float64, d float64) float64 {
 			if p != nil {
 				return *p
