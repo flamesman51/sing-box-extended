@@ -107,11 +107,14 @@ func TestSmartCloseReconcilesSharedLedgerUnstartedJobs(t *testing.T) {
 			ledger.Register("other-group", map[string]float64{"wifi": 100})
 			t.Cleanup(func() { ledger.Unregister("other-group") })
 			s.ledger = ledger
-			id, _, err := ledger.Reserve(context.Background(), "wifi", clock.Now(), 0)
+			id, charged, err := ledger.ReservePlan(context.Background(), "wifi", clock.Now(), 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
-			job := smartJob{kind: "throughput", member: s.primary, reservation: id, ctx: s.ctx, timeout: time.Second}
+			if charged != 100_000_000 {
+				t.Fatalf("unstarted admission reserved %d charged bytes, want full 100 MB remainder", charged)
+			}
+			job := smartJob{kind: "throughput", member: s.primary, reservation: id, capBytes: charged, ctx: s.ctx, timeout: time.Second}
 			s.healthJobs, s.otherJobs = make(chan smartJob, 1), make(chan smartJob, 1)
 			switch location {
 			case "pending":
@@ -127,9 +130,12 @@ func TestSmartCloseReconcilesSharedLedgerUnstartedJobs(t *testing.T) {
 			if err = s.Close(); err != nil {
 				t.Fatal(err)
 			}
-			next, _, err := ledger.Reserve(context.Background(), "wifi", clock.Now().Add(time.Minute), 0)
+			next, remaining, err := ledger.ReservePlan(context.Background(), "wifi", clock.Now().Add(time.Minute), 0, 1_000_000)
 			if err != nil {
 				t.Fatalf("closed group left shared ledger busy: %v", err)
+			}
+			if remaining != charged {
+				t.Fatalf("unstarted reservation was not fully refunded: got %d, want %d", remaining, charged)
 			}
 			if snapshot := ledger.Snapshot("wifi", clock.Now(), 0); snapshot.UsedMB != 0 {
 				t.Fatalf("unstarted test charged bytes: %+v", snapshot)

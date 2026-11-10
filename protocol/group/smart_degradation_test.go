@@ -12,7 +12,13 @@ import (
 
 func smartTestDegradationEpisode(s *Smart, now time.Time) *smartDegradationEpisode {
 	ctx, cancel := context.WithCancel(s.ctx)
-	e := &smartDegradationEpisode{primary: s.primary, key: s.network.Key, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.primary.generation, epoch: s.primaryEpoch, ctx: ctx, cancel: cancel, until: now.Add(5 * time.Minute)}
+	plan := s.downloadMeasurementPlanLocked()
+	plan.DownloadPhases = 2
+	challenger := s.degradationCandidateLocked(now)
+	e := &smartDegradationEpisode{primary: s.primary, challenger: challenger, key: s.network.Key, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.primary.generation, epoch: s.primaryEpoch, ctx: ctx, cancel: cancel, until: now.Add(plan.Deadline()), plan: plan}
+	if challenger != nil {
+		e.challengerGeneration = challenger.generation
+	}
 	s.degradation.episode = e
 	return e
 }
@@ -21,9 +27,8 @@ func smartTestDegradationResult(s *Smart, e *smartDegradationEpisode, m *smartMe
 	if m.queued == nil {
 		m.queued = make(map[string]bool)
 	}
-	m.queued["throughput"] = true
-	m.degradationQueued = e
-	s.applyResultLocked(smartResult{member: m, kind: "throughput", episode: e, purpose: purpose, download: rate, generation: e.generation, configGeneration: e.configGeneration, memberGeneration: m.generation}, now)
+	m.queued["throughput"], m.degradationQueued = true, e
+	s.applyResultLocked(smartResult{member: m, kind: "throughput", episode: e, purpose: purpose, measurement: smartMeasurementResult{Download: smartDirectionResult{Value: rate, At: now, Streams: 1, Window: 7 * time.Second, Valid: rate > 0}}, generation: e.generation, configGeneration: e.configGeneration, memberGeneration: m.generation}, now)
 }
 
 func smartDegradationTestGroup(t *testing.T) (*Smart, *smartFakeClock) {
@@ -44,97 +49,138 @@ func smartDegradationTestGroup(t *testing.T) (*Smart, *smartFakeClock) {
 	return s, clock
 }
 
+func smartTestRestoreEpisodeEvidence(t *testing.T, s *Smart, now time.Time) {
+	t.Helper()
+	encoded, err := s.history.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := decodeSmartHistory(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.history = history
+	for _, member := range s.members {
+		member.floorState = smartFloorState{}
+		member.legacyEpisodeObs = smartLegacyEpisodeObservation{}
+		member.downloadUnderLoad = smartDirectionResult{}
+	}
+	s.restoreThroughputLocked(now)
+}
+
 func TestSmartDegradationSustainedDemand(t *testing.T) {
-	for _, pattern := range []string{"slow", "sufficient", "chat", "long_stalls", "short"} {
-		t.Run(pattern, func(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		read    int
+		episode bool
+	}{
+		{"slow", 375000, true}, {"sufficient", 4000000, false}, {"chat", 100, false}, {"exact_byte_floor", 6554, true}, {"below_byte_floor", 6553, false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
 			s, clock := smartDegradationTestGroup(t)
-			l := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-			s.leases[s.primary] = map[*smartLease]struct{}{l: {}}
-			if pattern == "short" {
-				l.started = clock.Now().Add(time.Hour)
-			}
+			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
 			s.scheduleDegradationLocked(clock.Now())
-			for i := range 21 {
+			for second := range 20 {
+				lease.CountRead(scenario.read)
 				clock.Advance(time.Second)
-				n := 375000
-				switch pattern {
-				case "sufficient":
-					n = 4000000
-				case "chat":
-					n = 100
-				case "long_stalls":
-					if i%12 < 9 {
-						n = 0
-					}
-				}
-				if n > 0 {
-					l.CountRead(n)
-				}
 				s.scheduleDegradationLocked(clock.Now())
+				if second < 19 && s.degradation.episode != nil {
+					t.Fatal("less than twenty complete bins triggered an episode")
+				}
 			}
-			if pattern == "slow" && s.degradation.episode == nil {
-				t.Fatal("sustained 3 Mbit/s demand did not create episode")
-			}
-			if pattern != "slow" && s.degradation.episode != nil {
-				t.Fatal("app-limited or sufficient traffic created episode")
+			if got := s.degradation.episode != nil; got != scenario.episode {
+				t.Fatalf("episode=%v, want %v", got, scenario.episode)
 			}
 			if s.primary.throughput.Download != 50 {
-				t.Fatal("passive evidence demoted primary")
+				t.Fatal("passive bytes changed regular evidence")
+			}
+			if e := s.degradation.episode; e != nil && (e.challenger != s.standby || e.plan.DownloadPhases != 2 || e.plan.Upload != nil) {
+				t.Fatal("challenger and complete download-only plan were not chosen before admission")
 			}
 		})
 	}
 }
 
-func TestSmartDegradationProvisionalBlocksAgedDwell(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	primary := s.primary
-	s.selectedAt = clock.Now().Add(-time.Hour)
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-	if primary.throughput.Download != 50 {
-		t.Fatal("low confirmation was published")
-	}
-	for range 3 {
-		clock.Advance(30 * time.Second)
-		s.standby.lastOK = clock.Now()
-		s.chooseLocked(clock.Now())
-	}
-	if s.primary != primary {
-		t.Fatal("stale standby bypassed fresh challenger")
-	}
-	smartTestDegradationResult(s, e, s.standby, smartDegradationChallenger, 3, clock.Now())
-	if s.primary != primary || primary.throughput.Download != 50 || s.standby.throughput.Download != 50 {
-		t.Fatal("both-slow pair affected ordinary ranking")
+func TestSmartDegradationRecoveryAndIdleResetBins(t *testing.T) {
+	for _, reset := range []string{"recovery", "idle", "closed"} {
+		t.Run(reset, func(t *testing.T) {
+			s, clock := smartDegradationTestGroup(t)
+			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			s.scheduleDegradationLocked(clock.Now())
+			for range 19 {
+				lease.CountRead(375000)
+				clock.Advance(time.Second)
+				s.scheduleDegradationLocked(clock.Now())
+			}
+			switch reset {
+			case "recovery":
+				lease.CountRead(4_000_000)
+				clock.Advance(time.Second)
+				s.scheduleDegradationLocked(clock.Now())
+			case "idle":
+				clock.Advance(9 * time.Second)
+				s.scheduleDegradationLocked(clock.Now())
+			case "closed":
+				lease.Close()
+				s.scheduleDegradationLocked(clock.Now())
+				lease = &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+				s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			}
+			lease.CountRead(375000)
+			s.scheduleDegradationLocked(clock.Now())
+			for second := range 20 {
+				if second > 0 {
+					lease.CountRead(375000)
+				}
+				clock.Advance(time.Second)
+				s.scheduleDegradationLocked(clock.Now())
+				if second < 19 && s.degradation.episode != nil {
+					t.Fatal("reset reused earlier slow bins")
+				}
+			}
+			if s.degradation.episode == nil {
+				t.Fatal("fresh twenty-second low window did not trigger")
+			}
+		})
 	}
 }
 
-func TestSmartDegradationRotationAcrossCooldown(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	primary, b := s.primary, s.standby
-	c := &smartMember{tag: "c", identity: "c", serverIdentity: "c", outbound: &smartFakeOutbound{"c"}, tier: 1, generation: 1, state: "healthy", queued: make(map[string]bool), throughput: primary.throughput}
-	s.members = append(s.members, c)
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-	if e.challenger != b {
-		t.Fatal("first untried challenger missing")
-	}
-	s.degradation.attempts = map[string]time.Time{b.identity: clock.Now()}
-	s.lastChallenger = clock.Now()
-	smartTestDegradationResult(s, e, b, smartDegradationChallenger, 3, clock.Now())
-	clock.Advance(time.Hour)
-	e = smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-	if e.challenger != c {
-		t.Fatal("failed B starved untried fast C")
-	}
-	smartTestDegradationResult(s, e, c, smartDegradationChallenger, 50, clock.Now())
-	if s.primary != c {
-		t.Fatal("fresh fast C did not waive dwell")
+func TestSmartProfileDegradationThreshold(t *testing.T) {
+	for _, scenario := range []struct {
+		name            string
+		rank            []string
+		rate            int
+		legacy, episode bool
+	}{
+		{"legacy_seventy_percent", nil, 2_187_500, true, false},
+		{"floor_seventy_percent", []string{"speed_floor", "download"}, 2_187_500, false, true},
+		{"download_seventy_percent", []string{"download"}, 2_187_500, false, true},
+		{"throughput_seventy_percent", []string{"throughput"}, 2_187_500, false, true},
+		{"floor_threshold", []string{"speed_floor"}, 2_500_000, false, false},
+		{"stability_only", []string{"stability"}, 375000, false, false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.legacy, s.preference.rank = scenario.legacy, scenario.rank
+			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			s.scheduleDegradationLocked(clock.Now())
+			for range 20 {
+				lease.CountRead(scenario.rate)
+				clock.Advance(time.Second)
+				s.scheduleDegradationLocked(clock.Now())
+			}
+			if got := s.degradation.episode != nil; got != scenario.episode {
+				t.Fatalf("episode=%v, want %v", got, scenario.episode)
+			}
+		})
 	}
 }
 
 func TestSmartDegradationEpisodeInvalidation(t *testing.T) {
-	for _, change := range []string{"key", "generation", "config", "member", "away-back", "pause", "closed"} {
+	for _, change := range []string{"key", "generation", "config", "member", "away-back", "pause", "power", "closed"} {
 		t.Run(change, func(t *testing.T) {
 			s, clock := smartDegradationTestGroup(t)
 			primary := s.primary
@@ -153,29 +199,17 @@ func TestSmartDegradationEpisodeInvalidation(t *testing.T) {
 				s.switchLocked(primary, "switch", "test", clock.Now())
 			case "pause":
 				s.paused = true
+			case "power":
+				s.network.PowerSave = true
 			case "closed":
 				s.closed = true
 			}
 			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-			if s.degradation.episode != nil || primary.degradationQueued != nil || primary.throughput.Download != 50 {
-				t.Fatal("invalid episode retained ownership or published result")
+			if s.degradation.episode != nil || primary.degradationQueued != nil || primary.throughput.Download != 50 || primary.floorState.Kind != "" {
+				t.Fatal("invalid episode retained ownership or published evidence")
 			}
 			s.closed = false
 		})
-	}
-}
-
-func TestSmartDegradationNeutralCompletion(t *testing.T) {
-	for _, contained := range []bool{false, true} {
-		s, clock := smartDegradationTestGroup(t)
-		e := smartTestDegradationEpisode(s, clock.Now())
-		m := s.primary
-		m.degradationQueued = e
-		m.queued["throughput"] = true
-		s.applyResultLocked(smartResult{member: m, kind: "throughput", episode: e, purpose: smartDegradationConfirmation, err: context.Canceled, contained: contained}, clock.Now())
-		if m.degradationQueued != nil || m.queued["throughput"] || s.degradation.episode != nil || m.state != "healthy" || m.throughput.Download != 50 {
-			t.Fatal("neutral completion leaked state or changed health")
-		}
 	}
 }
 
@@ -183,18 +217,283 @@ func TestSmartDegradationHeartbeatLifetime(t *testing.T) {
 	s, clock := smartDegradationTestGroup(t)
 	s.workCtx, s.workCancel = context.WithCancel(s.ctx)
 	s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
-	for _, purpose := range []string{smartDegradationConfirmation, smartDegradationChallenger} {
+	e := smartTestDegradationEpisode(s, clock.Now())
+	s.preemptBackgroundLocked(smartJob{kind: "tcp", urgent: true, member: s.primary})
+	if e.ctx.Err() != nil {
+		t.Fatal("heartbeat cancelled admitted measurement")
+	}
+	s.clearDegradationLocked()
+	if !errors.Is(e.ctx.Err(), context.Canceled) {
+		t.Fatal("invalidation did not cancel measurement")
+	}
+}
+
+func TestSmartProfileDegradationStagedFloorOnly(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		challenger float64
+		outcome    string
+		switches   bool
+	}{
+		{"below_floor", 20, "challenger_slow", false}, {"meets_floor", 25, "switched", true}, {"above_floor", 40, "switched", true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			primary, challenger := s.primary, s.standby
+			beforePrimary, beforeChallenger := primary.throughput, challenger.throughput
+			clock.Advance(time.Second)
+			e := smartTestDegradationEpisode(s, clock.Now())
+			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+			if primary.floorState.Kind != "" || primary.downloadUnderLoad.Valid || !s.meetsFloorLocked(primary, clock.Now()) {
+				t.Fatal("A1 evidence was committed before terminal outcome")
+			}
+			clock.Advance(time.Second)
+			smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, scenario.challenger, clock.Now())
+			if (s.primary == challenger) != scenario.switches || s.degradation.state != scenario.outcome {
+				t.Fatalf("selected=%s outcome=%s", s.primary.tag, s.degradation.state)
+			}
+			if primary.throughput != beforePrimary || challenger.throughput != beforeChallenger {
+				t.Fatal("under-load results replaced regular downloads")
+			}
+			if primary.floorState.Kind != "revoked" || s.meetsFloorLocked(primary, clock.Now()) {
+				t.Fatal("completed slow A1 retained floor credit")
+			}
+			if !primary.downloadUnderLoad.Valid || primary.downloadUnderLoad.Value != 3 || challenger.downloadUnderLoad.Value != scenario.challenger {
+				t.Fatal("completed plan diagnostics missing")
+			}
+			if scenario.switches && (challenger.floorState.Kind != "proven" || !s.meetsFloorLocked(challenger, clock.Now())) {
+				t.Fatal("challenger proof missing")
+			}
+			if primary.legacyEpisodeObs.At.IsZero() == false || challenger.legacyEpisodeObs.At.IsZero() == false {
+				t.Fatal("profile results leaked into legacy observations")
+			}
+		})
+	}
+}
+
+func TestSmartProfileDegradationCancellationDiscardsStagedResults(t *testing.T) {
+	for _, failure := range []error{context.Canceled, errSmartBudget} {
+		s, clock := smartProfileThroughputTestGroup(t)
+		primary, challenger := s.primary, s.standby
 		e := smartTestDegradationEpisode(s, clock.Now())
-		e.ctx, e.cancel = context.WithCancel(s.workCtx)
-		s.preemptBackgroundLocked(smartJob{kind: "tcp", urgent: true, member: s.primary})
-		if e.ctx.Err() != nil {
-			t.Fatal("heartbeat cancelled degradation job")
+		smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+		challenger.queued["throughput"], challenger.degradationQueued = true, e
+		s.applyResultLocked(smartResult{member: challenger, kind: "throughput", episode: e, purpose: smartDegradationChallenger, err: failure, generation: e.generation, configGeneration: e.configGeneration, memberGeneration: challenger.generation}, clock.Now())
+		if primary.floorState.Kind != "" || primary.downloadUnderLoad.Valid || challenger.downloadUnderLoad.Valid || !primary.legacyEpisodeObs.At.IsZero() {
+			t.Fatal("failed C committed staged A1")
 		}
-		job := smartJob{ctx: e.ctx, episode: e, purpose: purpose}
-		s.clearDegradationLocked()
-		if !errors.Is(job.ctx.Err(), context.Canceled) {
-			t.Fatal("invalidation did not cancel job")
+		if s.degradation.episode != nil {
+			t.Fatal("failed plan retained owner")
 		}
+	}
+}
+
+func TestSmartProfileDegradationPrimaryFastUsesHysteresis(t *testing.T) {
+	for _, rate := range []float64{20, 22, 25, 100} {
+		s, clock := smartProfileThroughputTestGroup(t)
+		before := s.primary.throughput
+		e := smartTestDegradationEpisode(s, clock.Now())
+		smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, rate, clock.Now())
+		if s.degradation.state != "primary_fast" || s.degradation.episode != nil || s.primary.throughput != before || s.primary.downloadUnderLoad.Value != rate {
+			t.Fatalf("rate=%v did not finish primary_fast without magnitude publication", rate)
+		}
+	}
+}
+
+func TestSmartProfileDegradationRequiresDecisiveFloor(t *testing.T) {
+	for _, scenario := range []struct {
+		name           string
+		rank           []string
+		worseStability bool
+		outcome        string
+	}{
+		{"speed_max", []string{"download"}, false, "no_floor_criterion"},
+		{"throughput_only", []string{"throughput"}, false, "no_floor_criterion"},
+		{"stability_before_floor", []string{"stability", "speed_floor"}, true, "challenger_slow"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.rank = scenario.rank
+			primary, challenger := s.primary, s.standby
+			primary.throughput.Download, challenger.throughput.Download = 20, 30
+			if scenario.worseStability {
+				stat := s.history.statistic(s.network.Key, primary.identity, clock.Now())
+				stat.S, stat.W, stat.UpdatedAt = 1000, 1000, clock.Now().Unix()
+				stat = s.history.statistic(s.network.Key, challenger.identity, clock.Now())
+				stat.S, stat.W, stat.UpdatedAt = 850, 1000, clock.Now().Unix()
+			}
+			clock.Advance(time.Second)
+			e := smartTestDegradationEpisode(s, clock.Now())
+			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+			clock.Advance(time.Second)
+			smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, 25, clock.Now())
+			if s.primary != primary || s.degradation.state != scenario.outcome {
+				t.Fatalf("non-floor decision switched: state=%s", s.degradation.state)
+			}
+			if primary.throughput.Download != 20 || challenger.throughput.Download != 30 {
+				t.Fatal("episode published download magnitude")
+			}
+			if s.degradation.state == "shared_bottleneck_suspected" {
+				t.Fatal("profile emitted shared-bottleneck diagnosis")
+			}
+		})
+	}
+}
+
+func TestSmartProfileDegradationUnmeasuredChallenger(t *testing.T) {
+	s, clock := smartProfileThroughputTestGroup(t)
+	primary, challenger := s.primary, s.standby
+	challenger.throughput = smartThroughput{}
+	clock.Advance(time.Second)
+	e := smartTestDegradationEpisode(s, clock.Now())
+	if e.challenger != challenger {
+		t.Fatal("unmeasured healthy challenger was not planned")
+	}
+	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+	clock.Advance(time.Second)
+	smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, 25, clock.Now())
+	if s.primary != challenger || !s.meetsFloorLocked(challenger, clock.Now()) || !challenger.throughput.At.IsZero() {
+		t.Fatal("unmeasured challenger did not retain independent proven floor")
+	}
+	s.rankLocked(clock.Now())
+	if !s.meetsFloorLocked(challenger, clock.Now()) {
+		t.Fatal("ordinary ranking lost proven floor")
+	}
+	smartTestRestoreEpisodeEvidence(t, s, clock.Now())
+	if !s.meetsFloorLocked(challenger, clock.Now()) || challenger.floorState.Kind != "proven" {
+		t.Fatal("restart lost proven floor")
+	}
+}
+
+func TestSmartProfileDegradationRevocationRecoveryAndRestore(t *testing.T) {
+	s, clock := smartProfileThroughputTestGroup(t)
+	primary, challenger := s.primary, s.standby
+	clock.Advance(time.Second)
+	e := smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+	clock.Advance(time.Second)
+	smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, 10, clock.Now())
+	for _, rate := range []float64{15, 22, 25} {
+		smartTestRestoreEpisodeEvidence(t, s, clock.Now())
+		if s.meetsFloorLocked(primary, clock.Now()) {
+			t.Fatal("restore erased revocation")
+		}
+		clock.Advance(time.Second)
+		s.applyResultLocked(smartResult{member: primary, kind: "throughput", measurement: smartMeasurementResult{Download: smartDirectionResult{Value: rate, At: clock.Now(), Valid: true}}, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: primary.generation}, clock.Now())
+		if got := s.meetsFloorLocked(primary, clock.Now()); got != (rate == 25) {
+			t.Fatalf("idle=%v met=%v", rate, got)
+		}
+		if rate < 25 && primary.floorState.Kind != "revoked" {
+			t.Fatal("hysteresis-band idle result cleared revocation")
+		}
+	}
+	smartTestRestoreEpisodeEvidence(t, s, clock.Now())
+	if primary.floorState.Kind != "" || !s.meetsFloorLocked(primary, clock.Now()) {
+		t.Fatal("full-target recovery did not persist clearing")
+	}
+}
+
+func TestSmartProfileDegradationStaleCandidateCannotDriveOrdinarySwitch(t *testing.T) {
+	s, clock := smartProfileThroughputTestGroup(t)
+	s.preference.confirmations = 1
+	s.selectedAt = clock.Now().Add(-time.Hour)
+	primary, challenger := s.primary, s.standby
+	clock.Advance(time.Second)
+	e := smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+	clock.Advance(time.Second)
+	smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, 10, clock.Now())
+	if !s.downloadStaleAfterRevocationLocked(challenger) {
+		t.Fatal("pre-revocation candidate download remained current for scheduling")
+	}
+	if _, fresh := s.effectiveDownloadLocked(challenger, clock.Now()); fresh || s.meetsFloorLocked(challenger, clock.Now()) {
+		t.Fatal("pre-revocation candidate retained profile credit")
+	}
+	s.chooseLocked(clock.Now())
+	if s.primary != primary {
+		t.Fatal("ordinary chooser switched on stale candidate evidence")
+	}
+	primary.lastThroughput = clock.Now()
+	s.scheduleThroughputLocked(clock.Now())
+	if s.admission == nil || s.admission.job.member != challenger || s.admission.job.plan.Download == nil {
+		t.Fatal("ordinary scheduler skipped TTL-fresh pre-revocation challenger download")
+	}
+}
+
+func TestSmartDegradationOrdinaryChooserSuppressedOnTickAndHeartbeat(t *testing.T) {
+	for _, dispatch := range []string{"tick", "heartbeat"} {
+		t.Run(dispatch, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			primary := s.primary
+			primary.throughput.Download = 3
+			s.preference.confirmations = 1
+			s.selectedAt = clock.Now().Add(-time.Hour)
+			e := smartTestDegradationEpisode(s, clock.Now())
+			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+			if dispatch == "tick" {
+				s.tickLocked(clock.Now())
+			} else {
+				s.applyResultLocked(smartResult{member: s.standby, kind: "tcp", rtt: 10 * time.Millisecond, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.standby.generation}, clock.Now())
+			}
+			if s.primary != primary || s.degradation.episode != e {
+				t.Fatal("ordinary improvement bypassed pending complete plan")
+			}
+		})
+	}
+}
+
+func TestSmartDegradationLegacyObservationsPreserveClassification(t *testing.T) {
+	for _, scenario := range []struct {
+		name                          string
+		a1, c                         float64
+		outcome                       string
+		primaryClass, challengerClass int
+	}{
+		{"challenger_slow", 3, 10, "shared_bottleneck_suspected", 5, 4},
+		{"switched", 3, 25, "switched", 5, 0},
+		{"primary_fast", 30, 0, "primary_fast", 0, 4},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, clock := smartDegradationTestGroup(t)
+			primary, challenger := s.primary, s.standby
+			primary.throughput.Download, challenger.throughput.Download = 3, 10
+			for _, member := range s.members {
+				stat := s.history.statistic(s.network.Key, member.identity, clock.Now())
+				stat.Download, stat.ThroughputAt = member.throughput.Download, member.throughput.At.Unix()
+			}
+			clock.Advance(time.Second)
+			e := smartTestDegradationEpisode(s, clock.Now())
+			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, scenario.a1, clock.Now())
+			if scenario.c > 0 {
+				clock.Advance(time.Second)
+				smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, scenario.c, clock.Now())
+			}
+			if s.degradation.state != scenario.outcome {
+				t.Fatalf("outcome=%s", s.degradation.state)
+			}
+			if primary.throughput.Download != 3 || challenger.throughput.Download != 10 {
+				t.Fatal("legacy episode overwrote regular download")
+			}
+			for _, restore := range []bool{false, true} {
+				if restore {
+					smartTestRestoreEpisodeEvidence(t, s, clock.Now())
+				}
+				if got := s.throughputClass(primary, clock.Now()); got != scenario.primaryClass {
+					t.Fatalf("primary class=%d after restore=%v", got, restore)
+				}
+				if got := s.throughputClass(challenger, clock.Now()); got != scenario.challengerClass {
+					t.Fatalf("challenger class=%d after restore=%v", got, restore)
+				}
+			}
+			if scenario.name == "primary_fast" {
+				s.preference.confirmations = 1
+				s.selectedAt = clock.Now().Add(-time.Hour)
+				s.chooseLocked(clock.Now())
+				if s.primary != primary {
+					t.Fatal("legacy chooser used obsolete primary magnitude")
+				}
+			}
+		})
 	}
 }
 
@@ -203,7 +502,7 @@ func TestSmartDegradationFastCooldownAndV1Status(t *testing.T) {
 	e := smartTestDegradationEpisode(s, clock.Now())
 	smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, 50, clock.Now())
 	if s.degradation.retry.Sub(clock.Now()) != time.Hour || s.degradation.episode != nil {
-		t.Fatal("fast proof did not receive purpose cooldown")
+		t.Fatal("fast primary lost cooldown")
 	}
 	text, err := SmartStatus(context.Background(), smartTestManager{values: []adapter.Outbound{s}}, "")
 	if err != nil {
@@ -214,7 +513,63 @@ func TestSmartDegradationFastCooldownAndV1Status(t *testing.T) {
 		t.Fatal(err)
 	}
 	if document["version"] != float64(1) || document["throughput_degradation"] == nil {
-		t.Fatal("status contract changed")
+		t.Fatal("status envelope changed")
+	}
+}
+
+func TestSmartProfileDegradationTargetOneHundred(t *testing.T) {
+	s, clock := smartProfileThroughputTestGroup(t)
+	s.targetMbps = 100
+	primary, challenger := s.primary, s.standby
+	clock.Advance(time.Second)
+	e := smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 20, clock.Now())
+	clock.Advance(time.Second)
+	smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, 100, clock.Now())
+	if s.primary != challenger || challenger.floorState.Target != 100 || !s.meetsFloorLocked(challenger, clock.Now()) {
+		t.Fatal("target 100 did not produce a floor-only switch")
+	}
+}
+
+func TestSmartProfileDegradationProbeSafety(t *testing.T) {
+	for _, change := range []string{"unmeasured", "suspect", "other_tier", "below_minimum"} {
+		t.Run(change, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.minStability = 2
+			challenger := s.standby
+			challenger.throughput = smartThroughput{}
+			switch change {
+			case "suspect":
+				challenger.state = "suspect"
+			case "other_tier":
+				challenger.tier++
+			case "below_minimum":
+				stat := s.history.statistic(s.network.Key, challenger.identity, clock.Now())
+				stat.S, stat.W, stat.UpdatedAt = 500, 1000, clock.Now().Unix()
+			}
+			eligible := change == "unmeasured"
+			if got := s.degradationCandidateLocked(clock.Now()) == challenger; got != eligible {
+				t.Fatalf("candidate eligibility=%v, want %v", got, eligible)
+			}
+			e := smartTestDegradationEpisode(s, clock.Now())
+			e.challenger, e.challengerGeneration = challenger, challenger.generation
+			job := smartJob{member: challenger, ctx: e.ctx, episode: e, purpose: smartDegradationChallenger}
+			if got := s.degradationJobValid(job); got != eligible {
+				t.Fatalf("execution eligibility=%v, want %v", got, eligible)
+			}
+		})
+	}
+}
+
+func TestSmartDegradationStaleCompletionCannotClearNewOwner(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	old := smartTestDegradationEpisode(s, clock.Now())
+	s.clearDegradationLocked()
+	current := smartTestDegradationEpisode(s, clock.Now())
+	s.primary.degradationQueued, s.primary.queued["throughput"] = current, true
+	s.applyResultLocked(smartResult{member: s.primary, kind: "throughput", episode: old, purpose: smartDegradationConfirmation, err: context.Canceled}, clock.Now())
+	if s.degradation.episode != current || s.primary.degradationQueued != current || !s.primary.queued["throughput"] {
+		t.Fatal("late result cleared newer episode ownership")
 	}
 }
 
@@ -223,11 +578,7 @@ func TestSmartDegradationDelayedAdmissionFencing(t *testing.T) {
 		t.Run(change, func(t *testing.T) {
 			s, clock := smartDegradationTestGroup(t)
 			e := smartTestDegradationEpisode(s, clock.Now())
-			id, capBytes, err := s.ledger.ReserveDegradation(s.ctx, "wifi", clock.Now(), 0, smartDegradationConfirmation, 10_000_000)
-			if err != nil {
-				t.Fatal(err)
-			}
-			admission := &smartAdmission{job: smartJob{member: s.primary, kind: "throughput", ctx: e.ctx, episode: e, purpose: smartDegradationConfirmation, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.primary.generation, reservation: id, capBytes: capBytes}, ack: make(chan bool, 1)}
+			admission := &smartAdmission{job: smartJob{member: s.primary, kind: "throughput", ctx: e.ctx, episode: e, purpose: smartDegradationConfirmation, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.primary.generation, plan: e.plan}, ack: make(chan bool, 1)}
 			s.admission = admission
 			switch change {
 			case "key":
@@ -247,651 +598,8 @@ func TestSmartDegradationDelayedAdmissionFencing(t *testing.T) {
 			}
 			s.applyResultLocked(smartResult{kind: "admission", admission: admission}, clock.Now())
 			if <-admission.ack || len(s.pending) != 0 {
-				t.Fatal("stale or disabled admission queued degradation test")
-			}
-			if err = s.ledger.Reconcile(s.ctx, id, 0, false); err != nil {
-				t.Fatal(err)
+				t.Fatal("stale admission queued episode work")
 			}
 		})
-	}
-}
-
-func TestSmartDegradationPurposeDenialDoesNotBlockCalibration(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	e := smartTestDegradationEpisode(s, clock.Now())
-	admission := &smartAdmission{job: smartJob{member: s.primary, kind: "throughput", ctx: e.ctx, episode: e, purpose: smartDegradationConfirmation, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.primary.generation, networkType: "wifi"}, ack: make(chan bool, 1)}
-	s.admission = admission
-	s.applyResultLocked(smartResult{kind: "admission", admission: admission, err: errSmartDegradationBudget}, clock.Now())
-	if <-admission.ack || !s.admissionRetryAt.IsZero() {
-		t.Fatal("purpose allowance denial blocked all calibration")
-	}
-	s.startThroughputAdmissionLocked(s.primary, clock.Now())
-	if s.admission == nil {
-		t.Fatal("ordinary calibration did not enter admission")
-	}
-	s.clearDegradationLocked()
-	s.cancel()
-}
-
-func TestSmartDegradationStaleCompletionCannotClearNewOwner(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	old := smartTestDegradationEpisode(s, clock.Now())
-	s.clearDegradationLocked()
-	current := smartTestDegradationEpisode(s, clock.Now())
-	s.primary.degradationQueued = current
-	s.primary.queued["throughput"] = true
-	s.applyResultLocked(smartResult{member: s.primary, kind: "throughput", episode: old, purpose: smartDegradationConfirmation, err: context.Canceled}, clock.Now())
-	if s.degradation.episode != current || s.primary.degradationQueued != current || !s.primary.queued["throughput"] {
-		t.Fatal("late result cleared new episode ownership")
-	}
-}
-
-func TestSmartDegradationSupervisorRestartClearsOwnership(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	episode := smartTestDegradationEpisode(s, clock.Now())
-	s.primary.degradationQueued = episode
-	s.primary.queued["throughput"] = true
-	s.testHook = func(site string) {
-		if site == "tick" {
-			panic("degradation restart")
-		}
-	}
-	s.loopDone = make(chan struct{})
-	go s.loop(s.ctx)
-	smartAwaitGroup(t, s, clock, func() bool { return s.generationContained })
-	s.mu.Lock()
-	cleared := s.degradation.episode == nil && s.primary.degradationQueued == nil && !s.primary.queued["throughput"]
-	s.mu.Unlock()
-	if !cleared || episode.ctx.Err() == nil {
-		t.Fatal("restart retained degradation owner")
-	}
-}
-
-func TestSmartDegradationContainedJobUsesNormalSettlement(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	e := smartTestDegradationEpisode(s, clock.Now())
-	id, capBytes, err := s.ledger.ReserveDegradation(s.ctx, "wifi", clock.Now(), 0, smartDegradationConfirmation, 10_000_000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.primary.degradationQueued = e
-	s.primary.queued["throughput"] = true
-	s.testHook = func(site string) {
-		if site == "probe/throughput" {
-			panic("degradation measurement")
-		}
-	}
-	result := s.runJob(smartJob{member: s.primary, kind: "throughput", ctx: e.ctx, timeout: 30 * time.Second, episode: e, purpose: smartDegradationConfirmation, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: s.primary.generation, networkType: "wifi", reservation: id, capBytes: capBytes})
-	if !result.contained {
-		t.Fatal("new operation bypassed containment")
-	}
-	s.applyResultLocked(result, clock.Now())
-	budget := s.ledger.Snapshot("wifi", clock.Now(), 0)
-	if budget.ReservedMB != 0 || budget.UsedMB != 10 || budget.Degradation.UsedMB != 10 || s.degradation.episode != nil || s.primary.state != "healthy" {
-		t.Fatalf("contained result did not settle neutrally: %+v", budget)
-	}
-}
-
-func TestSmartDegradationChallengerAdmissionPersistsPurposeCooldown(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, 3, clock.Now())
-	s.startDegradationAdmissionLocked(e.challenger, smartDegradationChallenger, e, clock.Now())
-	result := smartLedgerWait(t, s.results)
-	s.applyResultLocked(result, clock.Now())
-	s.admissionWorkers.Wait()
-	s.accountingWorkers.Wait()
-	if len(s.pending) != 1 || s.pending[0].ctx != e.ctx || s.pending[0].episode != e {
-		t.Fatal("challenger lost its episode lifetime at queue acceptance")
-	}
-	if s.ledger.DegradationCooldown(s.degradationChallengerCooldownKey()).Sub(clock.Now()) != time.Hour {
-		t.Fatal("accepted challenger did not persist its hourly purpose cooldown")
-	}
-	if s.degradation.attempts[e.challenger.identity] != clock.Now() {
-		t.Fatal("admission did not record challenger identity independently of published throughput")
-	}
-	s.clearPendingLocked()
-	s.accountingWorkers.Wait()
-	s.lastChallenger = time.Time{}
-	s.network.Key += "/tower:new"
-	if !s.degradationChallengerRetryLocked().After(clock.Now()) {
-		t.Fatal("key-only change or volatile-state loss bypassed hourly challenger limit")
-	}
-}
-
-func TestSmartDegradationSampleRecoveryResetsWindow(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-	s.scheduleDegradationLocked(clock.Now())
-	for range 19 {
-		clock.Advance(time.Second)
-		lease.CountRead(1_625_000)
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	clock.Advance(time.Second)
-	lease.CountRead(125_000)
-	s.scheduleDegradationLocked(clock.Now())
-	if s.degradation.episode != nil {
-		t.Fatal("19 recovered samples followed by one slow sample qualified as sustained slow")
-	}
-	for range 18 {
-		clock.Advance(time.Second)
-		lease.CountRead(125_000)
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	if s.degradation.episode != nil {
-		t.Fatal("less than twenty slow samples qualified")
-	}
-	clock.Advance(time.Second)
-	lease.CountRead(125_000)
-	s.scheduleDegradationLocked(clock.Now())
-	if s.degradation.episode == nil {
-		t.Fatal("twenty consecutive low samples did not qualify")
-	}
-}
-
-func TestSmartDegradationUndersizedChallengerDoesNotConsumeTurn(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, 3, clock.Now())
-	s.ledger.mu.Lock()
-	s.ledger.state.Days[smartDegradationDayKey("wifi", clock.Now().Format("2006-01-02"))] = 498_790_000
-	s.ledger.mu.Unlock()
-	s.startDegradationAdmissionLocked(e.challenger, smartDegradationChallenger, e, clock.Now())
-	result := smartLedgerWait(t, s.results)
-	s.applyResultLocked(result, clock.Now())
-	s.admissionWorkers.Wait()
-	if !errors.Is(result.err, errSmartDegradationBudget) || len(s.pending) != 0 || len(s.degradation.attempts) != 0 || !s.lastChallenger.IsZero() || !s.ledger.DegradationCooldown(s.degradationChallengerCooldownKey()).IsZero() {
-		t.Fatal("unmeasurable challenger consumed its turn or hourly cooldown")
-	}
-}
-
-func TestSmartDegradationJitteredTicksReachSuspicion(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-	s.scheduleDegradationLocked(clock.Now())
-	intervals := []time.Duration{900 * time.Millisecond, 1100 * time.Millisecond, 1400 * time.Millisecond, 2200 * time.Millisecond}
-	start := clock.Now()
-	for i := range 24 {
-		elapsed := intervals[i%len(intervals)]
-		clock.Advance(elapsed)
-		lease.CountRead(int(187500 * elapsed / time.Second))
-		s.scheduleDegradationLocked(clock.Now())
-		if s.degradation.episode != nil {
-			if clock.Now().Sub(start) < 20*time.Second {
-				t.Fatal("jitter shortened sustained demand window")
-			}
-			return
-		}
-	}
-	t.Fatalf("sustained 1.5 Mbps download stayed %q under jittered sampling", s.degradation.state)
-}
-
-func TestSmartDegradationIntermittentReadsConfirmOnceWithoutChallengerCooldown(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-	s.scheduleDegradationLocked(clock.Now())
-	for i := range 20 {
-		clock.Advance(time.Second)
-		if i%2 == 0 {
-			lease.CountRead(375_000)
-		}
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	e := s.degradation.episode
-	if e == nil {
-		t.Fatal("intermittent sub-half-target traffic did not request confirmation")
-	}
-	result := smartLedgerWait(t, s.results)
-	s.applyResultLocked(result, clock.Now())
-	s.admissionWorkers.Wait()
-	if len(s.pending) != 1 || s.pending[0].purpose != smartDegradationConfirmation {
-		t.Fatal("suspicion did not admit exactly one primary confirmation")
-	}
-	job := s.pending[0]
-	s.pending = nil
-	if err := s.ledger.Reconcile(context.Background(), job.reservation, 1_000_000, false); err != nil {
-		t.Fatal(err)
-	}
-	smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, 50, clock.Now())
-	for i := range 180 {
-		clock.Advance(time.Second)
-		if i%2 == 0 {
-			lease.CountRead(375_000)
-		}
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	budget := s.ledger.Snapshot(s.network.Type, clock.Now(), s.network.Offset)
-	if s.degradation.episode != nil || s.admission != nil || len(s.pending) != 0 || budget.Degradation.UsedMB != 1 || budget.ReservedMB != 0 {
-		t.Fatalf("fast primary spent more than one confirmation: episode=%v admission=%v pending=%d budget=%+v", s.degradation.episode != nil, s.admission != nil, len(s.pending), budget)
-	}
-	if s.degradation.cooldowns[s.degradationKey(s.primary)].Sub(e.until.Add(-5*time.Minute)) != time.Hour {
-		t.Fatal("fast primary did not retain its one-hour suspicion cooldown")
-	}
-	if !s.lastChallenger.IsZero() || !s.degradationChallengerRetryLocked().IsZero() || len(s.degradation.attempts) != 0 {
-		t.Fatal("fast primary consumed the hourly challenger cooldown")
-	}
-}
-
-func TestSmartDegradationSamplingPauseResetsCoverage(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-	s.scheduleDegradationLocked(clock.Now())
-	for range 18 {
-		clock.Advance(time.Second)
-		lease.CountRead(375_000)
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	clock.Advance(10 * time.Second)
-	lease.CountRead(375_000)
-	s.scheduleDegradationLocked(clock.Now())
-	if s.degradation.episode != nil {
-		t.Fatal("read after sampling pause reused old coverage")
-	}
-	for range 19 {
-		clock.Advance(time.Second)
-		lease.CountRead(375_000)
-		s.scheduleDegradationLocked(clock.Now())
-		if s.degradation.episode != nil {
-			t.Fatal("pause did not require a fresh twenty-second window")
-		}
-	}
-	clock.Advance(time.Second)
-	lease.CountRead(375_000)
-	s.scheduleDegradationLocked(clock.Now())
-	if s.degradation.episode == nil {
-		t.Fatal("fresh continuous window did not qualify")
-	}
-}
-
-func TestSmartDegradationLossStallsQualifyWithinThirtySeconds(t *testing.T) {
-	for _, jitter := range []bool{false, true} {
-		t.Run(map[bool]string{false: "regular", true: "jittered"}[jitter], func(t *testing.T) {
-			s, clock := smartDegradationTestGroup(t)
-			start := clock.Now()
-			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: start, lastRead: start}
-			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-			s.scheduleDegradationLocked(start)
-			for i := range 32 {
-				interval := time.Second
-				if jitter {
-					interval = []time.Duration{900 * time.Millisecond, 1100 * time.Millisecond, 1050 * time.Millisecond, 950 * time.Millisecond}[i%4]
-				}
-				clock.Advance(interval)
-				// Six seconds near 1.5 Mbit/s, then alternating three- and four-second RTO stalls.
-				second := int(clock.Now().Sub(start) / time.Second)
-				cycle := second % 19
-				if cycle < 6 || cycle >= 9 && cycle < 15 {
-					rate := []int{162_500, 187_500, 212_500}[i%3]
-					lease.CountRead(int(time.Duration(rate) * interval / time.Second))
-				}
-				s.scheduleDegradationLocked(clock.Now())
-				if s.degradation.episode != nil {
-					if elapsed := clock.Now().Sub(start); elapsed < 30*time.Second || elapsed > 31*time.Second {
-						t.Fatalf("wrong detection time from flow open: %s", elapsed)
-					}
-					return
-				}
-			}
-			t.Fatalf("loss-stalled bulk download never qualified: state=%s coverage=%s", s.degradation.state, s.degradation.coverage.duration)
-		})
-	}
-}
-
-func TestSmartDegradationIdleAndClosedFlowResetWindow(t *testing.T) {
-	for _, closeFlow := range []bool{false, true} {
-		t.Run(map[bool]string{false: "stall_over_eight_seconds", true: "flow_closed"}[closeFlow], func(t *testing.T) {
-			s, clock := smartDegradationTestGroup(t)
-			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-			s.scheduleDegradationLocked(clock.Now())
-			for range 10 {
-				clock.Advance(time.Second)
-				lease.CountRead(187_500)
-				s.scheduleDegradationLocked(clock.Now())
-			}
-			if closeFlow {
-				lease.Close()
-				clock.Advance(time.Second)
-				s.scheduleDegradationLocked(clock.Now())
-				lease = &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-				s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-			} else {
-				for second := 1; second <= 9; second++ {
-					clock.Advance(time.Second)
-					s.scheduleDegradationLocked(clock.Now())
-					if second == 8 && s.degradation.coverage.duration != 18*time.Second {
-						t.Fatal("eight-second RTO stall reset coverage")
-					}
-				}
-			}
-			if s.degradation.episode != nil || s.degradation.coverage.duration != 0 {
-				t.Fatal("idle or closed flow retained suspicion coverage")
-			}
-			clock.Advance(time.Second)
-			lease.CountRead(187_500)
-			s.scheduleDegradationLocked(clock.Now())
-			for range 19 {
-				clock.Advance(time.Second)
-				lease.CountRead(187_500)
-				s.scheduleDegradationLocked(clock.Now())
-				if s.degradation.episode != nil {
-					t.Fatal("idle or closed flow reused old window")
-				}
-			}
-			clock.Advance(time.Second)
-			lease.CountRead(187_500)
-			s.scheduleDegradationLocked(clock.Now())
-			if s.degradation.episode == nil {
-				t.Fatal("fresh twenty-second window did not qualify")
-			}
-		})
-	}
-}
-
-func TestSmartDegradationStalledWindowRecoveryResets(t *testing.T) {
-	s, clock := smartDegradationTestGroup(t)
-	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-	s.scheduleDegradationLocked(clock.Now())
-	for range 10 {
-		clock.Advance(time.Second)
-		lease.CountRead(187_500)
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	for range 8 {
-		clock.Advance(time.Second)
-		s.scheduleDegradationLocked(clock.Now())
-	}
-	clock.Advance(time.Second)
-	lease.CountRead(1_562_500) // Exactly half of the default 25 Mbit/s target.
-	s.scheduleDegradationLocked(clock.Now())
-	for range 19 {
-		clock.Advance(time.Second)
-		lease.CountRead(187_500)
-		s.scheduleDegradationLocked(clock.Now())
-		if s.degradation.episode != nil {
-			t.Fatal("recovery sample was averaged into a stalled low-rate window")
-		}
-	}
-	clock.Advance(time.Second)
-	lease.CountRead(187_500)
-	s.scheduleDegradationLocked(clock.Now())
-	if s.degradation.episode == nil {
-		t.Fatal("fresh twenty-second window after recovery did not qualify")
-	}
-}
-
-func TestSmartDegradationExtremeThrottlingByteFloor(t *testing.T) {
-	for _, scenario := range []struct {
-		name    string
-		sample  func(int) int
-		qualify bool
-	}{
-		{
-			name: "CI_16_KiB_every_one_or_two_seconds",
-			sample: func(second int) int {
-				if second%4 == 0 {
-					return 0
-				}
-				return 16 * 1024
-			},
-			qualify: true,
-		},
-		{
-			name:    "128_KiB_per_twenty_seconds",
-			sample:  func(second int) int { return second*128*1024/20 - (second-1)*128*1024/20 },
-			qualify: true,
-		},
-		{
-			name:   "16_kbit_trickle",
-			sample: func(int) int { return 2 * 1024 },
-		},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			s, clock := smartDegradationTestGroup(t)
-			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-			s.scheduleDegradationLocked(clock.Now())
-			for second := 1; second <= 60; second++ {
-				clock.Advance(time.Second)
-				lease.CountRead(scenario.sample(second))
-				s.scheduleDegradationLocked(clock.Now())
-				if s.degradation.episode != nil {
-					if !scenario.qualify || second != 20 {
-						t.Fatalf("unexpected suspicion after %d seconds", second)
-					}
-					return
-				}
-			}
-			if scenario.qualify {
-				t.Fatalf("extreme throttling never qualified: window bytes=%f", s.degradation.coverage.bytes)
-			}
-		})
-	}
-}
-
-func TestSmartProfileDegradationThreshold(t *testing.T) {
-	for _, scenario := range []struct {
-		name    string
-		rank    []string
-		rate    int
-		legacy  bool
-		episode bool
-	}{
-		{"legacy_seventy_percent", nil, 2_187_500, true, false},
-		{"floor_seventy_percent", []string{"speed_floor", "download"}, 2_187_500, false, true},
-		{"download_seventy_percent", []string{"download"}, 2_187_500, false, true},
-		{"throughput_seventy_percent", []string{"throughput"}, 2_187_500, false, true},
-		{"floor_threshold", []string{"speed_floor"}, 2_500_000, false, false},
-		{"stability_only", []string{"stability"}, 375_000, false, false},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			s, clock := smartProfileThroughputTestGroup(t)
-			s.preference.legacy = scenario.legacy
-			s.preference.rank = scenario.rank
-			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
-			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
-			s.scheduleDegradationLocked(clock.Now())
-			for range 20 {
-				clock.Advance(time.Second)
-				lease.CountRead(scenario.rate)
-				s.scheduleDegradationLocked(clock.Now())
-			}
-			if got := s.degradation.episode != nil; got != scenario.episode {
-				t.Fatalf("episode=%v, want %v", got, scenario.episode)
-			}
-		})
-	}
-}
-
-func TestSmartProfileDegradationConfirmedFloorCredit(t *testing.T) {
-	for _, download := range []float64{0, 15, 19.75, 20, 25} {
-		s, clock := smartProfileThroughputTestGroup(t)
-		primary := s.primary
-		primary.throughput.Download = 30
-		e := smartTestDegradationEpisode(s, clock.Now())
-		smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, download, clock.Now())
-		if primary.floorDegraded != (download > 0 && download < 20) {
-			t.Fatalf("download=%v degraded floor=%v", download, primary.floorDegraded)
-		}
-		if download == 0 && primary.throughput.Download != 30 {
-			t.Fatal("zero confirmation replaced valid primary floor evidence")
-		}
-		if download > 0 && download < 20 && (e.confirmed != download || e.challenger != s.standby || primary.throughput.Download != download || s.meetsFloorLocked(primary, clock.Now())) {
-			t.Fatal("confirmed slow primary retained old floor credit or lost the challenger")
-		}
-		if (download == 0 || download >= 20) && s.degradation.episode != nil {
-			t.Fatal("inconclusive or threshold-or-faster primary continued degradation")
-		}
-	}
-}
-
-func TestSmartProfileDegradationUnmeasuredChallenger(t *testing.T) {
-	s, clock := smartProfileThroughputTestGroup(t)
-	primary, challenger := s.primary, s.standby
-	challenger.throughput = smartThroughput{}
-	challenger.lastOK = clock.Now().Add(-time.Minute)
-	stat := s.history.statistic(s.network.Key, primary.identity, clock.Now())
-	stat.S, stat.W = 1000, 1000
-	stat.UpdatedAt = clock.Now().Unix()
-	stat = s.history.statistic(s.network.Key, challenger.identity, clock.Now())
-	stat.S, stat.W = 850, 1000
-	stat.UpdatedAt = clock.Now().Unix()
-	if s.demandChallengerEligibleLocked(challenger, clock.Now()) {
-		t.Fatal("test challenger unexpectedly passed legacy relative stability")
-	}
-	if s.degradationCandidateLocked(clock.Now()) != challenger {
-		t.Fatal("unmeasured healthy challenger was not safe to explore")
-	}
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-	if e.challenger != challenger {
-		t.Fatal("confirmed primary did not select the unmeasured challenger")
-	}
-	job := smartJob{member: challenger, ctx: e.ctx, episode: e, purpose: smartDegradationChallenger}
-	if !s.degradationJobValid(job) {
-		t.Fatal("unmeasured challenger was rejected at job validation")
-	}
-	s.selectedAt = clock.Now()
-	smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, 20, clock.Now())
-	if s.primary != challenger || primary.throughput.Download != 3 || challenger.throughput.Download != 20 {
-		t.Fatal("fresh below-floor download winner did not replace the slow primary")
-	}
-}
-
-func TestSmartProfileDegradationSwitchUsesPreference(t *testing.T) {
-	for _, scenario := range []struct {
-		name        string
-		rank        []string
-		improvement bool
-		download    float64
-		switches    bool
-	}{
-		{"faster_below_floor", []string{"download"}, true, 20, true},
-		{"slower_below_floor", []string{"download"}, true, 2, false},
-		{"stability_precedes_download", []string{"stability", "download"}, true, 50, false},
-		{"improvement_disabled", []string{"download"}, false, 50, false},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			s, clock := smartProfileThroughputTestGroup(t)
-			s.preference.rank = scenario.rank
-			s.preference.improvement = scenario.improvement
-			primary, challenger := s.primary, s.standby
-			stat := s.history.statistic(s.network.Key, primary.identity, clock.Now())
-			stat.S, stat.W = 1000, 1000
-			stat.UpdatedAt = clock.Now().Unix()
-			stat = s.history.statistic(s.network.Key, challenger.identity, clock.Now())
-			stat.S, stat.W = 850, 1000
-			stat.UpdatedAt = clock.Now().Unix()
-			e := smartTestDegradationEpisode(s, clock.Now())
-			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-			smartTestDegradationResult(s, e, challenger, smartDegradationChallenger, scenario.download, clock.Now())
-			if got := s.primary == challenger; got != scenario.switches {
-				t.Fatalf("switched=%v, want %v", got, scenario.switches)
-			}
-			if primary.throughput.Download != 3 || challenger.throughput.Download != scenario.download {
-				t.Fatal("paired profile results were not published")
-			}
-		})
-	}
-}
-
-func TestSmartProfileDegradationFloorSuppressionRequiresTargetRecovery(t *testing.T) {
-	s, clock := smartProfileThroughputTestGroup(t)
-	primary := s.primary
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 17.5, clock.Now())
-	if !primary.floorDegraded {
-		t.Fatal("confirmed seventy-percent result retained floor credit")
-	}
-	s.clearDegradationLocked()
-	for _, download := range []float64{22, 25} {
-		clock.Advance(time.Second)
-		s.applyResultLocked(smartResult{member: primary, kind: "throughput", download: download, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: primary.generation}, clock.Now())
-		if primary.floorDegraded != (download < s.targetMbps) {
-			t.Fatalf("download=%v degraded floor=%v", download, primary.floorDegraded)
-		}
-	}
-}
-
-func TestSmartProfileDegradationProbeSafety(t *testing.T) {
-	for _, change := range []string{"unmeasured", "suspect", "other_tier", "below_minimum"} {
-		t.Run(change, func(t *testing.T) {
-			s, clock := smartProfileThroughputTestGroup(t)
-			s.preference.minStability = 2
-			challenger := s.standby
-			challenger.throughput = smartThroughput{}
-			switch change {
-			case "suspect":
-				challenger.state = "suspect"
-			case "other_tier":
-				challenger.tier++
-			case "below_minimum":
-				stat := s.history.statistic(s.network.Key, challenger.identity, clock.Now())
-				stat.S, stat.W = 500, 1000
-				stat.UpdatedAt = clock.Now().Unix()
-			}
-			eligible := change == "unmeasured"
-			if got := s.degradationCandidateLocked(clock.Now()) == challenger; got != eligible {
-				t.Fatalf("candidate eligibility=%v, want %v", got, eligible)
-			}
-			e := smartTestDegradationEpisode(s, clock.Now())
-			e.confirmed, e.checked = 3, clock.Now()
-			e.challenger, e.challengerGeneration = challenger, challenger.generation
-			job := smartJob{member: challenger, ctx: e.ctx, episode: e, purpose: smartDegradationChallenger}
-			if got := s.degradationJobValid(job); got != eligible {
-				t.Fatalf("job eligibility=%v, want %v", got, eligible)
-			}
-			if !eligible && (s.scheduleDegradationLocked(clock.Now()) || s.admission != nil) {
-				t.Fatal("unsafe challenger entered degradation admission")
-			}
-		})
-	}
-}
-
-func TestSmartProfileDegradationPrimaryPublishedWithoutPair(t *testing.T) {
-	for _, reason := range []string{"no_challenger", "challenger_cooldown"} {
-		t.Run(reason, func(t *testing.T) {
-			s, clock := smartProfileThroughputTestGroup(t)
-			primary := s.primary
-			primary.throughput.Download = 30
-			clock.Advance(time.Minute)
-			if reason == "no_challenger" {
-				s.members = []*smartMember{primary}
-			} else {
-				s.lastChallenger = clock.Now()
-			}
-			e := smartTestDegradationEpisode(s, clock.Now())
-			smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 17.5, clock.Now())
-			stat := s.history.Stats[s.network.Key][primary.identity]
-			if s.degradation.episode != nil || s.degradation.state != reason {
-				t.Fatalf("degradation did not stop without a pair: %s", s.degradation.state)
-			}
-			if s.meetsFloorLocked(primary, clock.Now()) || primary.throughput.Download != 17.5 || !primary.throughput.At.Equal(clock.Now()) || !primary.lastThroughput.Equal(clock.Now()) {
-				t.Fatal("confirmed slow primary did not immediately publish fresh below-floor evidence")
-			}
-			if stat == nil || stat.Download != 17.5 || stat.ThroughputAt != clock.Now().Unix() || !s.dirty {
-				t.Fatal("unpaired confirmed primary result was not persisted")
-			}
-		})
-	}
-}
-
-func TestSmartProfileDegradationZeroChallengerIsInconclusive(t *testing.T) {
-	s, clock := smartProfileThroughputTestGroup(t)
-	primary, candidate := s.primary, s.standby
-	s.preference.rank = []string{"latency", "download"}
-	primary.rtts, candidate.rtts = []float64{100, 100, 100}, []float64{10, 10, 10}
-	before := candidate.throughput
-	e := smartTestDegradationEpisode(s, clock.Now())
-	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
-	smartTestDegradationResult(s, e, candidate, smartDegradationChallenger, 0, clock.Now())
-	if s.primary != primary || candidate.throughput != before || s.degradation.blocked != "inconclusive" {
-		t.Fatal("zero challenger measurement replaced valid evidence or switched")
 	}
 }

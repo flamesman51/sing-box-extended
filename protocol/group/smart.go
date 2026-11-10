@@ -73,9 +73,14 @@ func (e smartEvidence) value(now time.Time) string {
 }
 
 type smartThroughput struct {
-	Download, Upload float64
-	At               time.Time
-	Source           string
+	Download, Upload             float64
+	At                           time.Time
+	Source                       string
+	DownloadResult, UploadResult smartDirectionResult
+	UploadAt                     time.Time
+	UploadUnverified             bool
+	UploadInconclusive           bool
+	LegacyUpload                 float64
 }
 
 type smartMember struct {
@@ -107,11 +112,19 @@ type smartMember struct {
 	passiveRead                                                               int64
 	degradationQueued                                                         *smartDegradationEpisode
 	improvementCriterion                                                      string
-	floorDegraded                                                             bool
 	rankFloor                                                                 bool
 	rankDownload, rankSpread, rankOutages                                     int
 	confirmationCancel                                                        context.CancelFunc
 	udpRefresh                                                                [2]smartUDPRefresh
+	udpRTTs, quicRTTs                                                         []float64
+	udpRTTAt                                                                  []time.Time
+	udpObservation, jitterObservation                                         smartMeasurementObservation
+	floorState                                                                smartFloorState
+	legacyEpisodeObs                                                          smartLegacyEpisodeObservation
+	downloadUnderLoad                                                         smartDirectionResult
+	passiveBins                                                               *smartPassiveBins
+	measurementCancel                                                         context.CancelFunc
+	measurementBackoff                                                        map[smartMeasurementKey]smartMeasurementBackoff
 }
 
 type (
@@ -131,6 +144,8 @@ type (
 		purpose                                        string
 		urgent                                         bool
 		country, networkType                           string
+		plan                                           smartMeasurementPlan
+		meter                                          *smartMeasureMeter
 	}
 )
 
@@ -150,6 +165,11 @@ type smartResult struct {
 	contained                                      bool
 	episode                                        *smartDegradationEpisode
 	purpose                                        string
+	measurement                                    smartMeasurementResult
+	udpRTTs                                        []float64
+	udpBurstSizes                                  []int
+	udpBursts                                      int
+	plan                                           smartMeasurementPlan
 }
 
 type smartURLWaiter struct {
@@ -189,6 +209,7 @@ type Smart struct {
 	clock                                                                                smartClock
 	probe                                                                                func(context.Context, N.Dialer, int) (time.Duration, error)
 	udpProbe                                                                             func(context.Context, N.Dialer, bool) (time.Duration, error)
+	udpBurstProbe                                                                        func(context.Context, N.Dialer, int) (smartRTTProbeResult, error)
 	directProbe                                                                          func(context.Context, string, []byte) (time.Duration, error)
 	kick                                                                                 chan struct{}
 	requests                                                                             chan smartRequest
@@ -238,6 +259,7 @@ type Smart struct {
 	improvementEpoch                                                                     uint64
 	udpPoolAt                                                                            [2]time.Time
 	udpPoolNext                                                                          [2]int
+	measurementBudgetExhausted                                                           bool
 }
 
 func NewSmart(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -264,6 +286,10 @@ func (s *Smart) configure() error {
 		return err
 	}
 	s.preference = preference
+	if err := s.options.Throughput.ValidateMeasurementFields(!s.preference.legacy); err != nil {
+		return err
+	}
+	s.normalizeMeasurementOptions()
 	boolDefault := func(v *bool) bool { return v == nil || *v }
 	s.interrupt, s.notify = boolDefault(s.options.InterruptOnFailover), boolDefault(s.options.NotifyAllDead)
 	s.udpEnabled, s.throughputEnabled = boolDefault(s.options.UDP.Enabled), boolDefault(s.options.Throughput.Enabled)
@@ -301,7 +327,7 @@ func (s *Smart) configure() error {
 		s.options.Throughput.DownloadURL = "https://speed.cloudflare.com/__down?bytes={bytes}"
 	}
 	if s.options.Throughput.UploadURL == "" {
-		s.options.Throughput.UploadURL = "https://speed.cloudflare.com/__up"
+		s.options.Throughput.UploadURL = "https://speed.cloudflare.com/__up?bytes={bytes}"
 	}
 	for _, raw := range []string{s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL} {
 		u, err := url.Parse(strings.ReplaceAll(raw, "{bytes}", "1000000"))
@@ -819,6 +845,15 @@ func (l *smartLease) count(n int, read bool) {
 	}
 	now := s.clock.Now()
 	s.lastDemand = now
+	if l.generation == s.generation {
+		var down, up int64
+		if read {
+			down = int64(n)
+		} else {
+			up = int64(n)
+		}
+		s.countPassiveLocked(l.member, down, up, now)
+	}
 	if read {
 		l.read += int64(n)
 		if l.generation == s.generation {
@@ -834,19 +869,16 @@ func (l *smartLease) count(n int, read bool) {
 	if stall {
 		l.stalled = true
 	}
-	elapsed := now.Sub(l.started)
-	if l.member != nil && l.generation == s.generation && elapsed >= 10*time.Second && now.Sub(l.lastRead) < 2*time.Second {
-		rate := float64(l.read) * 8 / elapsed.Seconds() / 1e6
-		if rate > 0 && (l.member.throughput.Source != "active" || l.member.throughput.At.Before(l.started)) && rate > l.member.throughput.Download {
-			l.member.throughput = smartThroughput{Download: rate, At: now, Source: "passive"}
-		}
-	}
 	if stall {
 		s.request("stall")
 	}
 }
 
 func (s *Smart) revokeLocked(member *smartMember) []io.Closer {
+	s.cancelMemberMeasurementLocked(member)
+	if episode := s.degradation.episode; episode != nil && (member == episode.primary || member == episode.challenger) {
+		s.clearDegradationLocked()
+	}
 	s.memberGeneration++
 	member.generation = s.memberGeneration
 	member.queued = make(map[string]bool)
@@ -889,7 +921,9 @@ func (s *Smart) worker(ctx context.Context, reserved bool) {
 			}
 		}
 		if ctx.Err() != nil {
-			if job.kind == "throughput" {
+			if job.episode != nil {
+				job.episode.accountingWait.Done()
+			} else if job.kind == "throughput" {
 				s.discardReservation(job.reservation)
 			}
 			return
@@ -901,10 +935,6 @@ func (s *Smart) worker(ctx context.Context, reserved bool) {
 			return
 		}
 	}
-}
-
-func (s *Smart) cellularUploadAllowed() bool {
-	return s.options.Throughput.CellularDailyBudgetMB != nil && *s.options.Throughput.CellularDailyBudgetMB >= 500
 }
 
 func (s *Smart) runLoop(ctx context.Context) {
@@ -1014,8 +1044,17 @@ func (s *Smart) handleRequest(request smartRequest) {
 			s.newGenerationLocked(network, now)
 		} else {
 			keyChanged := network.Key != s.network.Key
+			if network.PowerSave && !s.network.PowerSave {
+				s.clearDegradationLocked()
+				for _, member := range s.members {
+					s.cancelMemberMeasurementLocked(member)
+				}
+			}
 			s.network = network
 			if keyChanged {
+				for _, member := range s.members {
+					s.cancelMemberMeasurementLocked(member)
+				}
 				if s.profileEngine() {
 					s.resetProfileImprovementLocked()
 				}
@@ -1128,7 +1167,6 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 	s.timezone = time.FixedZone("", network.Offset)
 	s.cancelURLWaitersLocked(context.Canceled)
 	for _, member := range s.members {
-		member.floorDegraded = false
 		if s.profileEngine() {
 			member.lastUDP, member.lastUDP443 = time.Time{}, time.Time{}
 			member.udpRefresh = [2]smartUDPRefresh{}
@@ -1161,7 +1199,9 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 
 func (s *Smart) clearPendingLocked() {
 	for _, job := range s.pending {
-		if job.kind == "throughput" {
+		if job.episode != nil {
+			job.episode.accountingWait.Done()
+		} else if job.kind == "throughput" {
 			s.discardReservation(job.reservation)
 		}
 	}
@@ -1170,18 +1210,38 @@ func (s *Smart) clearPendingLocked() {
 
 func (s *Smart) restoreThroughputLocked(now time.Time) {
 	for _, member := range s.members {
-		member.floorDegraded = false
 		member.throughput = smartThroughput{}
 		member.lastThroughput = time.Time{}
+		member.floorState, member.legacyEpisodeObs = smartFloorState{}, smartLegacyEpisodeObservation{}
+		member.downloadUnderLoad = smartDirectionResult{}
+		member.passiveBins = nil
+		member.udpRTTs, member.quicRTTs = nil, nil
+		member.udpRTTAt = nil
+		member.udpObservation, member.jitterObservation = smartMeasurementObservation{}, smartMeasurementObservation{}
 		if stat := s.history.Stats[s.network.Key][member.identity]; stat != nil {
 			member.rtts = slices.Clone(stat.RTTs)
-			if stat.ThroughputAt > 0 {
+			member.udpRTTs, member.quicRTTs = slices.Clone(stat.UDPRTTs), slices.Clone(stat.QUICRTTs)
+			member.udpRTTAt = slices.Clone(stat.UDPRTTAt)
+			member.floorState, member.legacyEpisodeObs = stat.FloorState, stat.LegacyEpisodeObs
+			member.downloadUnderLoad = stat.DownloadUnderLoad
+			member.throughput.DownloadResult = stat.DownloadResult
+			member.throughput.UploadResult = stat.UploadResult
+			member.throughput.UploadUnverified, member.throughput.UploadInconclusive = stat.UploadUnverified, stat.UploadInconclusive
+			member.throughput.LegacyUpload = stat.LegacyUpload
+			if stat.DownloadResult.Valid {
+				member.throughput.Download, member.throughput.At, member.throughput.Source = stat.DownloadResult.Value, stat.DownloadResult.At, "active"
+			} else if stat.ThroughputAt > 0 {
 				at := time.Unix(stat.ThroughputAt, 0)
-				member.lastThroughput = at
-				if now.Sub(at) < 24*time.Hour {
-					member.throughput = smartThroughput{Download: stat.Download, Upload: stat.Upload, At: at, Source: "active"}
-				}
+				member.throughput.Download, member.throughput.At, member.throughput.Source = stat.Download, at, "active"
+				member.throughput.DownloadResult = smartDirectionResult{Value: stat.Download, At: at, Source: "active", Valid: true}
 			}
+			member.lastThroughput = member.throughput.At
+			if stat.UploadResult.Valid {
+				member.throughput.Upload, member.throughput.UploadAt = stat.UploadResult.Value, stat.UploadResult.At
+			} else if stat.Upload > 0 {
+				member.throughput.LegacyUpload = stat.Upload
+			}
+			s.clearRecoveredFloorLocked(member, now)
 		}
 	}
 }
@@ -1222,6 +1282,13 @@ func (s *Smart) queueLocked(member *smartMember, kind string, operator int, conf
 	}
 	if !job.urgent && s.backgroundCtx != nil {
 		job.ctx = s.backgroundCtx
+	}
+	if kind == "udp" {
+		job.plan.STUNBursts = 1
+		if s.profileEngine() && slices.Contains(s.preference.rank, "jitter") {
+			job.plan.STUNBursts = 2
+		}
+		job.timeout = job.plan.Deadline()
 	}
 	if len(s.pending) >= 256 {
 		if member != nil {
@@ -1343,17 +1410,22 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 			}
 		}
 	}
-	if demand && s.primary != nil && s.udpEnabled {
-		if now.Sub(s.primary.lastUDP) >= 5*time.Minute {
+	needsRTT := s.profileEngine() && (slices.Contains(s.preference.rank, "rtt") || slices.Contains(s.preference.rank, "jitter"))
+	if demand && s.primary != nil && (s.udpEnabled || needsRTT) {
+		interval := 5 * time.Minute
+		if needsRTT {
+			interval = 2 * time.Minute
+		}
+		if now.Sub(s.primary.lastUDP) >= interval {
 			s.primary.lastUDP = now
 			s.queueLocked(s.primary, "udp", 0, false, now)
 		}
-		if now.Sub(s.primary.lastUDP443) >= 5*time.Minute {
+		if s.udpEnabled && now.Sub(s.primary.lastUDP443) >= 5*time.Minute {
 			s.primary.lastUDP443 = now
 			s.queueLocked(s.primary, "udp443", 0, false, now)
 		}
 	}
-	if s.udpEnabled && s.profileEngine() {
+	if (s.udpEnabled || needsRTT) && s.profileEngine() {
 		s.queueProfileUDPLocked(now, false)
 	}
 	if !s.options.Probe.DisableDirect && demand && (s.lastDirect.IsZero() || now.Sub(s.lastDirect) >= 5*time.Minute) {
@@ -1481,38 +1553,24 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		if result.kind == "udp443" {
 			evidence.expires = now.Add(10 * time.Minute)
 			member.udp443 = evidence
+			if result.err == nil {
+				member.quicRTTs = append(member.quicRTTs, result.rtt.Seconds()*1000)
+				member.quicRTTs = member.quicRTTs[max(0, len(member.quicRTTs)-64):]
+			}
 			s.selectionGeneration++
 		} else {
 			member.udp = evidence
+			s.applyRTTMeasurementLocked(member, result.udpRTTs, result.udpBurstSizes, now)
 		}
+		for _, key := range s.network.Path {
+			stat := s.history.statistic(key, member.identity, now)
+			stat.UDPRTTs, stat.QUICRTTs = slices.Clone(member.udpRTTs), slices.Clone(member.quicRTTs)
+			stat.UDPRTTAt = slices.Clone(member.udpRTTAt)
+		}
+		s.dirty = true
 	case "throughput":
-		member.lastThroughput = now
-		if result.err == nil && (!s.profileEngine() || result.download > 0) {
-			upload := result.upload
-			if result.purpose == smartImprovementConfirmation {
-				upload = member.throughput.Upload
-			}
-			member.throughput = smartThroughput{Download: result.download, Upload: upload, At: now, Source: "active"}
-			member.lastThroughput = now
-			if s.profileEngine() && result.download >= s.targetMbps {
-				member.floorDegraded = false
-			}
-			s.eventLocked("speedtest", "", member.tag, s.network.Key, "active throughput measurement", now)
-			s.dirty = true
-			for _, key := range s.network.Path {
-				stat := s.history.statistic(key, member.identity, now)
-				stat.Download = result.download
-				if result.purpose != smartImprovementConfirmation {
-					stat.Upload = result.upload
-				}
-				stat.ThroughputAt = now.Unix()
-				points := s.history.Timeline[key][member.identity]
-				if len(points) > 0 {
-					points[len(points)-1].MBPS = result.download
-				}
-			}
-			s.history.IdentityServers[member.identity] = member.serverIdentity
-		}
+		s.cancelMemberMeasurementLocked(member)
+		s.applyMeasurementResultLocked(result, now)
 	case "tcp":
 		if s.profileEngine() {
 			s.observeOutageRecoveryLocked(member, result.err == nil, now)
@@ -1581,6 +1639,10 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			if !result.confirm {
 				if member.state == "healthy" {
 					member.state = "suspect"
+					s.cancelMemberMeasurementLocked(member)
+					if episode := s.degradation.episode; episode != nil && (member == episode.primary || member == episode.challenger) {
+						s.clearDegradationLocked()
+					}
 				}
 				s.profileMemberStateChangedLocked(member, now)
 				s.queueLocked(member, "tcp", (result.operator+1)%3, true, now)
@@ -1732,20 +1794,19 @@ func (s *Smart) rankLocked(now time.Time) {
 }
 
 func (s *Smart) throughputClass(member *smartMember, now time.Time) int {
-	value := member.throughput
-	ttl := 24 * time.Hour
-	if value.Source == "passive" {
-		ttl = 6 * time.Hour
+	var download float64
+	var fresh bool
+	if s.profileEngine() {
+		download, fresh = s.effectiveDownloadLocked(member, now)
+	} else {
+		download, fresh = s.legacyEpisodeDownloadLocked(member, now)
 	}
-	if value.At.IsZero() || now.Sub(value.At) >= ttl {
+	if !fresh {
 		return 1
 	}
-	ratio := value.Download / s.targetMbps
+	ratio := download / s.targetMbps
 	if ratio >= 1 {
 		return 0
-	}
-	if value.Source == "passive" {
-		return 1
 	}
 	if ratio >= .75 {
 		return 2
@@ -1790,6 +1851,9 @@ func (s *Smart) chooseLocked(now time.Time) {
 		}
 		return
 	}
+	if s.ordinaryImprovementSuppressedLocked() {
+		return
+	}
 	if s.profileEngine() {
 		s.chooseProfileImprovementLocked(now)
 		return
@@ -1814,6 +1878,9 @@ func (s *Smart) chooseLocked(now time.Time) {
 		observation := candidate.lastOK
 		if candidate.throughput.At.After(observation) {
 			observation = candidate.throughput.At
+		}
+		if candidate.legacyEpisodeObs.At.After(observation) {
+			observation = candidate.legacyEpisodeObs.At
 		}
 		if candidate.improvementAt.IsZero() || signature != candidate.improvementSignature {
 			candidate.improvementAt = observation
@@ -1876,45 +1943,42 @@ func (s *Smart) demandChallengerEligibleLocked(member *smartMember, now time.Tim
 }
 
 func (s *Smart) scheduleThroughputLocked(now time.Time) {
-	if !s.throughputEnabled || s.ledger == nil || s.network.PowerSave || s.paused || s.primary == nil || !s.generationSucceeded {
+	if !s.throughputAllowedLocked(now) {
 		return
 	}
-	if s.scheduleDegradationLocked(now) {
-		return
-	}
-	busy := false
-	for _, entries := range s.leases {
-		for lease := range entries {
-			if now.Sub(lease.lastRead) < 2*time.Second || now.Sub(lease.lastWrite) < 2*time.Second {
-				busy = true
-			}
-		}
-	}
-	if busy {
+	if s.scheduleDegradationLocked(now) || !s.measurementIdleLocked(now) {
 		return
 	}
 	var candidate *smartMember
 	ordered := []*smartMember{s.primary, s.standby}
 	ordered = append(ordered, s.members...)
-	oldest := now
+	eligible, fits := false, false
 	for _, member := range ordered {
-		if member == nil || member.state != "healthy" {
+		if member == nil || member.state != "healthy" || member.queued["throughput"] ||
+			!member.lastThroughput.IsZero() && now.Sub(member.lastThroughput) < 10*time.Minute {
 			continue
 		}
-		if member.throughput.Source != "active" || member.throughput.At.IsZero() || now.Sub(member.throughput.At) >= 24*time.Hour {
-			if candidate == nil || member.lastThroughput.Before(oldest) {
-				candidate = member
-				oldest = member.lastThroughput
-			}
+		plan := s.regularMeasurementPlanLocked(member, now)
+		if plan.Download == nil && plan.Upload == nil {
+			continue
+		}
+		eligible = true
+		if s.measurementPlanBackedOffLocked(member, plan, now) {
+			continue
+		}
+		if s.measurementEstimateLocked(member, plan, nil) > s.measurementRemainingLocked(now) {
+			s.backoffMeasurementPlanLocked(member, plan, now)
+			continue
+		}
+		fits = true
+		if candidate == nil || member.lastThroughput.Before(candidate.lastThroughput) {
+			candidate = member
 		}
 	}
-	if candidate != nil && candidate != s.primary && candidate != s.standby && !s.lastChallenger.IsZero() && now.Sub(s.lastChallenger) < time.Hour {
-		return
+	s.measurementBudgetExhausted = eligible && !fits
+	if candidate != nil {
+		s.startThroughputAdmissionLocked(candidate, now)
 	}
-	if candidate == nil || candidate.queued["throughput"] {
-		return
-	}
-	s.startThroughputAdmissionLocked(candidate, now)
 }
 
 func (s *Smart) updateNotificationLocked(now time.Time) {

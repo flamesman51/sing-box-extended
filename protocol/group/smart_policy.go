@@ -70,7 +70,7 @@ func checkSmartPolicyValue(decoder *stdjson.Decoder, path string) error {
 	case "preference.switch":
 		allowed = []string{"improvement", "dwell", "confirmations", "confirmation_interval", "tier_restore", "speed_margin"}
 	case "throughput":
-		allowed = []string{"target_mbps", "enabled"}
+		allowed = []string{"target_mbps", "enabled", "streams"}
 	case "probe":
 		allowed = []string{"heartbeat_interval", "standby_interval", "background_interval"}
 	case "udp":
@@ -147,7 +147,7 @@ func (s *Smart) resolvedSmartPolicy() map[string]any {
 				"tier_restore": s.preference.tierRestore.String(), "speed_margin": s.preference.speedMargin,
 			},
 		},
-		"throughput":            map[string]any{"target_mbps": s.targetMbps, "enabled": s.throughputEnabled},
+		"throughput":            map[string]any{"target_mbps": s.targetMbps, "enabled": s.throughputEnabled, "streams": s.options.Throughput.Streams},
 		"probe":                 map[string]any{"heartbeat_interval": s.heartbeat.String(), "standby_interval": s.standbyInterval.String(), "background_interval": s.backgroundInterval.String()},
 		"interrupt_on_failover": s.interrupt,
 		"udp":                   map[string]any{"quic_policy": s.quicPolicy},
@@ -169,7 +169,7 @@ func SmartProfiles() ([]map[string]any, error) {
 		}
 		profiles = append(profiles, map[string]any{
 			"name": name, "rank": slices.Clone(s.preference.rank), "min_stability": floor,
-			"target_mbps": s.targetMbps, "throughput_enabled": s.throughputEnabled,
+			"target_mbps": s.targetMbps, "throughput_enabled": s.throughputEnabled, "streams": s.options.Throughput.Streams,
 			"heartbeat_interval": s.heartbeat.String(), "standby_interval": s.standbyInterval.String(), "background_interval": s.backgroundInterval.String(),
 			"interrupt_on_failover": s.interrupt, "quic_policy": s.quicPolicy,
 			"improvement": s.preference.improvement, "dwell": s.preference.dwell.String(), "confirmations": s.preference.confirmations,

@@ -125,7 +125,7 @@ func TestSmartLedgerCanceledAdmissionCleansSharedReservation(t *testing.T) {
 	defer cancel()
 	admission := make(chan error, 1)
 	go func() {
-		id, bytes, reserveErr := ledger.Reserve(ctx, "wifi", now, 0)
+		id, bytes, reserveErr := ledger.ReservePlan(ctx, "wifi", now, 0, 1_000_000)
 		if reserveErr != nil && (id != "" || bytes != 0) {
 			reserveErr = errors.New("canceled admission returned a reservation")
 		}
@@ -158,7 +158,7 @@ func TestSmartLedgerCanceledAdmissionCleansSharedReservation(t *testing.T) {
 	observed := &smartLedgerObservedContext{Context: queuedCtx, waiting: make(chan struct{})}
 	queued := make(chan error, 1)
 	go func() {
-		_, _, reserveErr := shared.Reserve(observed, "wifi", now, 0)
+		_, _, reserveErr := shared.ReservePlan(observed, "wifi", now, 0, 1_000_000)
 		queued <- reserveErr
 	}()
 	smartLedgerWait(t, observed.waiting)
@@ -180,7 +180,7 @@ func TestSmartLedgerCanceledAdmissionCleansSharedReservation(t *testing.T) {
 	cleanup.unblock()
 	recoveredCtx, recoveredCancel := context.WithTimeout(context.Background(), time.Second)
 	defer recoveredCancel()
-	id, reserved, err := shared.Reserve(recoveredCtx, "wifi", now.Add(time.Minute), 0)
+	id, reserved, err := shared.ReservePlan(recoveredCtx, "wifi", now.Add(time.Minute), 0, 1_000_000)
 	if err != nil {
 		t.Fatalf("canceled reservation prevented recovery: %v", err)
 	}
@@ -188,8 +188,8 @@ func TestSmartLedgerCanceledAdmissionCleansSharedReservation(t *testing.T) {
 	if len(persisted.Ledger.Reservations) != 1 || persisted.Ledger.Reservations[id].Bytes != reserved || len(persisted.Ledger.Days) != 0 {
 		t.Fatalf("canceled admission was orphaned or charged: %+v", persisted.Ledger)
 	}
-	if reserved != 10_000_000 {
-		t.Fatalf("shared minimum cap = %d", reserved)
+	if reserved != 50_000_000 {
+		t.Fatalf("shared full reservation = %d", reserved)
 	}
 	if err = shared.Reconcile(context.Background(), id, 0, false); err != nil {
 		t.Fatal(err)
@@ -218,7 +218,7 @@ func TestSmartLedgerCanceledReconciliationRetainsMeasuredBytes(t *testing.T) {
 			ledger.Register("a", map[string]float64{"wifi": 100, "cellular": 50})
 			ledger.Register("b", map[string]float64{"wifi": 100, "cellular": 50})
 			now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
-			id, _, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+			id, _, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -245,7 +245,7 @@ func TestSmartLedgerCanceledReconciliationRetainsMeasuredBytes(t *testing.T) {
 			gate.unblock()
 			recoveredCtx, recoveredCancel := context.WithTimeout(context.Background(), time.Second)
 			defer recoveredCancel()
-			nextID, _, err := ledger.Reserve(recoveredCtx, "wifi", now.Add(time.Minute), 0)
+			nextID, _, err := ledger.ReservePlan(recoveredCtx, "wifi", now.Add(time.Minute), 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -273,7 +273,7 @@ func TestSmartLedgerCanceledAdmissionRetriesFailedCleanup(t *testing.T) {
 	defer cancel()
 	admission := make(chan error, 1)
 	go func() {
-		_, _, reserveErr := ledger.Reserve(ctx, "wifi", now, 0)
+		_, _, reserveErr := ledger.ReservePlan(ctx, "wifi", now, 0, 1_000_000)
 		admission <- reserveErr
 	}()
 	smartLedgerWait(t, gate.entered)
@@ -288,7 +288,7 @@ func TestSmartLedgerCanceledAdmissionRetriesFailedCleanup(t *testing.T) {
 	cleanup.unblock()
 	recoveredCtx, recoveredCancel := context.WithTimeout(context.Background(), time.Second)
 	defer recoveredCancel()
-	id, _, err := ledger.Reserve(recoveredCtx, "wifi", now.Add(time.Minute), 0)
+	id, _, err := ledger.ReservePlan(recoveredCtx, "wifi", now.Add(time.Minute), 0, 1_000_000)
 	if err != nil {
 		t.Fatalf("failed cancellation cleanup was not retried: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestSmartLedgerCanceledReconciliationPreservesPriorResetOrdering(t *testing
 	}
 	ledger.Register("a", map[string]float64{"wifi": 100})
 	now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
-	id, _, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+	id, _, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestSmartLedgerCanceledReconciliationPreservesPriorResetOrdering(t *testing
 	}
 	recoveredCtx, recoveredCancel := context.WithTimeout(context.Background(), time.Second)
 	defer recoveredCancel()
-	nextID, _, err := ledger.Reserve(recoveredCtx, "wifi", now.Add(time.Minute), 0)
+	nextID, _, err := ledger.ReservePlan(recoveredCtx, "wifi", now.Add(time.Minute), 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestSmartLedgerReserveSaveFailurePreservesDayAndRate(t *testing.T) {
 	}
 	ledger.Register("a", map[string]float64{"wifi": 100})
 	now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
-	id, _, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+	id, _, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestSmartLedgerReserveSaveFailurePreservesDayAndRate(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache.fail = true
-	if _, _, err = ledger.Reserve(context.Background(), "wifi", now.Add(48*time.Hour), 0); err == nil {
+	if _, _, err = ledger.ReservePlan(context.Background(), "wifi", now.Add(48*time.Hour), 0, 1_000_000); err == nil {
 		t.Fatal("failed reservation persistence admitted a test")
 	}
 	metadata := ledger.Metadata()
@@ -375,7 +375,7 @@ func TestSmartLedgerReserveSaveFailurePreservesDayAndRate(t *testing.T) {
 		t.Fatalf("failed reservation changed day or hourly accounting: %+v", metadata.Ledger)
 	}
 	cache.fail = false
-	id, _, err = ledger.Reserve(context.Background(), "wifi", now.Add(time.Minute), 0)
+	id, _, err = ledger.ReservePlan(context.Background(), "wifi", now.Add(time.Minute), 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}

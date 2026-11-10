@@ -56,26 +56,37 @@ type smartTimelinePoint struct {
 }
 
 type smartStatistic struct {
-	S                       float64       `json:"S"`
-	W                       float64       `json:"W"`
-	UpdatedAt               int64         `json:"updated_at"`
-	LastResult              int64         `json:"last_result"`
-	RTTs                    []float64     `json:"rtts,omitempty"`
-	Download                float64       `json:"download_mbps,omitempty"`
-	Upload                  float64       `json:"upload_mbps,omitempty"`
-	ThroughputAt            int64         `json:"throughput_at,omitempty"`
-	Hours                   [6][2]float64 `json:"hours"`
-	HourUpdatedAt           [6]int64      `json:"hour_updated_at"`
-	Flaps                   []int64       `json:"flaps,omitempty"`
-	HasResult               bool          `json:"has_result,omitempty"`
-	LastSuccess             bool          `json:"last_success,omitempty"`
-	OutageEpisodes          float64       `json:"outage_episodes,omitempty"`
-	OutageExposureHours     float64       `json:"outage_exposure_hours,omitempty"`
-	OutageObservedHours     float64       `json:"outage_observed_hours,omitempty"`
-	OutageOpen              bool          `json:"outage_open,omitempty"`
-	OutageRecoverySuccesses int           `json:"outage_recovery_successes,omitempty"`
-	OutageRecoveryAtNS      int64         `json:"outage_recovery_at_ns,omitempty"`
-	OutageObservedAtNS      int64         `json:"outage_observed_at_ns,omitempty"`
+	S                       float64                       `json:"S"`
+	W                       float64                       `json:"W"`
+	UpdatedAt               int64                         `json:"updated_at"`
+	LastResult              int64                         `json:"last_result"`
+	RTTs                    []float64                     `json:"rtts,omitempty"`
+	Download                float64                       `json:"download_mbps,omitempty"`
+	Upload                  float64                       `json:"upload_mbps,omitempty"`
+	ThroughputAt            int64                         `json:"throughput_at,omitempty"`
+	DownloadResult          smartDirectionResult          `json:"download,omitempty"`
+	UploadResult            smartDirectionResult          `json:"upload,omitempty"`
+	UploadUnverified        bool                          `json:"upload_unverified,omitempty"`
+	UploadInconclusive      bool                          `json:"upload_inconclusive,omitempty"`
+	LegacyUpload            float64                       `json:"legacy_upload,omitempty"`
+	FloorState              smartFloorState               `json:"floor_state,omitempty"`
+	LegacyEpisodeObs        smartLegacyEpisodeObservation `json:"legacy_episode_obs,omitempty"`
+	DownloadUnderLoad       smartDirectionResult          `json:"download_under_load,omitempty"`
+	UDPRTTs                 []float64                     `json:"udp_rtts,omitempty"`
+	UDPRTTAt                []time.Time                   `json:"udp_rtt_at,omitempty"`
+	QUICRTTs                []float64                     `json:"quic_rtts,omitempty"`
+	Hours                   [6][2]float64                 `json:"hours"`
+	HourUpdatedAt           [6]int64                      `json:"hour_updated_at"`
+	Flaps                   []int64                       `json:"flaps,omitempty"`
+	HasResult               bool                          `json:"has_result,omitempty"`
+	LastSuccess             bool                          `json:"last_success,omitempty"`
+	OutageEpisodes          float64                       `json:"outage_episodes,omitempty"`
+	OutageExposureHours     float64                       `json:"outage_exposure_hours,omitempty"`
+	OutageObservedHours     float64                       `json:"outage_observed_hours,omitempty"`
+	OutageOpen              bool                          `json:"outage_open,omitempty"`
+	OutageRecoverySuccesses int                           `json:"outage_recovery_successes,omitempty"`
+	OutageRecoveryAtNS      int64                         `json:"outage_recovery_at_ns,omitempty"`
+	OutageObservedAtNS      int64                         `json:"outage_observed_at_ns,omitempty"`
 	pauseAtResult           time.Duration
 }
 
@@ -450,6 +461,31 @@ func decodeSmartHistory(data []byte) (*smartHistory, error) {
 		for _, statistic := range statistics {
 			if statistic == nil || !smartValidSums(statistic.S, statistic.W) || !smartNonnegative(statistic.Download) || !smartNonnegative(statistic.Upload) || !smartNonnegative(statistic.OutageEpisodes) || !smartNonnegative(statistic.OutageExposureHours) || !smartNonnegative(statistic.OutageObservedHours) {
 				return nil, errors.New("invalid smart statistic")
+			}
+			for _, direction := range []smartDirectionResult{statistic.DownloadResult, statistic.UploadResult, statistic.DownloadUnderLoad} {
+				if !smartNonnegative(direction.Value) || !smartNonnegative(direction.P10) || !smartNonnegative(direction.Mean) || !smartNonnegative(direction.PostMin) || direction.Streams < 0 || direction.Window < 0 {
+					return nil, errors.New("invalid smart directional measurement")
+				}
+			}
+			if !smartNonnegative(statistic.LegacyUpload) || !smartNonnegative(statistic.LegacyEpisodeObs.Value) || !smartNonnegative(statistic.FloorState.Value) || !smartNonnegative(statistic.FloorState.Target) ||
+				statistic.FloorState.Kind != "" && statistic.FloorState.Kind != "revoked" && statistic.FloorState.Kind != "proven" {
+				return nil, errors.New("invalid smart episode measurement")
+			}
+			for _, samples := range [][]float64{statistic.UDPRTTs, statistic.QUICRTTs} {
+				for _, rtt := range samples {
+					if !smartNonnegative(rtt) {
+						return nil, errors.New("invalid smart packet RTT")
+					}
+				}
+			}
+			if len(statistic.UDPRTTs) != len(statistic.UDPRTTAt) {
+				statistic.UDPRTTs, statistic.UDPRTTAt = nil, nil
+			} else if len(statistic.UDPRTTs) > 64 {
+				statistic.UDPRTTAt = slices.Clone(statistic.UDPRTTAt[len(statistic.UDPRTTAt)-64:])
+				statistic.UDPRTTs = slices.Clone(statistic.UDPRTTs[len(statistic.UDPRTTs)-64:])
+			}
+			if len(statistic.QUICRTTs) > 64 {
+				statistic.QUICRTTs = slices.Clone(statistic.QUICRTTs[len(statistic.QUICRTTs)-64:])
 			}
 			if statistic.OutageRecoverySuccesses < 0 || statistic.OutageRecoverySuccesses > 2 || statistic.OutageRecoveryAtNS < 0 || (statistic.OutageRecoverySuccesses == 0) != (statistic.OutageRecoveryAtNS == 0) || statistic.OutageRecoverySuccesses > 0 && !statistic.OutageOpen {
 				return nil, errors.New("invalid smart outage recovery")

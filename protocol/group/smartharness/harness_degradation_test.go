@@ -95,9 +95,9 @@ func assertHarnessEpisode(t *testing.T, status harnessStatus, primary string) {
 			t.Fatalf("throughput scenario used health failover: %+v", event)
 		}
 	}
-	allowance := status.Budget.Degradation
-	if allowance.Limit != 100 || allowance.Used < 0 || allowance.Reserved < 0 || allowance.Used+allowance.Reserved > allowance.Limit {
-		t.Fatalf("degradation allowance violated: %+v", allowance)
+	budget := status.Budget
+	if budget.Limit != 1000 || budget.Used < 0 || budget.Reserved < 0 || budget.Used+budget.Reserved > budget.Limit {
+		t.Fatalf("daily budget violated: %+v", budget)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			t.Cleanup(func() { t.Logf("slice-D scenario runtime: %s", time.Since(started)) })
 			links := []harnessLink{{tag: "a", mbps: 20}, {tag: "b", mbps: 20, delay: 5 * time.Millisecond}}
 			if scenario == "two_slow_one_fast" {
-				// Keep C out of startup calibration so the fresh pair retains two hourly slots.
+				// Keep C out of startup calibration so the episode tests the fresh A/B pair first.
 				links = append(links, harnessLink{tag: "c", mbps: 20, blackhole: true})
 			}
 			client, members, _ := newHarnessNetwork(t, links, 1000, "")
@@ -168,7 +168,7 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			bulk := startHarnessBulk(t, client)
 			startBytes := bulk.bytes.Load()
 			degradedAt := time.Now()
-			switchExpected := scenario == "degraded_primary" || scenario == "burst_then_slow"
+			switchExpected := scenario == "degraded_primary" || scenario == "burst_then_slow" || scenario == "shared_link_correction"
 			switch scenario {
 			case "degraded_primary":
 				faults := members[0].faults
@@ -236,8 +236,6 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			want := "shared_bottleneck_suspected"
 			if switchExpected {
 				want = "switched"
-			} else if scenario == "shared_link_correction" {
-				want = "primary_fast"
 			}
 			var seenLow bool
 			sampledAt, sampledBytes := time.Now(), bulk.bytes.Load()
@@ -280,8 +278,8 @@ func TestSmartHarnessDegradation(t *testing.T) {
 					t.Fatal("missing throughput-driven demand switch event")
 				}
 				for _, member := range finished.Members {
-					if member.Tag == "b" && (member.State != "healthy" || member.Download == nil || *member.Download < 10 || member.At <= calibratedAt["b"]) {
-						t.Fatalf("replacement lacks healthy, fresh target-meeting evidence: %+v", member)
+					if member.Tag == "b" && (member.State != "healthy" || !member.UnderLoad.Valid || member.UnderLoad.Value < 10 || member.UnderLoad.At <= calibratedAt["b"]) {
+						t.Fatalf("replacement lacks healthy, fresh target-meeting under-load evidence: %+v", member)
 					}
 				}
 				beforeB := members[1].fixtures.https.Load()
@@ -293,34 +291,14 @@ func TestSmartHarnessDegradation(t *testing.T) {
 				if finished.Degradation.Retry < time.Now().Add(29*time.Minute).Unix() || finished.Degradation.Blocked != want {
 					t.Fatalf("missing purpose cooldown: %+v", finished.Degradation)
 				}
-				if scenario == "shared_link_correction" {
-					corrected := false
-					for _, member := range finished.Members {
-						if member.Tag == "a" && member.Download != nil && *member.Download >= 10 {
-							corrected = true
-						}
-					}
-					if !corrected || primary.bulkRate.Load() != 2_500_000 {
-						t.Fatal("same-interval passive traffic did not correct the sub-half-target active probe")
-					}
-				} else {
-					for _, member := range finished.Members {
-						if member.Tag == "c" {
-							continue
-						}
-						if member.At != calibratedAt[member.Tag] || member.Download == nil || *member.Download != calibratedRates[member.Tag] {
-							t.Fatal("provisional slow pair was published to ordinary throughput")
-						}
-					}
-				}
 				starts := harnessLedgerStarts(t, client)
-				used := finished.Budget.Degradation.Used
+				used := finished.Budget.Used
 				deadline := time.Now().Add(3 * time.Second)
 				for time.Now().Before(deadline) {
 					status := statusHarness(t, client)
 					assertHarnessEpisode(t, status, "a")
-					if status.Selected.TCP != "a" || status.Budget.Degradation.Used != used || status.Budget.Degradation.Reserved != 0 {
-						t.Fatal("cooldown switched primary or spent more allowance")
+					if status.Selected.TCP != "a" || status.Budget.Used != used || status.Budget.Reserved != 0 {
+						t.Fatal("cooldown switched primary or spent more daily budget")
 					}
 					time.Sleep(100 * time.Millisecond)
 				}
@@ -328,20 +306,30 @@ func TestSmartHarnessDegradation(t *testing.T) {
 					t.Fatal("cooldown admitted another active test")
 				}
 			}
-			wantStarts := 4
-			if scenario == "shared_link_correction" {
-				wantStarts = 3
+			if starts := harnessLedgerStarts(t, client); starts != 3 || finished.Budget.Used <= calibrated.Budget.Used {
+				t.Fatalf("episode must reserve once for A1+C: starts=%d want=3 budget=%+v", starts, finished.Budget)
 			}
-			if starts := harnessLedgerStarts(t, client); starts != wantStarts || finished.Budget.Degradation.Used <= 0 {
-				t.Fatalf("fresh episode accounting: starts=%d want=%d budget=%+v", starts, wantStarts, finished.Budget)
+			for _, member := range finished.Members {
+				if member.Tag == "a" || member.Tag == "b" {
+					if !member.UnderLoad.Valid || member.UnderLoad.At <= calibratedAt[member.Tag] {
+						t.Fatalf("episode lacks fresh diagnostic evidence for %s: %+v", member.Tag, member)
+					}
+					if member.Tag == "a" && member.UnderLoad.Value >= 5 || member.Tag == "b" && !switchExpected && member.UnderLoad.Value >= 10 {
+						t.Fatalf("episode diagnostic contradicts legacy decision for %s: %+v", member.Tag, member)
+					}
+				}
+				if original, ok := calibratedRates[member.Tag]; ok {
+					if member.At != calibratedAt[member.Tag] || member.Download == nil || *member.Download != original {
+						t.Fatalf("episode overwrote regular download for %s: %+v", member.Tag, member)
+					}
+				}
+			}
+			if scenario == "shared_link_correction" && primary.bulkRate.Load() != 2_500_000 {
+				t.Fatal("shared-link scenario never introduced competing passive traffic")
 			}
 			for i := range 2 {
-				wantDownloads := beforeDownloads[i] + 1
-				if scenario == "shared_link_correction" && i == 1 {
-					wantDownloads--
-				}
-				if got := members[i].fixtures.downloads.Load(); got != wantDownloads {
-					t.Fatalf("member %d download attempts=%d want=%d", i, got, wantDownloads)
+				if got := members[i].fixtures.downloads.Load(); got <= beforeDownloads[i] {
+					t.Fatalf("member %d never executed its adaptive download phase: before=%d after=%d", i, beforeDownloads[i], got)
 				}
 			}
 			if bulk.bytes.Load() <= startBytes || members[1].fixtures.bulkBytes.Load() != 0 {

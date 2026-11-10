@@ -44,6 +44,7 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 		return smartPreference{}, err
 	}
 	target := 25.0
+	streams := 1
 	heartbeat, standby, background := 15*time.Second, time.Minute, 5*time.Minute
 	interrupt, throughputEnabled := true, true
 	if preference.profile == "default" {
@@ -61,6 +62,9 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 		}
 		preference.rank, preference.minStability = definition.rank, definition.minStability
 		target = definition.target
+		if definition.streams != 0 {
+			streams = definition.streams
+		}
 		interrupt, throughputEnabled = !definition.noInterrupt, !definition.noThroughput
 		if definition.heartbeat != 0 {
 			heartbeat = definition.heartbeat
@@ -85,7 +89,7 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 		}
 		for index, criterion := range preference.rank {
 			switch criterion {
-			case "stability", "speed_floor", "download", "throughput", "latency", "rtt_spread", "udp", "quic", "outages":
+			case "stability", "speed_floor", "download", "upload", "throughput", "rtt", "jitter", "latency", "rtt_spread", "udp", "quic", "outages":
 			default:
 				return smartPreference{}, fmt.Errorf("unknown smart preference rank criterion: %q", criterion)
 			}
@@ -143,6 +147,9 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 	}
 	if options.Throughput.TargetMbps == 0 {
 		options.Throughput.TargetMbps = target
+	}
+	if options.Throughput.Streams == 0 {
+		options.Throughput.Streams = streams
 	}
 	if options.Throughput.Enabled == nil {
 		options.Throughput.Enabled = &throughputEnabled

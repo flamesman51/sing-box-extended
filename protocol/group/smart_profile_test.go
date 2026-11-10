@@ -79,9 +79,8 @@ func TestSmartProfileFloorHysteresisAndExpiry(t *testing.T) {
 		t.Fatal("expired active measurement retained floor credit")
 	}
 	primary.throughput = smartThroughput{Download: 30, At: clock.Now(), Source: "passive"}
-	clock.Advance(6 * time.Hour)
 	if s.meetsFloorLocked(primary, clock.Now()) {
-		t.Fatal("expired passive measurement retained floor credit")
+		t.Fatal("passive measurement retained floor credit")
 	}
 }
 
@@ -126,6 +125,7 @@ func TestSmartProfileQuantiles(t *testing.T) {
 
 func TestSmartProfileConfirmationsUseDecisiveEvidence(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "responsive")
+	s.preference.rank = []string{"latency", "stability", "download"}
 	primary, candidate := s.primary, s.standby
 	s.selectedAt = clock.Now().Add(-time.Hour)
 	primary.rtts = []float64{70, 70, 70}
@@ -149,6 +149,7 @@ func TestSmartProfileConfirmationsUseDecisiveEvidence(t *testing.T) {
 
 func TestSmartProfileLatencyBucketsDoNotOscillate(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "responsive")
+	s.preference.rank = []string{"latency", "stability", "download"}
 	primary, candidate := s.primary, s.standby
 	s.selectedAt = clock.Now().Add(-time.Hour)
 	primary.rtts = []float64{50, 50, 50}
@@ -165,6 +166,7 @@ func TestSmartProfileLatencyBucketsDoNotOscillate(t *testing.T) {
 
 func TestSmartProfileConfirmationReset(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "responsive")
+	s.preference.rank = []string{"latency", "stability", "download"}
 	primary, b := s.primary, s.standby
 	c := &smartMember{tag: "c", identity: "c", serverIdentity: "c", state: "healthy", tier: 1, generation: 1, configOrder: 2, lastOK: clock.Now()}
 	s.members = append(s.members, c)
@@ -464,11 +466,17 @@ func TestSmartProfileRTTEvidenceMinimums(t *testing.T) {
 	}{
 		{"latency", 2, false}, {"latency", 3, true},
 		{"rtt_spread", 7, false}, {"rtt_spread", 8, true},
+		{"rtt", 4, false}, {"rtt", 5, true},
+		{"jitter", 9, false}, {"jitter", 10, true},
 	} {
 		t.Run(fmt.Sprintf("%s/%d", test.criterion, test.count), func(t *testing.T) {
 			member.rtts = make([]float64, test.count)
 			for i := range member.rtts {
 				member.rtts[i] = 40
+			}
+			if test.criterion == "rtt" || test.criterion == "jitter" {
+				smartSeedRTTTestSamples(member, member.rtts, clock.Now())
+				member.rtts = nil
 			}
 			s.rankProfileMemberLocked(member, clock.Now())
 			s.rankProfileMemberLocked(s.standby, clock.Now())

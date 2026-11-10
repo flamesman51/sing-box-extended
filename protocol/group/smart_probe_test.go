@@ -1,11 +1,9 @@
 package group
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -362,30 +360,6 @@ func TestSmartDNSRejectsWrongQuestionAndID(t *testing.T) {
 	}
 }
 
-func TestSmartMeasureCountsInnerBytesAndCapsOverhead(t *testing.T) {
-	dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
-		var buffer [4096]byte
-		_, _ = conn.Read(buffer[:])
-		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\nConnection: close\r\n\r\n")
-		// Windows' coarse monotonic clock can read an in-memory transfer as zero elapsed.
-		_, _ = io.CopyN(conn, smartZeroReader{}, 100_000)
-		time.Sleep(30 * time.Millisecond)
-		_, _ = io.CopyN(conn, smartZeroReader{}, 1_900_000)
-	}}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	download, _, charged, err := smartMeasure(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", "", 1_100_000, false)
-	if err != nil || download <= 0 {
-		t.Fatalf("measurement failed: %v (%f Mbps)", err, download)
-	}
-	if charged <= 0 || charged > 1_210_000 {
-		t.Fatalf("invalid overhead accounting: %d", charged)
-	}
-	if dialer.httpDials.Load() > 2 {
-		t.Fatal("download connection limit exceeded")
-	}
-}
-
 type smartProbeDisappearingNetworkManager struct {
 	adapter.NetworkManager
 	iface *adapter.NetworkInterface
@@ -447,56 +421,5 @@ func TestSmartDirectListsAndCoarseResolution(t *testing.T) {
 	addresses, err := smartResolveMember(context.Background(), &smartProbeTestDialer{failResolve: true}, "1.1.1.1")
 	if err != nil || len(addresses) != 1 || addresses[0] != netip.MustParseAddr("1.1.1.1") {
 		t.Fatal("IP literal resolved through DNS")
-	}
-}
-
-func TestSmartMeasureRampsAndUploadsOneMB(t *testing.T) {
-	var downloaded, uploaded atomic.Int64
-	var firstDownload atomic.Int64
-	dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
-		reader := bufio.NewReader(conn)
-		for {
-			request, err := http.ReadRequest(reader)
-			if err != nil {
-				return
-			}
-			if request.Method == http.MethodPost {
-				n, copyErr := io.Copy(io.Discard, request.Body)
-				_ = request.Body.Close()
-				if copyErr != nil {
-					return
-				}
-				uploaded.Add(n)
-				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-				continue
-			}
-			size, parseErr := strconv.ParseInt(request.URL.Query().Get("bytes"), 10, 64)
-			if parseErr != nil || size <= 0 {
-				return
-			}
-			firstDownload.CompareAndSwap(0, size)
-			downloaded.Add(size)
-			if _, err = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: "+strconv.FormatInt(size, 10)+"\r\n\r\n"); err != nil {
-				return
-			}
-			if _, err = io.CopyN(conn, smartZeroReader{}, size); err != nil {
-				return
-			}
-		}
-	}}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	download, upload, charged, err := smartMeasure(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", "http://203.0.113.1/up", 4_000_000, true)
-	if err != nil || download <= 0 || upload <= 0 {
-		t.Fatalf("measurement failed: %v (%f/%f Mbps)", err, download, upload)
-	}
-	if firstDownload.Load() != 1_000_000 || downloaded.Load() <= 1_000_000 || uploaded.Load() != 1_000_000 {
-		t.Fatalf("ramp/upload sizes: %d/%d/%d", firstDownload.Load(), downloaded.Load(), uploaded.Load())
-	}
-	if charged < (downloaded.Load()+uploaded.Load())*11/10 || charged > 4_400_000 {
-		t.Fatalf("inner byte accounting: %d", charged)
-	}
-	if dialer.httpDials.Load() > 2 {
-		t.Fatal("unnecessary download connections")
 	}
 }

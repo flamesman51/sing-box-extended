@@ -273,8 +273,14 @@ func (s *Smart) loop(ctx context.Context) {
 }
 
 func (s *Smart) runJob(job smartJob) smartResult {
+	if job.episode != nil {
+		defer job.episode.accountingWait.Done()
+	}
 	result := s.runOperation(job)
-	if job.kind == "throughput" && s.ledger != nil {
+	if job.episode != nil && result.contained {
+		job.episode.accountingPanic.Store(true)
+	}
+	if job.kind == "throughput" && job.episode == nil && s.ledger != nil {
 		uncertain := func() bool {
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -292,6 +298,7 @@ type smartContainmentKey struct{}
 
 func (s *Smart) runOperation(job smartJob) (result smartResult) {
 	result = smartResult{member: job.member, kind: job.kind, operator: job.operator, confirm: job.confirm, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, reservation: job.reservation, episode: job.episode, purpose: job.purpose}
+	result.plan = job.plan
 	result.primaryEpoch, result.improvementEpoch = job.primaryEpoch, job.improvementEpoch
 	started := false
 	defer func() {
@@ -335,19 +342,29 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 	switch job.kind {
 	case "tcp":
 		result.rtt, result.err = s.probe(workCtx, job.member.outbound, job.operator)
-	case "udp", "udp443":
-		result.rtt, result.err = s.udpProbe(workCtx, job.member.outbound, job.kind == "udp443")
+	case "udp":
+		bursts := max(1, job.plan.STUNBursts)
+		probe := s.udpBurstProbe
+		if probe == nil {
+			probe = smartSTUNProbe
+		}
+		var observation smartRTTProbeResult
+		observation, result.err = probe(workCtx, job.member.outbound, bursts)
+		result.udpRTTs, result.udpBurstSizes, result.udpBursts = observation.Samples, observation.BurstSizes, bursts
+	case "udp443":
+		result.rtt, result.err = s.udpProbe(workCtx, job.member.outbound, true)
 	case "direct":
 		result.rtt, result.err = s.directProbe(workCtx, job.country, s.directSeed)
 	case "throughput":
-		if job.episode != nil {
-			var passive func() int64
-			if job.purpose == smartDegradationConfirmation {
-				passive = func() int64 { return s.degradationPassive(job.episode) }
-			}
-			result.download, result.bytes, result.err = smartMeasureDegradation(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, job.capBytes, s.targetMbps, s.degradationThresholdLocked(), passive, s.clock)
-		} else {
-			result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.purpose != smartImprovementConfirmation && (job.networkType == "wifi" || s.cellularUploadAllowed()))
+		meter := job.meter
+		if meter == nil {
+			meter = newSmartMeasureMeter(job.capBytes)
+		}
+		result.measurement, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, meter, job.plan, s.clock)
+		result.download, result.upload = result.measurement.Download.Value, result.measurement.Upload.Value
+		result.bytes = meter.chargedBytes()
+		if errors.Is(result.err, errSmartMeasureCap) && s.logger != nil {
+			s.logger.Warn("speedtest aborted: budget")
 		}
 	}
 	return

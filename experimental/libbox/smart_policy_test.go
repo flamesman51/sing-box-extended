@@ -32,11 +32,11 @@ func TestSmartProfiles(t *testing.T) {
 	encoded, _ := json.Marshal(profiles)
 	var expected []map[string]any
 	_ = json.Unmarshal(encoded, &expected)
-	if !reflect.DeepEqual(actual, expected) || len(actual) != 15 {
+	if !reflect.DeepEqual(actual, expected) || len(actual) != 16 {
 		t.Fatalf("libbox catalog differs from core: %s", content)
 	}
 	for _, profile := range actual {
-		if len(profile) != 17 {
+		if len(profile) != 18 {
 			t.Fatalf("incomplete catalog profile: %#v", profile)
 		}
 	}
@@ -192,7 +192,7 @@ func TestSmartPolicyServiceMixedCaseOverride(t *testing.T) {
 				t.Fatalf("override metadata = %s", response.GetJson())
 			}
 			resolved := preference.Resolved
-			if !reflect.DeepEqual(resolved["throughput"], map[string]any{"target_mbps": float64(25), "enabled": true}) ||
+			if !reflect.DeepEqual(resolved["throughput"], map[string]any{"target_mbps": float64(25), "enabled": true, "streams": float64(1)}) ||
 				!reflect.DeepEqual(resolved["probe"], map[string]any{"heartbeat_interval": "15s", "standby_interval": "1m0s", "background_interval": "5m0s"}) ||
 				resolved["interrupt_on_failover"] != true ||
 				!reflect.DeepEqual(resolved["udp"], map[string]any{"quic_policy": "auto"}) {

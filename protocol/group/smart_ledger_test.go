@@ -80,27 +80,37 @@ func TestSmartLedgerMinimumSerialRateAndRollback(t *testing.T) {
 	ledger.Register("a", map[string]float64{"wifi": 300})
 	ledger.Register("b", map[string]float64{"wifi": 50})
 	now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
-	for i := range 4 {
-		id, capBytes, reserveErr := ledger.Reserve(context.Background(), "wifi", now.Add(time.Duration(i)*time.Minute), 0)
+	for i := range 30 {
+		id, capBytes, reserveErr := ledger.ReservePlan(context.Background(), "wifi", now.Add(time.Duration(i)*time.Minute), 0, 1_000_000)
 		if reserveErr != nil {
 			t.Fatal(reserveErr)
 		}
-		if i == 0 && capBytes != 10_000_000 {
-			t.Fatalf("cap = %d", capBytes)
+		if capBytes != 50_000_000-int64(i)*1_000_000 {
+			t.Fatalf("full remaining reservation = %d", capBytes)
 		}
-		if _, _, reserveErr = ledger.Reserve(context.Background(), "wifi", now, 0); !errors.Is(reserveErr, errSmartTestBusy) {
+		if _, _, reserveErr = ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000); !errors.Is(reserveErr, errSmartTestBusy) {
 			t.Fatalf("serial admission: %v", reserveErr)
 		}
 		if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err = ledger.Reserve(context.Background(), "wifi", now.Add(5*time.Minute), 0); !errors.Is(err, errSmartTestRate) {
+	if _, _, err = ledger.ReservePlan(context.Background(), "wifi", now.Add(30*time.Minute), 0, 1_000_000); !errors.Is(err, errSmartTestRate) {
 		t.Fatalf("hourly admission: %v", err)
 	}
 	snapshot := ledger.Snapshot("wifi", now.Add(-24*time.Hour), 0)
-	if snapshot.Day != "2026-11-09" || snapshot.UsedMB != 4 || snapshot.LimitMB != 50 {
+	if snapshot.Day != "2026-11-09" || snapshot.UsedMB != 30 || snapshot.LimitMB != 50 {
 		t.Fatalf("rollback snapshot: %+v", snapshot)
+	}
+	if _, _, err = ledger.ReservePlan(context.Background(), "wifi", now.Add(-time.Hour), 0, 1_000_000); !errors.Is(err, errSmartTestRate) {
+		t.Fatalf("clock rollback bypassed the hourly fuse: %v", err)
+	}
+	id, _, err := ledger.ReservePlan(context.Background(), "wifi", now.Add(time.Hour), 0, 1_000_000)
+	if err != nil {
+		t.Fatalf("hourly fuse did not expire at its exact boundary: %v", err)
+	}
+	if err = ledger.Reconcile(context.Background(), id, 0, false); err != nil {
+		t.Fatal(err)
 	}
 	shared, err := getSmartLedger(cache)
 	if err != nil || shared != ledger {
@@ -116,7 +126,7 @@ func TestSmartLedgerRestartChargesOrphansAndPreservesMetadata(t *testing.T) {
 	}
 	ledger.Register("g", map[string]float64{"wifi": 100, "cellular": 50})
 	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	_, reserved, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+	_, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +151,7 @@ func TestSmartLedgerRestartChargesOrphansAndPreservesMetadata(t *testing.T) {
 	}
 	failureLedger.Register("g", map[string]float64{"wifi": 100})
 	failureCache.fail = true
-	if _, _, err = failureLedger.Reserve(context.Background(), "wifi", now.Add(2*time.Hour), 0); err == nil {
+	if _, _, err = failureLedger.ReservePlan(context.Background(), "wifi", now.Add(2*time.Hour), 0, 1_000_000); err == nil {
 		t.Fatal("save failure admitted test")
 	}
 	if failureLedger.Snapshot("wifi", now, 0).ReservedMB != 0 {
@@ -159,7 +169,7 @@ func TestSmartLedgerUncertainChargesCellularAndDisabledCache(t *testing.T) {
 	}
 	ledger.Register("g", map[string]float64{"wifi": 100, "cellular": 50})
 	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	id, _, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+	id, _, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +184,7 @@ func TestSmartLedgerUncertainChargesCellularAndDisabledCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	disabled.Register("g", map[string]float64{"wifi": 300})
-	if _, _, err = disabled.Reserve(context.Background(), "wifi", now, 0); !errors.Is(err, errSmartTestsDisabled) {
+	if _, _, err = disabled.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000); !errors.Is(err, errSmartTestsDisabled) {
 		t.Fatalf("disabled cache: %v", err)
 	}
 	again, err := getSmartLedger(nil)
@@ -187,7 +197,7 @@ func TestSmartLedgerUncertainChargesCellularAndDisabledCache(t *testing.T) {
 	}
 }
 
-func TestSmartLedgerConcurrentAdmissionAndMinimumCap(t *testing.T) {
+func TestSmartLedgerConcurrentAdmissionAndPlanEstimate(t *testing.T) {
 	ledger, err := getSmartLedger(new(smartLedgerTestCache))
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +212,7 @@ func TestSmartLedgerConcurrentAdmissionAndMinimumCap(t *testing.T) {
 	results := make(chan admission, 16)
 	for range 16 {
 		go func() {
-			id, bytes, reserveErr := ledger.Reserve(context.Background(), "wifi", now, 10800)
+			id, bytes, reserveErr := ledger.ReservePlan(context.Background(), "wifi", now, 10800, 1_000_000)
 			results <- admission{id, bytes, reserveErr}
 		}()
 	}
@@ -218,14 +228,14 @@ func TestSmartLedgerConcurrentAdmissionAndMinimumCap(t *testing.T) {
 			t.Fatal(result.err)
 		}
 	}
-	if winner.id == "" || winner.bytes != 1_100_000 {
-		t.Fatalf("minimum reservation: %+v", winner)
+	if winner.id == "" || winner.bytes != 5_500_000 {
+		t.Fatalf("full reservation: %+v", winner)
 	}
 	if err = ledger.Reconcile(context.Background(), winner.id, 1_100_000, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = ledger.Reserve(context.Background(), "wifi", now.Add(2*time.Hour), 0); !errors.Is(err, errSmartBudget) {
-		t.Fatalf("minimum cap not enforced: %v", err)
+	if _, _, err = ledger.ReservePlan(context.Background(), "wifi", now.Add(2*time.Hour), 0, 4_400_001); !errors.Is(err, errSmartBudget) {
+		t.Fatalf("plan estimate not enforced: %v", err)
 	}
 	snapshot := ledger.Snapshot("wifi", now.Add(-24*time.Hour), 0)
 	if snapshot.Day != "2026-11-10" || snapshot.UsedMB != 1.1 {
@@ -241,7 +251,7 @@ func TestSmartLedgerReconcileSaveFailureKeepsReservation(t *testing.T) {
 	}
 	ledger.Register("g", map[string]float64{"wifi": 100})
 	now := time.Now()
-	id, reserved, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+	id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +280,7 @@ func TestSmartLedgerReserveRetriesPendingReconciliation(t *testing.T) {
 			ledger.Register("a", map[string]float64{"wifi": 100, "cellular": 50})
 			ledger.Register("b", map[string]float64{"wifi": 100, "cellular": 50})
 			now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
-			id, reserved, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+			id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -284,7 +294,7 @@ func TestSmartLedgerReserveRetriesPendingReconciliation(t *testing.T) {
 				t.Fatalf("shared ledger = %p, %v", shared, err)
 			}
 			for range 2 {
-				if _, _, err = shared.Reserve(context.Background(), "wifi", now.Add(time.Minute), 0); err == nil || errors.Is(err, errSmartTestBusy) {
+				if _, _, err = shared.ReservePlan(context.Background(), "wifi", now.Add(time.Minute), 0, 1_000_000); err == nil || errors.Is(err, errSmartTestBusy) {
 					t.Fatalf("pending reconciliation did not retry storage: %v", err)
 				}
 				if string(cache.data) != durable {
@@ -297,7 +307,7 @@ func TestSmartLedgerReserveRetriesPendingReconciliation(t *testing.T) {
 				}
 			}
 			cache.fail = false
-			nextID, _, err := shared.Reserve(context.Background(), "wifi", now.Add(time.Minute), 0)
+			nextID, _, err := shared.ReservePlan(context.Background(), "wifi", now.Add(time.Minute), 0, 1_000_000)
 			if err != nil {
 				t.Fatalf("storage recovery did not restore admission: %v", err)
 			}
@@ -318,7 +328,7 @@ func TestSmartLedgerReserveRetriesPendingReconciliation(t *testing.T) {
 			if err = shared.Reconcile(context.Background(), nextID, 0, false); err != nil {
 				t.Fatal(err)
 			}
-			thirdID, _, err := ledger.Reserve(context.Background(), "wifi", now.Add(2*time.Minute), 0)
+			thirdID, _, err := ledger.ReservePlan(context.Background(), "wifi", now.Add(2*time.Minute), 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -347,12 +357,12 @@ func TestSmartLedgerRestartAfterFailedReconciliationChargesReservation(t *testin
 	}
 	ledger.Register("g", map[string]float64{"wifi": 100})
 	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	id, reserved, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+	id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cache.fail = true
-	if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err == nil {
+	if err = ledger.Reconcile(context.Background(), id, 2_200_000, false); err == nil {
 		t.Fatal("failed reconciliation save accepted")
 	}
 	restartedCache := &smartLedgerTestCache{data: append([]byte(nil), cache.data...)}
@@ -383,12 +393,12 @@ func TestSmartLedgerPauseAndPowerSaveDenyAdmission(t *testing.T) {
 	}
 	ledger.Register("g", map[string]float64{"wifi": 100})
 	ctx := service.ContextWith[adapter.PlatformInterface](context.Background(), &smartLedgerPowerSavePlatform{})
-	if _, _, err = ledger.Reserve(ctx, "wifi", time.Now(), 0); !errors.Is(err, errSmartTestsDisabled) {
+	if _, _, err = ledger.ReservePlan(ctx, "wifi", time.Now(), 0, 1_000_000); !errors.Is(err, errSmartTestsDisabled) {
 		t.Fatalf("power-save admission: %v", err)
 	}
 	ctx = pause.WithDefaultManager(context.Background())
 	service.FromContext[pause.Manager](ctx).DevicePause()
-	if _, _, err = ledger.Reserve(ctx, "wifi", time.Now(), 0); !errors.Is(err, errSmartTestsDisabled) {
+	if _, _, err = ledger.ReservePlan(ctx, "wifi", time.Now(), 0, 1_000_000); !errors.Is(err, errSmartTestsDisabled) {
 		t.Fatalf("paused admission: %v", err)
 	}
 }
@@ -400,7 +410,7 @@ func TestSmartLedgerMetadataUpdatesPreserveGroupsAndReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledger.Register("a", map[string]float64{"wifi": 100})
-	id, reserved, err := ledger.Reserve(context.Background(), "wifi", time.Now(), 0)
+	id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", time.Now(), 0, 1_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}

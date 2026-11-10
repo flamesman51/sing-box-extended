@@ -147,13 +147,18 @@ type harnessStatus struct {
 		Total int `json:"total"`
 	} `json:"panics"`
 	Members []struct {
-		Tag      string   `json:"tag"`
-		State    string   `json:"state"`
-		UDP      string   `json:"udp"`
-		QUIC     string   `json:"udp443"`
-		Download *float64 `json:"download_mbps"`
-		Source   string   `json:"throughput_source"`
-		At       int64    `json:"throughput_at"`
+		Tag       string   `json:"tag"`
+		State     string   `json:"state"`
+		UDP       string   `json:"udp"`
+		QUIC      string   `json:"udp443"`
+		Download  *float64 `json:"download_mbps"`
+		Source    string   `json:"throughput_source"`
+		At        int64    `json:"throughput_at"`
+		UnderLoad struct {
+			Value float64 `json:"value"`
+			At    int64   `json:"at"`
+			Valid bool    `json:"valid"`
+		} `json:"download_under_load"`
 	} `json:"members"`
 	Events []struct {
 		Kind   string  `json:"kind"`
@@ -173,15 +178,10 @@ type harnessStatus struct {
 }
 
 type harnessBudget struct {
-	Day         string  `json:"day"`
-	Used        float64 `json:"used_mb"`
-	Reserved    float64 `json:"reserved_mb"`
-	Limit       float64 `json:"limit_mb"`
-	Degradation struct {
-		Used     float64 `json:"used_mb"`
-		Reserved float64 `json:"reserved_mb"`
-		Limit    float64 `json:"limit_mb"`
-	} `json:"degradation"`
+	Day      string  `json:"day"`
+	Used     float64 `json:"used_mb"`
+	Reserved float64 `json:"reserved_mb"`
+	Limit    float64 `json:"limit_mb"`
 }
 
 func statusHarness(t *testing.T, client *harnessBox) harnessStatus {
@@ -323,7 +323,7 @@ func newHarnessNetwork(t *testing.T, links []harnessLink, budget float64, probeT
 			"throughput": map[string]any{
 				"target_mbps":              10,
 				"download_url":             "https://fixture.invalid/download?bytes={bytes}",
-				"upload_url":               "https://fixture.invalid/upload",
+				"upload_url":               "https://fixture.invalid/upload?bytes={bytes}",
 				"wifi_daily_budget_mb":     budget,
 				"cellular_daily_budget_mb": budget,
 				"other_daily_budget_mb":    budget,
@@ -359,6 +359,11 @@ func TestSmartHarness(t *testing.T) {
 			t.Logf("%s calibrated %.2f Mbit/s", member.Tag, rate)
 			if member.Tag == "fast" && rate < 10 || member.Tag != "fast" && rate >= 10 {
 				t.Fatalf("%s calibrated %.2f Mbit/s, inconsistent with configured link", member.Tag, rate)
+			}
+		}
+		for i, fixture := range members {
+			if fixture.fixtures.uploads.Load() < 3 || fixture.fixtures.uploadBytes.Load() == 0 {
+				t.Fatalf("member %d lacks repeated receipt-verified uploads", i)
 			}
 		}
 	}) {

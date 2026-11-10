@@ -17,12 +17,13 @@ const smartImprovementConfirmation = "improvement_confirmation"
 func (s *Smart) improvementConfirmationEligibleLocked(member *smartMember, now time.Time) bool {
 	if !s.profileEngine() || !s.preference.improvement || member == nil || member != s.improvementCandidate ||
 		member.improvementObservations < 1 || member.improvementObservations >= s.preference.confirmations ||
-		(member.improvementCriterion != "speed_floor" && member.improvementCriterion != "download" && member.improvementCriterion != "throughput") ||
+		(member.improvementCriterion != "speed_floor" && member.improvementCriterion != "download" && member.improvementCriterion != "throughput" &&
+			member.improvementCriterion != "upload" && member.improvementCriterion != "rtt" && member.improvementCriterion != "jitter") ||
 		now.Sub(member.improvementAt) < s.preference.confirmationInterval ||
 		s.primary == nil || member == s.primary || member.state != "healthy" || member.tier != s.primary.tier {
 		return false
 	}
-	if _, fresh := smartFreshDownload(member, now); !fresh {
+	if !s.profileCriterionFreshLocked(member, member.improvementCriterion, now) {
 		return false
 	}
 	better, criterion := s.betterLocked(member, s.primary, now)
@@ -35,25 +36,31 @@ func (s *Smart) improvementConfirmationJobValidLocked(member *smartMember, prima
 		s.primary == nil || member == s.primary || member.state != "healthy" || member.tier != s.primary.tier {
 		return false
 	}
-	_, fresh := smartFreshDownload(member, now)
-	return fresh
+	if !s.profileCriterionFreshLocked(member, member.improvementCriterion, now) {
+		return false
+	}
+	better, criterion := s.betterLocked(member, s.primary, now)
+	return better && criterion == member.improvementCriterion
 }
 
 func (s *Smart) scheduleImprovementConfirmationLocked(now time.Time) bool {
 	member := s.improvementCandidate
-	if !s.improvementConfirmationEligibleLocked(member, now) || !s.throughputAllowedLocked(now) ||
+	plan := s.smartConfirmationPlanLocked(member)
+	if !s.improvementConfirmationEligibleLocked(member, now) || !s.measurementPlanAllowedLocked(plan, now) ||
 		s.degradation.episode != nil || s.admission != nil && s.admission.job.ctx.Err() == nil {
 		return false
 	}
 	for _, candidate := range s.members {
-		if candidate.queued["throughput"] {
+		if candidate.queued["throughput"] || plan.STUNBursts > 0 && candidate == member && candidate.queued["udp"] {
 			return false
 		}
 	}
-	for _, entries := range s.leases {
-		for lease := range entries {
-			if now.Sub(lease.lastRead) < 2*time.Second || now.Sub(lease.lastWrite) < 2*time.Second {
-				return false
+	if plan.STUNBursts == 0 {
+		for _, entries := range s.leases {
+			for lease := range entries {
+				if now.Sub(lease.lastRead) < 2*time.Second || now.Sub(lease.lastWrite) < 2*time.Second {
+					return false
+				}
 			}
 		}
 	}
@@ -81,46 +88,53 @@ func (s *Smart) startThroughputPurposeAdmissionLocked(member *smartMember, purpo
 	if s.admission != nil && s.admission.job.ctx.Err() == nil {
 		return
 	}
-	if !s.throughputAllowedLocked(now) || s.admissionRetryNetwork == s.network.Type && now.Before(s.admissionRetryAt) {
+	plan := s.regularMeasurementPlanLocked(member, now)
+	if purpose == smartImprovementConfirmation {
+		plan = s.smartConfirmationPlanLocked(member)
+	}
+	if episode != nil {
+		plan = episode.plan
+	}
+	if plan.Download == nil && plan.Upload == nil && plan.STUNBursts == 0 ||
+		!s.measurementPlanAllowedLocked(plan, now) ||
+		s.admissionRetryNetwork == s.network.Type && now.Before(s.admissionRetryAt) ||
+		plan.STUNBursts == 0 && s.measurementPlanBackedOffLocked(member, plan, now) {
 		return
 	}
-	ctx := s.workCtx
-	if ctx == nil {
-		ctx = s.ctx
+	ctx := s.measurementContextLocked(member, plan)
+	if purpose == smartImprovementConfirmation {
+		member.confirmationCancel = member.measurementCancel
 	}
 	if episode != nil {
 		ctx = episode.ctx
 	}
-	var confirmationCancel context.CancelFunc
-	if purpose == smartImprovementConfirmation {
-		if member.confirmationCancel != nil {
-			member.confirmationCancel()
-		}
-		ctx, confirmationCancel = context.WithTimeout(ctx, 30*time.Second)
-		member.confirmationCancel = confirmationCancel
+	kind := "throughput"
+	if plan.STUNBursts > 0 {
+		kind = "udp"
 	}
-	admission := &smartAdmission{
-		job: smartJob{
-			member: member, kind: "throughput", generation: s.generation,
-			memberGeneration: member.generation, configGeneration: s.configGeneration,
-			ctx: ctx, networkType: s.network.Type, timeout: 30 * time.Second,
-			episode: episode, purpose: purpose,
-			primaryEpoch: s.primaryEpoch, improvementEpoch: s.improvementEpoch,
-		},
-		ack: make(chan bool, 1),
-	}
+	admission := &smartAdmission{job: smartJob{
+		member: member, kind: kind, generation: s.generation,
+		memberGeneration: member.generation, configGeneration: s.configGeneration,
+		ctx: ctx, networkType: s.network.Type, timeout: plan.Deadline(),
+		episode: episode, purpose: purpose, plan: plan,
+		primaryEpoch: s.primaryEpoch, improvementEpoch: s.improvementEpoch,
+	}, ack: make(chan bool, 1)}
 	s.admission = admission
+	estimate := s.measurementEstimateLocked(member, plan, episode)
 	ledger, networkType, offset := s.ledger, s.network.Type, s.network.Offset
 	s.admissionWorkers.Go(func() {
 		id, capBytes, err := func() (id string, capBytes int64, err error) {
 			defer s.recoverError("ledger-admission", &err)
 			s.injectPanic("ledger-admission")
-			if episode != nil {
-				return ledger.ReserveDegradation(context.WithValue(ctx, smartContainmentKey{}, s), networkType, now, offset, purpose, smartDegradationConfirmationCap(s.targetMbps))
+			if plan.STUNBursts > 0 {
+				return "", 0, ctx.Err()
 			}
-			return ledger.Reserve(context.WithValue(ctx, smartContainmentKey{}, s), networkType, now, offset)
+			return ledger.ReservePlan(context.WithValue(ctx, smartContainmentKey{}, s), networkType, now, offset, estimate)
 		}()
 		admission.job.reservation, admission.job.capBytes = id, capBytes
+		if id != "" {
+			admission.job.meter = newSmartMeasureMeter(capBytes)
+		}
 		result := smartResult{kind: "admission", admission: admission, err: err, contained: errors.Is(err, errSmartContained)}
 		accepted := false
 		select {
@@ -140,12 +154,7 @@ func (s *Smart) startThroughputPurposeAdmissionLocked(member *smartMember, purpo
 		case <-ctx.Done():
 		}
 		if !accepted {
-			if confirmationCancel != nil {
-				confirmationCancel()
-			}
-			if id != "" {
-				s.discardReservation(id)
-			}
+			s.discardReservation(id)
 		}
 	})
 }
@@ -156,87 +165,58 @@ func (s *Smart) applyAdmissionLocked(result smartResult, now time.Time) {
 		s.admission = nil
 	}
 	job := admission.job
-	if result.err != nil && job.generation == s.generation && job.configGeneration == s.configGeneration &&
+	current := job.generation == s.generation && job.configGeneration == s.configGeneration &&
 		(job.episode == nil || s.degradationValidLocked(job.episode, now)) &&
-		(job.purpose != smartImprovementConfirmation || s.improvementConfirmationJobValidLocked(job.member, job.primaryEpoch, job.improvementEpoch, now)) {
-		delay := 30 * time.Second
-		switch {
-		case errors.Is(result.err, errSmartTestBusy):
-			delay = 5 * time.Second
-		case errors.Is(result.err, errSmartTestRate), errors.Is(result.err, errSmartTestsDisabled):
-			delay = time.Minute
-		case errors.Is(result.err, errSmartBudget):
-			local := now.In(time.FixedZone("smart-local", s.network.Offset))
-			year, month, day := local.Date()
-			delay = time.Date(year, month, day+1, 0, 0, 0, 0, local.Location()).Sub(now)
-		case errors.Is(result.err, context.Canceled):
-			delay = time.Second
-		}
-		if job.episode != nil && errors.Is(result.err, errSmartDegradationBudget) {
-			s.degradation.retry, s.degradation.blocked = now.Add(time.Hour), "degradation_allowance"
+		(job.purpose != smartImprovementConfirmation || s.improvementConfirmationJobValidLocked(job.member, job.primaryEpoch, job.improvementEpoch, now))
+	if result.err != nil && current {
+		if errors.Is(result.err, errSmartBudget) {
+			s.backoffMeasurementPlanLocked(job.member, job.plan, now)
 		} else {
+			delay := 30 * time.Second
+			switch {
+			case errors.Is(result.err, errSmartTestBusy):
+				delay = 5 * time.Second
+			case errors.Is(result.err, errSmartTestRate), errors.Is(result.err, errSmartTestsDisabled):
+				delay = time.Minute
+			case errors.Is(result.err, context.Canceled), errors.Is(result.err, context.DeadlineExceeded):
+				delay = time.Second
+			}
 			s.admissionRetryAt, s.admissionRetryNetwork = now.Add(delay), job.networkType
 		}
 	}
-	accepted := false
-	eligible := result.err == nil && s.throughputAllowedLocked(now) && job.member.state == "healthy"
-	if eligible && job.episode == nil {
-		for _, entries := range s.leases {
-			for lease := range entries {
-				if now.Sub(lease.lastRead) < 2*time.Second || now.Sub(lease.lastWrite) < 2*time.Second {
-					eligible = false
-				}
-			}
-		}
-	}
-	if job.episode != nil {
-		eligible = eligible && s.degradationValidLocked(job.episode, now)
-		if job.purpose == smartDegradationChallenger {
-			eligible = eligible && job.member == job.episode.challenger && job.member.generation == job.episode.challengerGeneration && s.degradationProbeEligibleLocked(job.member, now) && !s.degradationChallengerRetryLocked().After(now)
-		}
+	eligible := current && result.err == nil && s.measurementPlanAllowedLocked(job.plan, now) && job.member.state == "healthy"
+	if eligible && job.episode == nil && job.plan.STUNBursts == 0 {
+		eligible = s.measurementIdleLocked(now)
 	}
 	if job.purpose == smartImprovementConfirmation {
-		eligible = eligible && s.degradation.episode == nil && s.improvementConfirmationJobValidLocked(job.member, job.primaryEpoch, job.improvementEpoch, now)
+		eligible = eligible && s.degradation.episode == nil
 	}
-	if eligible && job.ctx.Err() == nil && job.generation == s.generation && job.configGeneration == s.configGeneration &&
-		job.memberGeneration == job.member.generation && slices.Contains(s.members, job.member) {
-		s.queueLocked(job.member, "throughput", 0, false, now)
+	accepted := false
+	if eligible && job.ctx.Err() == nil && job.memberGeneration == job.member.generation && slices.Contains(s.members, job.member) {
+		s.queueLocked(job.member, job.kind, 0, false, now)
 		for index := len(s.pending) - 1; index >= 0; index-- {
 			pending := &s.pending[index]
-			if pending.member == job.member && pending.kind == "throughput" && pending.reservation == "" {
-				pending.reservation, pending.capBytes, pending.timeout = job.reservation, job.capBytes, job.timeout
-				pending.purpose = job.purpose
-				pending.primaryEpoch, pending.improvementEpoch = job.primaryEpoch, job.improvementEpoch
-				if job.purpose == smartImprovementConfirmation {
-					pending.ctx = job.ctx
-				}
+			if pending.member == job.member && pending.kind == job.kind && pending.reservation == "" {
+				job.urgent = pending.urgent
+				*pending = job
 				if job.episode != nil {
-					pending.ctx, pending.episode, pending.purpose = job.ctx, job.episode, job.purpose
-					job.member.degradationQueued = job.episode
+					episode := job.episode
+					episode.reservation, episode.capBytes, episode.meter = job.reservation, job.capBytes, job.meter
+					episode.accountingWait.Add(1)
+					job.member.degradationQueued = episode
 					s.degradation.state = "checking"
-					if job.purpose == smartDegradationChallenger {
-						if s.degradation.attempts == nil {
-							s.degradation.attempts = make(map[string]time.Time)
-						}
-						s.degradation.attempts[job.member.identity] = now
-						s.lastChallenger = now
-						s.persistDegradationCooldownLocked(s.degradationChallengerCooldownKey(), now, now.Add(time.Hour))
-					}
 				}
-				if job.member != s.primary && job.member != s.standby {
-					s.lastChallenger = now
+				if job.kind == "throughput" {
+					job.member.lastThroughput = now
 				}
 				accepted = true
 				break
 			}
 		}
 	}
-	if !accepted && job.episode != nil && s.degradation.episode == job.episode {
-		if result.contained || errors.Is(result.err, context.Canceled) || !s.degradationValidLocked(job.episode, now) {
-			s.finishDegradationLocked(now, 30*time.Minute, "no_data")
-		} else if result.err != nil && !errors.Is(result.err, errSmartBudget) && !errors.Is(result.err, errSmartDegradationBudget) {
-			s.degradation.retry = s.admissionRetryAt
-		} else {
+	if !accepted {
+		s.cancelMemberMeasurementLocked(job.member)
+		if job.episode != nil && s.degradation.episode == job.episode {
 			s.finishDegradationLocked(now, 30*time.Minute, "admission_blocked")
 		}
 	}
@@ -278,7 +258,9 @@ func (s *Smart) discardBufferedJobsLocked() {
 	for {
 		select {
 		case job := <-s.otherJobs:
-			if job.kind == "throughput" {
+			if job.episode != nil {
+				job.episode.accountingWait.Done()
+			} else if job.kind == "throughput" {
 				s.discardReservation(job.reservation)
 			}
 		default:

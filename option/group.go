@@ -3,6 +3,7 @@ package option
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -78,15 +79,26 @@ type SmartUDPOptions struct {
 }
 
 type SmartThroughputOptions struct {
-	Enabled               *bool    `json:"enabled,omitempty"`
-	TargetMbps            float64  `json:"target_mbps,omitempty"`
-	DownloadURL           string   `json:"download_url,omitempty"`
-	UploadURL             string   `json:"upload_url,omitempty"`
-	WIFIDailyBudgetMB     *float64 `json:"wifi_daily_budget_mb,omitempty"`
-	CellularDailyBudgetMB *float64 `json:"cellular_daily_budget_mb,omitempty"`
-	OtherDailyBudgetMB    *float64 `json:"other_daily_budget_mb,omitempty"`
+	Enabled               *bool              `json:"enabled,omitempty"`
+	TargetMbps            float64            `json:"target_mbps,omitempty"`
+	Streams               int                `json:"streams,omitempty"`
+	Window                badoption.Duration `json:"window,omitempty"`
+	Warmup                badoption.Duration `json:"warmup,omitempty"`
+	Upload                *bool              `json:"upload,omitempty"`
+	UploadWindow          badoption.Duration `json:"upload_window,omitempty"`
+	UploadWarmup          badoption.Duration `json:"upload_warmup,omitempty"`
+	DownloadURL           string             `json:"download_url,omitempty"`
+	UploadURL             string             `json:"upload_url,omitempty"`
+	WIFIDailyBudgetMB     *float64           `json:"wifi_daily_budget_mb,omitempty"`
+	CellularDailyBudgetMB *float64           `json:"cellular_daily_budget_mb,omitempty"`
+	OtherDailyBudgetMB    *float64           `json:"other_daily_budget_mb,omitempty"`
 
-	targetMbpsSet bool
+	targetMbpsSet   bool
+	streamsSet      bool
+	windowSet       bool
+	warmupSet       bool
+	uploadWindowSet bool
+	uploadWarmupSet bool
 }
 
 func (o *SmartProbeOptions) UnmarshalJSON(content []byte) error {
@@ -141,7 +153,12 @@ func (o *SmartThroughputOptions) UnmarshalJSON(content []byte) error {
 	type throughputOptions SmartThroughputOptions
 	var decoded struct {
 		throughputOptions
-		TargetMbps *float64 `json:"target_mbps,omitempty"`
+		TargetMbps   *float64            `json:"target_mbps,omitempty"`
+		Streams      *int                `json:"streams,omitempty"`
+		Window       *badoption.Duration `json:"window,omitempty"`
+		Warmup       *badoption.Duration `json:"warmup,omitempty"`
+		UploadWindow *badoption.Duration `json:"upload_window,omitempty"`
+		UploadWarmup *badoption.Duration `json:"upload_warmup,omitempty"`
 	}
 	if err := json.UnmarshalDisallowUnknownFields(content, &decoded); err != nil {
 		return err
@@ -149,6 +166,25 @@ func (o *SmartThroughputOptions) UnmarshalJSON(content []byte) error {
 	if decoded.TargetMbps != nil {
 		decoded.throughputOptions.TargetMbps = *decoded.TargetMbps
 		decoded.throughputOptions.targetMbpsSet = true
+	}
+	if decoded.Streams != nil {
+		decoded.throughputOptions.Streams = *decoded.Streams
+		decoded.throughputOptions.streamsSet = true
+	}
+	for _, field := range []struct {
+		value   *badoption.Duration
+		dest    *badoption.Duration
+		present *bool
+	}{
+		{decoded.Window, &decoded.throughputOptions.Window, &decoded.throughputOptions.windowSet},
+		{decoded.Warmup, &decoded.throughputOptions.Warmup, &decoded.throughputOptions.warmupSet},
+		{decoded.UploadWindow, &decoded.throughputOptions.UploadWindow, &decoded.throughputOptions.uploadWindowSet},
+		{decoded.UploadWarmup, &decoded.throughputOptions.UploadWarmup, &decoded.throughputOptions.uploadWarmupSet},
+	} {
+		if field.value != nil {
+			*field.dest = *field.value
+			*field.present = true
+		}
 	}
 	*o = SmartThroughputOptions(decoded.throughputOptions)
 	return nil
@@ -158,6 +194,7 @@ func (o *SmartThroughputOptions) UnmarshalJSON(content []byte) error {
 func (o *SmartOutboundOptions) HasProfileOwnedFields() bool {
 	return o.InterruptOnFailover != nil || o.Throughput.Enabled != nil ||
 		o.Throughput.targetMbpsSet || o.Throughput.TargetMbps != 0 ||
+		o.Throughput.streamsSet || o.Throughput.Streams != 0 ||
 		o.Probe.heartbeatIntervalSet || o.Probe.HeartbeatInterval != 0 ||
 		o.Probe.standbyIntervalSet || o.Probe.StandbyInterval != 0 ||
 		o.Probe.backgroundIntervalSet || o.Probe.BackgroundInterval != 0 ||
@@ -171,6 +208,8 @@ func (o *SmartOutboundOptions) ApplySmartPolicy(policy *SmartOutboundOptions) {
 	o.Throughput.Enabled = policy.Throughput.Enabled
 	o.Throughput.TargetMbps = policy.Throughput.TargetMbps
 	o.Throughput.targetMbpsSet = policy.Throughput.targetMbpsSet
+	o.Throughput.Streams = policy.Throughput.Streams
+	o.Throughput.streamsSet = policy.Throughput.streamsSet
 	o.Probe.HeartbeatInterval = policy.Probe.HeartbeatInterval
 	o.Probe.heartbeatIntervalSet = policy.Probe.heartbeatIntervalSet
 	o.Probe.StandbyInterval = policy.Probe.StandbyInterval
@@ -183,6 +222,9 @@ func (o *SmartOutboundOptions) ApplySmartPolicy(policy *SmartOutboundOptions) {
 
 // ValidateProfileFields applies presence-aware validation only for the profile engine.
 func (o *SmartOutboundOptions) ValidateProfileFields() error {
+	if err := o.Throughput.ValidateMeasurementFields(true); err != nil {
+		return err
+	}
 	for _, field := range []struct {
 		name    string
 		value   badoption.Duration
@@ -209,6 +251,29 @@ func (o *SmartOutboundOptions) ValidateProfileFields() error {
 	case "auto", "route_only", "off":
 	default:
 		return fmt.Errorf("invalid smart udp.quic_policy: %q", o.UDP.QUICPolicy)
+	}
+	return nil
+}
+
+// ValidateMeasurementFields preserves legacy zero defaults while checking measurement bounds.
+func (o *SmartThroughputOptions) ValidateMeasurementFields(profile bool) error {
+	if o.Streams < 0 || (profile && o.streamsSet && o.Streams == 0) {
+		return fmt.Errorf("smart throughput.streams must be at least 1")
+	}
+	for _, field := range []struct {
+		name    string
+		value   badoption.Duration
+		present bool
+		minimum time.Duration
+	}{
+		{"window", o.Window, o.windowSet, 5 * time.Second},
+		{"warmup", o.Warmup, o.warmupSet, time.Second},
+		{"upload_window", o.UploadWindow, o.uploadWindowSet, 5 * time.Second},
+		{"upload_warmup", o.UploadWarmup, o.uploadWarmupSet, time.Second},
+	} {
+		if (field.value != 0 || (profile && field.present)) && time.Duration(field.value) < field.minimum {
+			return fmt.Errorf("smart throughput.%s must be at least %s", field.name, field.minimum)
+		}
 	}
 	return nil
 }

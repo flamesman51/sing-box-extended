@@ -22,7 +22,7 @@ func TestSmartLedgerAcquireSurvivesLastCleanupBetweenLookupAndRegistration(t *te
 		defer cancel()
 		admission := make(chan error, 1)
 		go func() {
-			_, _, reserveErr := ledger.Reserve(ctx, "wifi", now, 0)
+			_, _, reserveErr := ledger.ReservePlan(ctx, "wifi", now, 0, 1_000_000)
 			admission <- reserveErr
 		}()
 		smartLedgerWait(t, gate.entered)
@@ -79,11 +79,11 @@ func TestSmartLedgerAcquireSurvivesLastCleanupBetweenLookupAndRegistration(t *te
 		if replacement != other {
 			t.Fatalf("replacement and new group acquired independent owners: %p != %p", replacement, other)
 		}
-		id, reserved, err := replacement.Reserve(context.Background(), "wifi", now.Add(time.Minute), 0)
-		if err != nil || reserved != 10_000_000 {
-			t.Fatalf("shared minimum reservation = %d, %v", reserved, err)
+		id, reserved, err := replacement.ReservePlan(context.Background(), "wifi", now.Add(time.Minute), 0, 1_000_000)
+		if err != nil || reserved != 50_000_000 {
+			t.Fatalf("shared full reservation = %d, %v", reserved, err)
 		}
-		if _, _, err = other.Reserve(context.Background(), "wifi", now.Add(time.Minute), 0); !errors.Is(err, errSmartTestBusy) {
+		if _, _, err = other.ReservePlan(context.Background(), "wifi", now.Add(time.Minute), 0, 1_000_000); !errors.Is(err, errSmartTestBusy) {
 			t.Fatalf("second group independently admitted a test: %v", err)
 		}
 		if err = replacement.UpdatePriors("replacement", []smartPrior{{Network: "wifi", ServerIdentity: "a", S: 1, W: 2}}, nil); err != nil {
@@ -129,7 +129,7 @@ func TestSmartLedgerCacheRetirementDropsFailedReconciliationOwner(t *testing.T) 
 			t.Fatal(err)
 		}
 		now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
-		id, reserved, err := ledger.Reserve(context.Background(), "wifi", now, 0)
+		id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -176,10 +176,10 @@ func TestSmartLedgerCacheRetirementDropsFailedReconciliationOwner(t *testing.T) 
 		if recovered == ledger || recovered.Metadata().InstallID != ledger.Metadata().InstallID {
 			t.Fatal("fresh cache did not recover the installation through a new owner")
 		}
-		if snapshot := recovered.Snapshot("wifi", now, 0); snapshot.UsedMB != 20 || snapshot.ReservedMB != 0 {
+		if snapshot := recovered.Snapshot("wifi", now, 0); snapshot.UsedMB != 100 || snapshot.ReservedMB != 0 {
 			t.Fatalf("fresh cache did not charge the durable orphan in full: %+v", snapshot)
 		}
-		if persisted := fresh.metadata(t); len(persisted.Ledger.Reservations) != 0 || persisted.Ledger.Days["wifi/2026-11-09"] != 20_000_000 {
+		if persisted := fresh.metadata(t); len(persisted.Ledger.Reservations) != 0 || persisted.Ledger.Days["wifi/2026-11-09"] != 100_000_000 {
 			t.Fatalf("fresh cache orphan recovery was not durable: %+v", persisted.Ledger)
 		}
 	})

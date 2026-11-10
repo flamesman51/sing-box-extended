@@ -134,6 +134,7 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 		}
 	}
 	members := make([]map[string]any, 0, len(s.members))
+	uploadVerified := true
 	for rank, member := range s.members {
 		probability, weight := s.history.Estimate(s.network.Path, member.identity, member.serverIdentity, now, priors)
 		class := s.history.Class(s.network.Path, member.identity, member.serverIdentity, s.historyTime(now), priors)
@@ -146,28 +147,30 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 			memberState = "emergency"
 		}
 		throughput := member.throughput
-		ttl := 24 * time.Hour
-		if throughput.Source == "passive" {
-			ttl = 6 * time.Hour
-		}
-		fresh := !throughput.At.IsZero() && now.Sub(throughput.At) < ttl
+		fresh := throughput.Source == "active" && !throughput.At.IsZero() && now.Sub(throughput.At) < 24*time.Hour
 		download, upload, source, at := any(nil), any(nil), any(nil), any(nil)
 		if fresh {
 			download = smartNumber(throughput.Download)
-			upload = smartNumber(throughput.Upload)
 			source = smartNullable(throughput.Source)
 			at = smartTime(throughput.At)
+		}
+		if throughput.UploadResult.Valid && now.Sub(throughput.UploadResult.At) < 24*time.Hour {
+			upload = smartNumber(throughput.UploadResult.Value)
+		}
+		if throughput.UploadUnverified {
+			uploadVerified = false
 		}
 		members = append(members, map[string]any{
 			"tag": member.tag, "tier": member.tier, "country": smartNullable(member.country), "state": memberState, "probation": member.probation, "quarantine_until": smartTime(member.quarantineUntil),
 			"tcp": member.tcp.value(now), "udp": member.udp.value(now), "udp443": member.udp443.value(now), "rtt_ms": rtt, "rtt_p90_ms": p90, "stability": probability, "stability_class": string(rune('A' + class)), "weight": weight,
 			"download_mbps": download, "upload_mbps": upload, "throughput_class": s.throughputClass(member, now), "throughput_source": source, "throughput_at": at, "last_ok": smartTime(member.lastOK), "last_fail": smartTime(member.lastFail), "rank": rank + 1,
 		})
+		s.measurementStatusLocked(member, members[len(members)-1], now)
 		if s.profileEngine() {
 			entry := members[len(members)-1]
 			if slices.Contains(s.preference.rank, "download") || slices.Contains(s.preference.rank, "speed_floor") {
 				entry["download_bucket"] = nil
-				if download, fresh := smartFreshDownload(member, now); fresh && download > 0 {
+				if download, fresh := s.effectiveDownloadLocked(member, now); fresh && download > 0 {
 					entry["download_bucket"] = int(math.Floor(math.Log(download) / math.Log(1.25)))
 				}
 			}
@@ -206,10 +209,11 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 		"version": 1, "group": s.Tag(), "now": now.Unix(), "state": state, "generation": s.selectionGeneration,
 		"panics": s.panicSnapshot(), "degraded": s.degradedLocked(), "budgets": budgets,
 		"throughput_degradation": s.degradationSnapshotLocked(),
-		"preference":             s.preferenceStatusLocked(),
-		"selected":               map[string]any{"tcp": primary, "standby": standby, "udp": udp, "udp443": udp443},
-		"network":                map[string]any{"key": s.network.Key, "type": s.network.Type, "label": smartNullable(s.network.Label), "carrier": smartNullable(s.network.Carrier), "radio": smartNullable(s.network.Radio), "country": smartNullable(s.network.Country)},
-		"direct":                 map[string]any{"state": s.direct.value(now), "checked_at": smartTime(s.direct.at), "rtt_ms": smartNumber(float64(s.directRTT) / float64(time.Millisecond)), "download_mbps": nil}, "budget": budget, "members": members, "events": events, "timeline": timeline,
+		"upload_verified":        uploadVerified, "budget_exhausted": s.measurementBudgetExhausted,
+		"preference": s.preferenceStatusLocked(),
+		"selected":   map[string]any{"tcp": primary, "standby": standby, "udp": udp, "udp443": udp443},
+		"network":    map[string]any{"key": s.network.Key, "type": s.network.Type, "label": smartNullable(s.network.Label), "carrier": smartNullable(s.network.Carrier), "radio": smartNullable(s.network.Radio), "country": smartNullable(s.network.Country)},
+		"direct":     map[string]any{"state": s.direct.value(now), "checked_at": smartTime(s.direct.at), "rtt_ms": smartNumber(float64(s.directRTT) / float64(time.Millisecond)), "download_mbps": nil}, "budget": budget, "members": members, "events": events, "timeline": timeline,
 	})
 }
 
@@ -611,7 +615,8 @@ func (s *Smart) preferenceStatusLocked() map[string]any {
 	}
 	return map[string]any{
 		"profile": profile, "rank": rank, "min_stability": floor, "target_mbps": s.targetMbps, "improvement": improvement,
-		"engine": engine, "base": base, "custom": s.profileEngine() && s.preferenceCustom,
+		"streams": s.options.Throughput.Streams,
+		"engine":  engine, "base": base, "custom": s.profileEngine() && s.preferenceCustom,
 		"source": source, "override_hash": s.options.SmartPolicyOverrideHash, "resolved": s.resolvedSmartPolicy(),
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -20,174 +21,88 @@ func smartDegradationTestLedger(t *testing.T, limits map[string]float64) (*smart
 	return ledger, cache
 }
 
-func TestSmartDegradationLedgerAllowanceDoesNotBlockOrdinary(t *testing.T) {
-	ledger, _ := smartDegradationTestLedger(t, map[string]float64{"cellular": 50})
-	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	if _, _, err := ledger.ReserveDegradation(context.Background(), "cellular", now, 0, smartDegradationConfirmation, 10_000_000); !errors.Is(err, errSmartDegradationBudget) || errors.Is(err, errSmartBudget) {
-		t.Fatalf("confirmation allowance denial = %v", err)
-	}
-	ledger.mu.Lock()
-	ledger.state.Days["cellular/2026-11-09"] = 5_000_000
-	ledger.state.Days[smartDegradationDayKey("cellular", "2026-11-09")] = 5_000_000
-	ledger.mu.Unlock()
-	if _, _, err := ledger.ReserveDegradation(context.Background(), "cellular", now, 0, smartDegradationChallenger, 10_000_000); !errors.Is(err, errSmartDegradationBudget) {
-		t.Fatalf("exhausted challenger allowance = %v", err)
-	}
-	id, capBytes, err := ledger.Reserve(context.Background(), "cellular", now, 0)
-	if err != nil || capBytes != 9_000_000 {
-		t.Fatalf("ordinary admission after purpose exhaustion = %d, %v", capBytes, err)
-	}
-	if got := ledger.Metadata().Ledger.Reservations[id].Purpose; got != "" {
-		t.Fatalf("ordinary reservation purpose = %q", got)
-	}
-	if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err != nil {
-		t.Fatal(err)
-	}
-	budget := ledger.Snapshot("cellular", now, 0)
-	if budget.UsedMB != 6 || budget.Degradation.UsedMB != 5 || budget.Degradation.LimitMB != 5 {
-		t.Fatalf("ordinary bytes consumed purpose allowance: %+v", budget)
+func TestSmartLedgerRejectsNegativePlanEstimate(t *testing.T) {
+	ledger, cache := smartDegradationTestLedger(t, map[string]float64{"wifi": 300})
+	before := string(cache.data)
+	id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", time.Now(), 0, -1)
+	if err == nil || id != "" || reserved != 0 || string(cache.data) != before {
+		t.Fatalf("negative estimate changed admission state: id=%q reserved=%d err=%v", id, reserved, err)
 	}
 }
 
-func TestSmartDegradationLedgerRunwayArithmetic(t *testing.T) {
-	if got := smartDegradationWorstCase(10_000_000); got != 11_000_000 {
-		t.Fatalf("confirmation worst case = %d", got)
+func TestSmartDegradationLedgerWholePlanAdmission(t *testing.T) {
+	ledger, cache := smartDegradationTestLedger(t, map[string]float64{"wifi": 300})
+	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	ledger.mu.Lock()
+	ledger.state.Days["wifi/2026-11-09"] = 285_000_000
+	ledger.state.Days["degradation/wifi/2026-11-09"] = 30_000_000
+	ledger.mu.Unlock()
+	before := string(cache.data)
+	if _, _, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 20_000_000); !errors.Is(err, errSmartBudget) {
+		t.Fatalf("two-phase plan that exceeds the remainder = %v", err)
 	}
-	if got := smartDegradationWorstCase(10_000_000 + 25_000_000); got != 38_500_000 {
-		t.Fatalf("full pair worst case = %d", got)
+	if state := ledger.Metadata().Ledger; len(state.Starts) != 0 || len(state.Reservations) != 0 || string(cache.data) != before {
+		t.Fatalf("skipped episode changed admission state: %+v", state)
 	}
-	if got := smartDegradationWorstCase(2*10_000_000 + 25_000_000); got != 49_500_000 {
-		t.Fatalf("confirmation admission threshold = %d", got)
+	id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 10_000_000)
+	if err != nil || reserved != 15_000_000 {
+		t.Fatalf("one-phase plan after episode denial = %d, %v", reserved, err)
 	}
+	if err = ledger.Reconcile(context.Background(), id, 11_000_000, false); err != nil {
+		t.Fatal(err)
+	}
+	if state := ledger.Metadata().Ledger; state.Days["wifi/2026-11-09"] != 296_000_000 || state.Days["degradation/wifi/2026-11-09"] != 30_000_000 {
+		t.Fatalf("plan used a separate degradation allowance: %+v", state)
+	}
+}
+
+func TestSmartLedgerChargedAdmissionBoundaries(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		limit     float64
-		count     int
-		used      float64
-		remaining float64
-		denyNext  bool
+		network string
+		limitMB float64
 	}{
-		{"wifi", 5000, 24, 264, 236, false},
-		{"cellular", 1000, 5, 55, 45, true},
+		{"wifi", 300},
+		{"cellular", 50},
+		{"wifi", 5000},
+		{"cellular", 1000},
+		{"unknown", 1000},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			ledger, _ := smartDegradationTestLedger(t, map[string]float64{test.name: test.limit})
+		t.Run(fmt.Sprintf("%s_%g", test.network, test.limitMB), func(t *testing.T) {
+			ledger, cache := smartDegradationTestLedger(t, map[string]float64{smartBudgetType(test.network): test.limitMB})
 			now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-			for i := range test.count {
-				at := now.Add(time.Duration(i) * time.Hour)
-				id, capBytes, err := ledger.ReserveDegradation(context.Background(), test.name, at, 0, smartDegradationConfirmation, 10_000_000)
-				if err != nil || capBytes != 10_000_000 {
-					t.Fatalf("confirmation %d = %d, %v", i+1, capBytes, err)
+			limit := int64(test.limitMB * 1_000_000)
+			for _, remaining := range []int64{limit, 1_099_999, 11, 1} {
+				ledger.mu.Lock()
+				ledger.state.Days[smartBudgetType(test.network)+"/2026-11-09"] = limit - remaining
+				ledger.mu.Unlock()
+				if _, _, err := ledger.ReservePlan(context.Background(), test.network, now, 0, remaining+1); !errors.Is(err, errSmartBudget) {
+					t.Fatalf("remaining %d admitted estimate %d: %v", remaining, remaining+1, err)
 				}
-				if got := ledger.Snapshot(test.name, at, 0); got.ReservedMB != 11 || got.Degradation.ReservedMB != 11 {
-					t.Fatalf("worst-case outstanding confirmation: %+v", got)
+				id, reserved, err := ledger.ReservePlan(context.Background(), test.network, now, 0, remaining)
+				if err != nil || reserved != remaining {
+					t.Fatalf("exact remaining %d = %d, %v", remaining, reserved, err)
 				}
-				if err = ledger.Reconcile(context.Background(), id, 11_000_000, false); err != nil {
+				var durable smartInstallation
+				if err = json.Unmarshal(cache.data, &durable); err != nil {
 					t.Fatal(err)
 				}
-			}
-			at := now.Add(time.Duration(test.count-1) * time.Hour)
-			budget := ledger.Snapshot(test.name, at, 0)
-			if budget.UsedMB != test.used || budget.Degradation.UsedMB != test.used || budget.Degradation.LimitMB-budget.Degradation.UsedMB != test.remaining {
-				t.Fatalf("hourly confirmation runway: %+v", budget)
-			}
-			id, _, err := ledger.ReserveDegradation(context.Background(), test.name, at, 0, smartDegradationConfirmation, 10_000_000)
-			if test.denyNext {
-				if !errors.Is(err, errSmartDegradationBudget) {
-					t.Fatalf("sixth cellular confirmation = %v", err)
-				}
-			} else {
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err = ledger.Reconcile(context.Background(), id, 0, false); err != nil {
-					t.Fatal(err)
-				}
-			}
-			id, capBytes, err := ledger.ReserveDegradation(context.Background(), test.name, at, 0, smartDegradationChallenger, 10_000_000)
-			if err != nil || capBytes != 25_000_000 {
-				t.Fatalf("preserved full challenger = %d, %v", capBytes, err)
-			}
-			if err = ledger.Reconcile(context.Background(), id, 27_500_000, false); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestSmartDegradationLedgerConfirmationThresholdAndCap(t *testing.T) {
-	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	for _, test := range []struct {
-		name    string
-		limit   float64
-		used    int64
-		cap     int64
-		wantErr error
-	}{
-		{"exact_runway", 1000, 50_500_000, 10_000_000, nil},
-		{"one_byte_short", 1000, 50_500_001, 10_000_000, errSmartDegradationBudget},
-		{"ordinary_base_too_small", 1000, 951_000_000, 10_000_000, errSmartDegradationBudget},
-		{"ordinary_exhausted", 5, 0, 1_100_000, errSmartBudget},
-		{"confirmation_never_shrinks", 50, 0, 10_000_000, errSmartDegradationBudget},
-		{"confirmation_over_maximum", 5000, 0, 25_000_001, errSmartDegradationBudget},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			ledger, _ := smartDegradationTestLedger(t, map[string]float64{"wifi": test.limit})
-			ledger.mu.Lock()
-			if test.name == "ordinary_base_too_small" {
-				ledger.state.Days["wifi/2026-11-09"] = test.used
-			} else {
-				ledger.state.Days["degradation/wifi/2026-11-09"] = test.used
-			}
-			ledger.mu.Unlock()
-			id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationConfirmation, test.cap)
-			if !errors.Is(err, test.wantErr) {
-				t.Fatalf("confirmation admission = %v, want %v", err, test.wantErr)
-			}
-			if err == nil {
-				if capBytes != test.cap {
-					t.Fatalf("confirmation shrank to %d", capBytes)
+				if reservation := durable.Ledger.Reservations[id]; reservation.Bytes != remaining || reservation.Format != "charged-v2" || reservation.Purpose != "" {
+					t.Fatalf("full charged reservation was not durable: %+v", reservation)
 				}
 				if err = ledger.Reconcile(context.Background(), id, 0, false); err != nil {
 					t.Fatal(err)
 				}
 			}
 		})
-	}
-}
-
-func TestSmartDegradationLedgerChallengerMinimumAndSharedLimit(t *testing.T) {
-	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	ledger, _ := smartDegradationTestLedger(t, map[string]float64{"wifi": 5000})
-	ledger.Register("smaller", map[string]float64{"wifi": 1000})
-	defer ledger.Unregister("smaller")
-	if got := ledger.Snapshot("wifi", now, 0).Degradation.LimitMB; got != 100 {
-		t.Fatalf("shared effective allowance = %v", got)
-	}
-	ledger.mu.Lock()
-	ledger.state.Days["degradation/wifi/2026-11-09"] = 89_000_000
-	ledger.mu.Unlock()
-	id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000)
-	if err != nil || capBytes != 10_000_000 {
-		t.Fatalf("target-sized minimum challenger = %d, %v", capBytes, err)
-	}
-	if err = ledger.Reconcile(context.Background(), id, 1, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err = ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000); !errors.Is(err, errSmartDegradationBudget) {
-		t.Fatalf("one byte below minimum headroom = %v", err)
 	}
 }
 
 func TestSmartDegradationLedgerRestartOrphansAndDayRollback(t *testing.T) {
 	ledger, cache := smartDegradationTestLedger(t, map[string]float64{"wifi": 5000})
 	now := time.Date(2026, 11, 9, 23, 30, 0, 0, time.UTC)
-	id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationConfirmation, 10_000_000)
-	if err != nil || capBytes != 10_000_000 {
-		t.Fatalf("confirmation = %d, %v", capBytes, err)
-	}
-	if reservation := ledger.Metadata().Ledger.Reservations[id]; reservation.Purpose != smartDegradationConfirmation {
-		t.Fatalf("durable reservation purpose = %q", reservation.Purpose)
+	_, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 10_000_000)
+	if err != nil || reserved != 5_000_000_000 {
+		t.Fatalf("episode reservation = %d, %v", reserved, err)
 	}
 	for i := range 2 {
 		restartedCache := &smartLedgerTestCache{data: append([]byte(nil), cache.data...)}
@@ -196,7 +111,7 @@ func TestSmartDegradationLedgerRestartOrphansAndDayRollback(t *testing.T) {
 			t.Fatal(restartErr)
 		}
 		restarted.Register("restart", map[string]float64{"wifi": 5000})
-		if got := restarted.Snapshot("wifi", now.Add(-24*time.Hour), 0); got.Day != "2026-11-09" || got.UsedMB != 11 || got.Degradation.UsedMB != 11 || got.Degradation.ReservedMB != 0 {
+		if got := restarted.Snapshot("wifi", now.Add(-24*time.Hour), 0); got.Day != "2026-11-09" || got.UsedMB != 5000 || got.ReservedMB != 0 {
 			t.Fatalf("restart %d charged orphan incorrectly: %+v", i, got)
 		}
 		restarted.Unregister("restart")
@@ -208,57 +123,54 @@ func TestSmartDegradationLedgerRestartOrphansAndDayRollback(t *testing.T) {
 	}
 	restarted.Register("restart", map[string]float64{"wifi": 5000})
 	defer restarted.Unregister("restart")
-	tomorrow := now.Add(2 * time.Hour)
-	if got := restarted.Snapshot("wifi", tomorrow, 0); got.Day != "2026-11-10" || got.Degradation.UsedMB != 0 || got.UsedMB != 0 {
-		t.Fatalf("daily purpose rollover: %+v", got)
+	if got := restarted.Snapshot("wifi", now.Add(2*time.Hour), 0); got.Day != "2026-11-10" || got.UsedMB != 0 {
+		t.Fatalf("daily rollover: %+v", got)
 	}
-	id, _, err = restarted.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000)
+	id, _, err := restarted.ReservePlan(context.Background(), "wifi", now, 0, 10_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = restarted.Reconcile(context.Background(), id, 2_750_000, false); err != nil {
 		t.Fatal(err)
 	}
-	if got := restarted.Snapshot("wifi", now.Add(-48*time.Hour), 0); got.Day != "2026-11-10" || got.UsedMB != 2.75 || got.Degradation.UsedMB != 2.75 {
-		t.Fatalf("rolled-back reservation reset purpose day: %+v", got)
+	if got := restarted.Snapshot("wifi", now.Add(-48*time.Hour), 0); got.Day != "2026-11-10" || got.UsedMB != 2.75 {
+		t.Fatalf("rolled-back reservation reset the day: %+v", got)
 	}
 }
 
 func TestSmartDegradationLedgerUncertainCellularAttribution(t *testing.T) {
 	ledger, cache := smartDegradationTestLedger(t, map[string]float64{"wifi": 5000, "cellular": 50})
 	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	id, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000)
+	id, _, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 10_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cell := ledger.Snapshot("cellular", now, 0); cell.ReservedMB != 0 || cell.Degradation.ReservedMB != 0 {
+	if cell := ledger.Snapshot("cellular", now, 0); cell.ReservedMB != 0 {
 		t.Fatalf("cellular exposure pre-reserved: %+v", cell)
 	}
 	cache.fail = true
-	if err = ledger.Reconcile(context.Background(), id, 27_500_000, true); err == nil {
-		t.Fatal("failed save accepted purpose reconciliation")
+	if err = ledger.Reconcile(context.Background(), id, 55_000_000, true); err == nil {
+		t.Fatal("failed save accepted reconciliation")
 	}
-	if got := ledger.Snapshot("wifi", now, 0); got.Degradation.ReservedMB != 27.5 || got.Degradation.UsedMB != 0 {
-		t.Fatalf("failed save lost purpose headroom: %+v", got)
+	if got := ledger.Snapshot("wifi", now, 0); got.ReservedMB != 5000 || got.UsedMB != 0 {
+		t.Fatalf("failed save lost reserved headroom: %+v", got)
 	}
 	cache.fail = false
-	if err = ledger.Reconcile(context.Background(), id, 27_500_000, true); err != nil {
+	if err = ledger.Reconcile(context.Background(), id, 55_000_000, true); err != nil {
 		t.Fatal(err)
 	}
-	if wifi := ledger.Snapshot("wifi", now, 0); wifi.UsedMB != 0 || wifi.Degradation.UsedMB != 0 || wifi.Degradation.ReservedMB != 0 {
+	if wifi := ledger.Snapshot("wifi", now, 0); wifi.UsedMB != 0 || wifi.ReservedMB != 0 {
 		t.Fatalf("uncertain transfer retained wifi charge: %+v", wifi)
 	}
-	if cell := ledger.Snapshot("cellular", now, 0); cell.UsedMB != 27.5 || cell.Degradation.UsedMB != 27.5 || cell.Degradation.LimitMB != 5 {
-		t.Fatalf("uncertain actual charge capped at cellular allowance: %+v", cell)
+	if cell := ledger.Snapshot("cellular", now, 0); cell.UsedMB != 55 {
+		t.Fatalf("uncertain actual charge was capped at the cellular budget: %+v", cell)
 	}
 	restarted, err := getSmartLedger(&smartLedgerTestCache{data: append([]byte(nil), cache.data...)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	restarted.Register("restart", map[string]float64{"cellular": 50})
-	defer restarted.Unregister("restart")
-	if cell := restarted.Snapshot("cellular", now, 0); cell.Degradation.UsedMB != 27.5 {
-		t.Fatalf("restart lost reattributed purpose charge: %+v", cell)
+	if cell := restarted.Snapshot("cellular", now, 0); cell.UsedMB != 55 {
+		t.Fatalf("restart lost reattributed charge: %+v", cell)
 	}
 }
 
@@ -310,7 +222,7 @@ func TestSmartDegradationLedgerCooldownPersistenceAndPruning(t *testing.T) {
 	if got := restarted.DegradationCooldown("hashed-next"); !got.Equal(until.Add(time.Hour)) {
 		t.Fatalf("clock rollback shortened cooldown: %v", got)
 	}
-	id, _, err := restarted.ReserveDegradation(ctx, "wifi", until.Add(time.Hour), 0, smartDegradationConfirmation, 10_000_000)
+	id, _, err := restarted.ReservePlan(ctx, "wifi", until.Add(time.Hour), 0, 10_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,40 +236,49 @@ func TestSmartDegradationLedgerCooldownPersistenceAndPruning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var status struct {
-		Degradation map[string]float64 `json:"degradation"`
-	}
+	var status map[string]json.RawMessage
 	if err = json.Unmarshal(encoded, &status); err != nil {
 		t.Fatal(err)
 	}
-	if len(status.Degradation) != 3 || status.Degradation["used_mb"] != 0 || status.Degradation["reserved_mb"] != 0 || status.Degradation["limit_mb"] != 500 {
-		t.Fatalf("additive purpose status = %s", encoded)
+	if _, exists := status["degradation"]; exists {
+		t.Fatalf("removed allowance still appears in status: %s", encoded)
 	}
 }
 
-func TestSmartDegradationLedgerUnknownOrphanPurpose(t *testing.T) {
+func TestSmartLedgerOldReservationRecovery(t *testing.T) {
 	for _, test := range []struct {
 		name      string
-		capBytes  int64
+		bytes     int64
+		purpose   string
+		format    string
+		charged   int64
 		wantError bool
 	}{
-		{"unknown_purpose_charged_conservatively", 10_000_001, false},
-		{"invalid_purpose_cap_rejected", 25_000_001, true},
+		{name: "legacy_ordinary", bytes: 20_000_000, charged: 20_000_000},
+		{name: "legacy_confirmation", bytes: 10_000_000, purpose: "degradation_confirmation", charged: 11_000_000},
+		{name: "legacy_unknown_purpose", bytes: 10_000_001, purpose: "unknown-purpose", charged: 11_000_002},
+		{name: "legacy_invalid_cap", bytes: 25_000_001, purpose: "unknown-purpose", wantError: true},
+		{name: "charged_v2", bytes: 5_000_000_000, format: "charged-v2", charged: 5_000_000_000},
+		{name: "charged_marker_overrides_legacy_purpose", bytes: 50_000_000, purpose: "unknown-purpose", format: "charged-v2", charged: 50_000_000},
+		{name: "negative", bytes: -1, wantError: true},
+		{name: "unknown_format", bytes: 1, format: "future", wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			encoded, err := json.Marshal(smartInstallation{Ledger: smartLedgerState{
 				Latest: map[string]string{"wifi": "2026-11-09"},
+				Days:   map[string]int64{"wifi/2026-11-09": 123, "degradation/wifi/2026-11-09": 7},
 				Reservations: map[string]smartReservation{
-					"orphan": {NetworkType: "wifi", Day: "2026-11-09", Bytes: test.capBytes, Purpose: "unknown-purpose"},
+					"orphan": {NetworkType: "wifi", Day: "2026-11-09", Bytes: test.bytes, Purpose: test.purpose, Format: test.format},
 				},
 			}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			ledger, err := getSmartLedger(&smartLedgerTestCache{data: encoded})
+			cache := &smartLedgerTestCache{data: encoded}
+			ledger, err := getSmartLedger(cache)
 			if test.wantError {
 				if err == nil {
-					t.Fatal("invalid orphan cap admitted")
+					t.Fatal("invalid orphan admitted")
 				}
 				return
 			}
@@ -365,58 +286,42 @@ func TestSmartDegradationLedgerUnknownOrphanPurpose(t *testing.T) {
 				t.Fatal(err)
 			}
 			state := ledger.Metadata().Ledger
-			if state.Days["wifi/2026-11-09"] != 11_000_002 || state.Days["degradation/wifi/2026-11-09"] != 11_000_002 || len(state.Reservations) != 0 {
-				t.Fatalf("unknown purpose lost worst-case charge: %+v", state)
+			if state.Days["wifi/2026-11-09"] != 123+test.charged || state.Days["degradation/wifi/2026-11-09"] != 7 || len(state.Reservations) != 0 {
+				t.Fatalf("orphan lost its original accounting meaning: %+v", state)
+			}
+			restarted, err := getSmartLedger(&smartLedgerTestCache{data: append([]byte(nil), cache.data...)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := restarted.Metadata().Ledger.Days["wifi/2026-11-09"]; got != 123+test.charged {
+				t.Fatalf("second restart charged the orphan twice: %d", got)
 			}
 		})
 	}
 }
 
-func TestSmartDegradationChallengerRequiresTargetSizedCap(t *testing.T) {
-	ledger, _ := smartDegradationTestLedger(t, map[string]float64{"wifi": 1000})
-	now := smartDegradationTestClock().Now()
-	day := now.Format("2006-01-02")
-	ledger.mu.Lock()
-	ledger.state.Days[smartDegradationDayKey("wifi", day)] = 98_790_000
-	ledger.mu.Unlock()
-	if _, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000); !errors.Is(err, errSmartDegradationBudget) {
-		t.Fatalf("unmeasurable challenger admitted: %v", err)
+func TestSmartLedgerAccountingPanicBeyondEstimateRecoversFullReservation(t *testing.T) {
+	cache := new(smartPanicMetadataCache)
+	ledger, err := getSmartLedger(cache)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if state := ledger.Metadata().Ledger; len(state.Starts) != 0 || len(state.Reservations) != 0 {
-		t.Fatal("rejected challenger consumed hourly attempt")
+	ledger.Register("panic", map[string]float64{"wifi": 300})
+	defer ledger.Unregister("panic")
+	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	id, reserved, err := ledger.ReservePlan(context.Background(), "wifi", now, 0, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestSmartDegradationConfirmationRequiresPostTestChallengerCap(t *testing.T) {
-	for _, test := range []struct {
-		remaining int64
-		wantErr   error
-	}{
-		{60_000_000, errSmartDegradationBudget},
-		{61_000_000, nil},
-	} {
-		ledger, _ := smartDegradationTestLedger(t, map[string]float64{"wifi": 1000})
-		clock := smartDegradationTestClock()
-		now := clock.Now()
-		ledger.mu.Lock()
-		ledger.state.Days["wifi/"+now.Format("2006-01-02")] = 1_000_000_000 - test.remaining
-		ledger.mu.Unlock()
-		id, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationConfirmation, 10_000_000)
-		if !errors.Is(err, test.wantErr) {
-			t.Fatalf("remaining=%d: confirmation error=%v want=%v", test.remaining, err, test.wantErr)
-		}
-		if err == nil {
-			if err = ledger.Reconcile(context.Background(), id, 11_000_000, false); err != nil {
-				t.Fatal(err)
-			}
-			clock.Advance(time.Second)
-			id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", clock.Now(), 0, smartDegradationChallenger, 10_000_000)
-			if err != nil || capBytes < 10_000_000 {
-				t.Fatalf("accepted episode cannot measure challenger: cap=%d err=%v", capBytes, err)
-			}
-			if err = ledger.Reconcile(context.Background(), id, 0, false); err != nil {
-				t.Fatal(err)
-			}
-		}
+	cache.panicSave.Store(true)
+	if err = ledger.Reconcile(context.Background(), id, 2_200_000, false); !errors.Is(err, errSmartContained) {
+		t.Fatalf("accounting panic = %v", err)
+	}
+	restarted, err := getSmartLedger(&smartLedgerTestCache{data: append([]byte(nil), cache.data...)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := restarted.Metadata().Ledger; state.Days["wifi/2026-11-09"] != reserved || len(state.Reservations) != 0 {
+		t.Fatalf("panic beyond the admission estimate lost its full reservation: %+v", state)
 	}
 }

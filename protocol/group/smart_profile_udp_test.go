@@ -29,7 +29,14 @@ func smartCompleteProfileUDPRefresh(t *testing.T, s *Smart, job smartJob, now ti
 		smartFakeOutbound: &smartFakeOutbound{tag: job.member.tag},
 		dialer:            &smartProbeTestDialer{strictUDP: true},
 	}
-	result := s.runOperation(job)
+	var result smartResult
+	if job.kind == "udp" {
+		// Burst timing has a dedicated fake-network test; pool tests need one completion.
+		result = smartResult{member: job.member, kind: job.kind, udpRTTs: []float64{1, 1, 1, 1, 1}, udpBursts: 1, udpBurstSizes: []int{5},
+			generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration}
+	} else {
+		result = s.runOperation(job)
+	}
 	if result.err != nil {
 		t.Fatalf("UDP refresh failed: %v", result.err)
 	}

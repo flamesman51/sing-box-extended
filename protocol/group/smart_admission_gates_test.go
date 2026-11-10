@@ -57,9 +57,12 @@ func TestSmartDelayedAdmissionRechecksActiveTestGates(t *testing.T) {
 			}
 			platform.power.Store(false)
 			ledger.Register(s.Tag(), map[string]float64{"wifi": 100})
-			next, _, err := ledger.Reserve(context.Background(), "wifi", clock.Now().Add(time.Minute), 0)
+			next, charged, err := ledger.ReservePlan(context.Background(), "wifi", clock.Now().Add(time.Minute), 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if charged != 100_000_000 {
+				t.Fatalf("next admission reserved %d charged bytes, want full 100 MB remainder", charged)
 			}
 			if err = ledger.Reconcile(context.Background(), next, 0, false); err != nil {
 				t.Fatal(err)

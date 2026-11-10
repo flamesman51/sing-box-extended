@@ -111,7 +111,7 @@ func TestSmartExistingFieldsDecodeBeforePreferenceResolution(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				for _, metadata := range []string{"heartbeatIntervalSet", "standbyIntervalSet", "backgroundIntervalSet", "timeoutSet", "targetMbpsSet", "quicPolicySet"} {
+				for _, metadata := range []string{"heartbeatIntervalSet", "standbyIntervalSet", "backgroundIntervalSet", "timeoutSet", "targetMbpsSet", "streamsSet", "windowSet", "warmupSet", "uploadWindowSet", "uploadWarmupSet", "quicPolicySet"} {
 					if strings.Contains(string(encoded), metadata) {
 						t.Fatalf("presence metadata was serialized: %s", encoded)
 					}
@@ -152,5 +152,119 @@ func TestSmartExistingPlainFieldsRemainSourceCompatible(t *testing.T) {
 	}
 	if roundTrip.Probe.HeartbeatInterval != 1 || roundTrip.Probe.StandbyInterval != 2 || roundTrip.Probe.BackgroundInterval != 3 || roundTrip.Throughput.TargetMbps != 4 || roundTrip.UDP.QUICPolicy != "off" {
 		t.Fatalf("existing plain fields changed: %#v", roundTrip)
+	}
+}
+
+func TestSmartMeasurementFieldPresence(t *testing.T) {
+	for _, decode := range []struct {
+		name string
+		run  func([]byte, any) error
+	}{
+		{"standard", json.Unmarshal},
+		{"strict", singjson.UnmarshalDisallowUnknownFields},
+		{"context", func(content []byte, value any) error {
+			return singjson.UnmarshalContextDisallowUnknownFields(context.Background(), content, value)
+		}},
+	} {
+		t.Run(decode.name, func(t *testing.T) {
+			var options SmartOutboundOptions
+			if err := decode.run([]byte(`{"throughput":{"streams":0,"window":"0s","warmup":"0s","upload":false,"upload_window":"0s","upload_warmup":"0s"}}`), &options); err != nil {
+				t.Fatal(err)
+			}
+			throughput := options.Throughput
+			if !throughput.streamsSet || !throughput.windowSet || !throughput.warmupSet || !throughput.uploadWindowSet || !throughput.uploadWarmupSet || throughput.Upload == nil || *throughput.Upload {
+				t.Fatalf("explicit zero or false lost: %#v", throughput)
+			}
+			if !options.HasProfileOwnedFields() {
+				t.Fatal("explicit streams did not mark the policy customized")
+			}
+			if err := throughput.ValidateMeasurementFields(false); err != nil {
+				t.Fatalf("legacy zero defaults rejected: %v", err)
+			}
+			if err := throughput.ValidateMeasurementFields(true); err == nil {
+				t.Fatal("profile accepted explicit zero")
+			}
+			if err := decode.run([]byte(`{"throughput":{"streams":2,"window":"5s","warmup":"1s","upload":false,"upload_window":"5s","upload_warmup":"1s"}}`), &options); err != nil {
+				t.Fatal(err)
+			}
+			if err := options.ValidateProfileFields(); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(encoded), `"upload":false`) {
+				t.Fatalf("upload false lost: %s", encoded)
+			}
+			var roundTrip SmartOutboundOptions
+			if err := decode.run(encoded, &roundTrip); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(options, roundTrip) {
+				t.Fatalf("measurement round trip changed options: %#v != %#v", options, roundTrip)
+			}
+			options = SmartOutboundOptions{}
+			if err := decode.run([]byte(`{}`), &options); err != nil {
+				t.Fatal(err)
+			}
+			if options.HasProfileOwnedFields() || !reflect.DeepEqual(options.Throughput, SmartThroughputOptions{}) {
+				t.Fatalf("absent fields gained presence: %#v", options.Throughput)
+			}
+		})
+	}
+}
+
+func TestSmartMeasurementFieldBounds(t *testing.T) {
+	for _, field := range []string{
+		`"streams":-1`, `"window":"-1s"`, `"window":"4.999s"`, `"warmup":"999ms"`,
+		`"upload_window":"4.999s"`, `"upload_warmup":"999ms"`,
+	} {
+		t.Run(field, func(t *testing.T) {
+			var throughput SmartThroughputOptions
+			if err := json.Unmarshal([]byte(`{`+field+`}`), &throughput); err != nil {
+				t.Fatal(err)
+			}
+			for _, profile := range []bool{false, true} {
+				if err := throughput.ValidateMeasurementFields(profile); err == nil {
+					t.Fatalf("accepted %s with profile=%v", field, profile)
+				}
+			}
+		})
+	}
+	for _, field := range []string{`"streams":0`, `"window":"0s"`, `"warmup":"0s"`, `"upload_window":"0s"`, `"upload_warmup":"0s"`} {
+		var throughput SmartThroughputOptions
+		if err := json.Unmarshal([]byte(`{`+field+`}`), &throughput); err != nil {
+			t.Fatal(err)
+		}
+		if err := throughput.ValidateMeasurementFields(false); err != nil {
+			t.Fatalf("legacy zero rejected: %s: %v", field, err)
+		}
+		if err := throughput.ValidateMeasurementFields(true); err == nil {
+			t.Fatalf("explicit zero accepted: %s", field)
+		}
+	}
+}
+
+func TestSmartPolicyReplacesStreamsOnly(t *testing.T) {
+	var options, policy SmartOutboundOptions
+	if err := json.Unmarshal([]byte(`{"throughput":{"streams":0,"window":"5s","warmup":"1s","upload":false,"upload_window":"6s","upload_warmup":"2s"}}`), &options); err != nil {
+		t.Fatal(err)
+	}
+	before := options.Throughput
+	options.ApplySmartPolicy(&policy)
+	if options.Throughput.Streams != 0 || options.Throughput.streamsSet || options.HasProfileOwnedFields() {
+		t.Fatal("omitted policy streams did not reset value and presence")
+	}
+	before.Streams, before.streamsSet = 0, false
+	if !reflect.DeepEqual(options.Throughput, before) {
+		t.Fatal("policy replacement changed non-policy measurement settings")
+	}
+	if err := json.Unmarshal([]byte(`{"throughput":{"streams":3}}`), &policy); err != nil {
+		t.Fatal(err)
+	}
+	options.ApplySmartPolicy(&policy)
+	if options.Throughput.Streams != 3 || !options.Throughput.streamsSet || !options.HasProfileOwnedFields() {
+		t.Fatal("policy streams value or presence lost")
 	}
 }

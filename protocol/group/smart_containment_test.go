@@ -144,7 +144,7 @@ func TestSmartContainedThroughputSettlesReservation(t *testing.T) {
 			}
 			ledger.Register(s.Tag(), map[string]float64{"wifi": 100})
 			s.ledger = ledger
-			id, capBytes, err := ledger.Reserve(s.ctx, "wifi", clock.Now(), 0)
+			id, capBytes, err := ledger.ReservePlan(s.ctx, "wifi", clock.Now(), 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -462,11 +462,11 @@ func TestSmartLedgerBackgroundPanicsReleaseOperations(t *testing.T) {
 	ledger.Register(s.Tag(), map[string]float64{"wifi": 100})
 	ctx := context.WithValue(s.ctx, smartContainmentKey{}, s)
 	cache.panicSave.Store(true)
-	if _, _, err = ledger.Reserve(ctx, "wifi", clock.Now(), 0); !errors.Is(err, errSmartContained) {
+	if _, _, err = ledger.ReservePlan(ctx, "wifi", clock.Now(), 0, 1_000_000); !errors.Is(err, errSmartContained) {
 		t.Fatalf("admission panic escaped: %v", err)
 	}
 	cache.panicSave.Store(false)
-	id, _, err := ledger.Reserve(ctx, "wifi", clock.Now(), 0)
+	id, _, err := ledger.ReservePlan(ctx, "wifi", clock.Now(), 0, 1_000_000)
 	if err != nil {
 		t.Fatalf("admission operation remained locked: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestSmartLedgerBackgroundPanicsReleaseOperations(t *testing.T) {
 		t.Fatalf("failed accounting lost reservation: %+v", budget)
 	}
 	cache.panicSave.Store(false)
-	next, _, err := ledger.Reserve(ctx, "wifi", clock.Now(), 0)
+	next, _, err := ledger.ReservePlan(ctx, "wifi", clock.Now(), 0, 1_000_000)
 	if err != nil {
 		t.Fatalf("accounting operation remained locked: %v", err)
 	}
@@ -538,7 +538,7 @@ func TestSmartAccountingHookPanicLeavesRetryableSettlement(t *testing.T) {
 			ledger.Register(s.Tag(), map[string]float64{"wifi": 100})
 			ledger.Register("other-group", map[string]float64{"wifi": 100})
 			defer ledger.Unregister("other-group")
-			id, capBytes, err := ledger.Reserve(s.ctx, "wifi", clock.Now(), 0)
+			id, capBytes, err := ledger.ReservePlan(s.ctx, "wifi", clock.Now(), 0, 1_000_000)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -560,7 +560,11 @@ func TestSmartAccountingHookPanicLeavesRetryableSettlement(t *testing.T) {
 			if budget := ledger.Snapshot("wifi", clock.Now(), 0); budget.ReservedMB == 0 || budget.UsedMB != 0 {
 				t.Fatalf("accounting panic lost durable reservation: %+v", budget)
 			}
-			next, _, err := ledger.Reserve(context.Background(), "wifi", clock.Now(), 0)
+			if unknown {
+				ledger.Register(s.Tag(), map[string]float64{"wifi": 200})
+				ledger.Register("other-group", map[string]float64{"wifi": 200})
+			}
+			next, _, err := ledger.ReservePlan(context.Background(), "wifi", clock.Now(), 0, 1_000_000)
 			if err != nil {
 				t.Fatalf("accounting panic left shared throughput admission busy: %v", err)
 			}

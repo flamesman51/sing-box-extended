@@ -20,28 +20,20 @@ import (
 )
 
 var (
-	errSmartTestsDisabled     = errors.New("smart active tests disabled")
-	errSmartBudget            = errors.New("smart daily budget exhausted")
-	errSmartDegradationBudget = errors.New("smart degradation allowance exhausted")
-	errSmartTestBusy          = errors.New("smart throughput test already running")
-	errSmartTestRate          = errors.New("smart throughput hourly limit reached")
+	errSmartTestsDisabled = errors.New("smart active tests disabled")
+	errSmartBudget        = errors.New("smart daily budget exhausted")
+	errSmartTestBusy      = errors.New("smart throughput test already running")
+	errSmartTestRate      = errors.New("smart throughput hourly limit reached")
 )
 
 type smartBudget struct {
-	NetworkType string                 `json:"network_type"`
-	Day         string                 `json:"day"`
-	DayEndsAt   time.Time              `json:"day_ends_at"`
-	UsedMB      float64                `json:"used_mb"`
-	ReservedMB  float64                `json:"reserved_mb"`
-	LimitMB     float64                `json:"limit_mb"`
-	ActiveTests bool                   `json:"active_tests"`
-	Degradation smartDegradationBudget `json:"degradation"`
-}
-
-type smartDegradationBudget struct {
-	UsedMB     float64 `json:"used_mb"`
-	ReservedMB float64 `json:"reserved_mb"`
-	LimitMB    float64 `json:"limit_mb"`
+	NetworkType string    `json:"network_type"`
+	Day         string    `json:"day"`
+	DayEndsAt   time.Time `json:"day_ends_at"`
+	UsedMB      float64   `json:"used_mb"`
+	ReservedMB  float64   `json:"reserved_mb"`
+	LimitMB     float64   `json:"limit_mb"`
+	ActiveTests bool      `json:"active_tests"`
 }
 
 type smartInstallation struct {
@@ -67,6 +59,7 @@ type smartReservation struct {
 	Day         string `json:"day"`
 	Bytes       int64  `json:"bytes"`
 	Purpose     string `json:"purpose,omitempty"`
+	Format      string `json:"format,omitempty"`
 }
 
 type smartReconciliation struct {
@@ -231,12 +224,17 @@ func (l *smartLedger) initialize() error {
 			return errors.New("negative smart reservation")
 		}
 		charged := reservation.Bytes
-		if reservation.Purpose != "" {
-			if reservation.Bytes > 25_000_000 {
-				return errors.New("invalid smart degradation reservation")
+		switch reservation.Format {
+		case "":
+			if reservation.Purpose != "" {
+				if reservation.Bytes > 25_000_000 {
+					return errors.New("invalid legacy smart degradation reservation")
+				}
+				charged += (charged + 9) / 10
 			}
-			charged = smartDegradationWorstCase(charged)
-			l.state.Days[smartDegradationDayKey(reservation.NetworkType, reservation.Day)] += charged
+		case "charged-v2":
+		default:
+			return errors.New("unknown smart reservation format")
 		}
 		l.state.Days[reservation.NetworkType+"/"+reservation.Day] += charged
 	}
@@ -317,35 +315,18 @@ func smartBudgetDayEnd(day string, offset int) time.Time {
 	return start.AddDate(0, 0, 1).Add(-time.Duration(offset) * time.Second)
 }
 
-func smartDegradationDayKey(networkType, day string) string {
-	return "degradation/" + networkType + "/" + day
-}
-
-func smartDegradationWorstCase(capBytes int64) int64 {
-	return capBytes + (capBytes+9)/10
-}
-
 func (l *smartLedger) snapshotLocked(networkType, day string) smartBudget {
 	limit := l.limitLocked(networkType)
-	var reserved, degradationReserved int64
+	var reserved int64
 	for _, reservation := range l.state.Reservations {
 		if reservation.NetworkType == networkType && reservation.Day == day {
-			charged := reservation.Bytes
-			if reservation.Purpose != "" {
-				charged = smartDegradationWorstCase(charged)
-				degradationReserved += charged
-			}
-			reserved += charged
+			reserved += reservation.Bytes
 		}
 	}
 	return smartBudget{
 		NetworkType: networkType, Day: day,
 		UsedMB:     float64(l.state.Days[networkType+"/"+day]) / 1_000_000,
 		ReservedMB: float64(reserved) / 1_000_000, LimitMB: limit, ActiveTests: l.cache != nil && limit > 0,
-		Degradation: smartDegradationBudget{
-			UsedMB:     float64(l.state.Days[smartDegradationDayKey(networkType, day)]) / 1_000_000,
-			ReservedMB: float64(degradationReserved) / 1_000_000, LimitMB: limit * 0.1,
-		},
 	}
 }
 
@@ -360,20 +341,12 @@ func (l *smartLedger) Snapshot(networkType string, now time.Time, offset int) sm
 	return snapshot
 }
 
-func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.Time, offset int) (string, int64, error) {
-	return l.reservePurpose(ctx, networkType, now, offset, "", 0)
-}
-
-func (l *smartLedger) ReserveDegradation(ctx context.Context, networkType string, now time.Time, offset int, purpose string, confirmationCap int64) (id string, capBytes int64, err error) {
-	if purpose != smartDegradationConfirmation && purpose != smartDegradationChallenger {
-		return "", 0, errors.New("invalid smart degradation purpose")
-	}
-	return l.reservePurpose(ctx, networkType, now, offset, purpose, confirmationCap)
-}
-
-func (l *smartLedger) reservePurpose(ctx context.Context, networkType string, now time.Time, offset int, purpose string, confirmationCap int64) (string, int64, error) {
+func (l *smartLedger) ReservePlan(ctx context.Context, networkType string, now time.Time, offset int, estimateBytes int64) (string, int64, error) {
 	if err := ctx.Err(); err != nil {
 		return "", 0, err
+	}
+	if estimateBytes < 0 {
+		return "", 0, errors.New("negative smart plan estimate")
 	}
 	if platform := service.FromContext[adapter.PlatformInterface](ctx); platform != nil && platform.IsPowerSaveMode() {
 		return "", 0, errSmartTestsDisabled
@@ -402,7 +375,7 @@ func (l *smartLedger) reservePurpose(ctx context.Context, networkType string, no
 		defer l.releaseOperation()
 		id, bytes, err := func() (id string, bytes int64, err error) {
 			defer smartContextRecover(ctx, "ledger-reserve", &err)
-			return l.reserve(ctx, networkType, now, offset, purpose, confirmationCap)
+			return l.reserve(ctx, networkType, now, offset, estimateBytes)
 		}()
 		select {
 		case result <- admission{id: id, bytes: bytes, err: err}:
@@ -435,7 +408,7 @@ func (l *smartLedger) reservePurpose(ctx context.Context, networkType string, no
 	}
 }
 
-func (l *smartLedger) reserve(ctx context.Context, networkType string, now time.Time, offset int, purpose string, confirmationCap int64) (string, int64, error) {
+func (l *smartLedger) reserve(ctx context.Context, networkType string, now time.Time, offset int, estimateBytes int64) (string, int64, error) {
 	if err := ctx.Err(); err != nil {
 		return "", 0, err
 	}
@@ -448,7 +421,7 @@ func (l *smartLedger) reserve(ctx context.Context, networkType string, now time.
 	id, capBytes, state, installation, err := func() (string, int64, smartLedgerState, smartInstallation, error) {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		id, capBytes, state, err := l.reservationLocked(networkType, now, offset, purpose, confirmationCap)
+		id, capBytes, state, err := l.reservationLocked(networkType, now, offset, estimateBytes)
 		return id, capBytes, state, l.installation, err
 	}()
 	if err != nil {
@@ -463,7 +436,7 @@ func (l *smartLedger) reserve(ctx context.Context, networkType string, now time.
 	return id, capBytes, nil
 }
 
-func (l *smartLedger) reservationLocked(networkType string, now time.Time, offset int, purpose string, confirmationCap int64) (string, int64, smartLedgerState, error) {
+func (l *smartLedger) reservationLocked(networkType string, now time.Time, offset int, estimateBytes int64) (string, int64, smartLedgerState, error) {
 	if l.cache == nil {
 		return "", 0, smartLedgerState{}, errSmartTestsDisabled
 	}
@@ -476,35 +449,14 @@ func (l *smartLedger) reservationLocked(networkType string, now time.Time, offse
 	if !snapshot.ActiveTests {
 		return "", 0, smartLedgerState{}, errSmartTestsDisabled
 	}
-	remaining := (snapshot.LimitMB - snapshot.UsedMB - snapshot.ReservedMB) * 1_000_000
-	capBytes := int64(min(25_000_000, math.Max(0, math.Floor(remaining*0.2))))
-	if capBytes < 1_100_000 {
-		return "", 0, smartLedgerState{}, errSmartBudget
+	limit := math.Floor(snapshot.LimitMB * 1_000_000)
+	limitBytes := int64(math.MaxInt64)
+	if limit < float64(math.MaxInt64) {
+		limitBytes = int64(limit)
 	}
-	if purpose != "" {
-		remainingAllowance := math.Floor(l.limitLocked(networkType)*100_000) - float64(l.state.Days[smartDegradationDayKey(networkType, day)])
-		allowance := int64(min(float64(smartDegradationWorstCase(3*25_000_000)), math.Max(0, remainingAllowance)))
-		if confirmationCap < 1_100_000 || confirmationCap > 25_000_000 {
-			return "", 0, smartLedgerState{}, errSmartDegradationBudget
-		}
-		// A harmless confirmation must leave enough allowance for another full pair.
-		if purpose == smartDegradationConfirmation {
-			// The confirmation must leave an ordinary cap large enough for a measurable challenger.
-			postConfirmationRemaining := max(0, remaining-float64(smartDegradationWorstCase(confirmationCap)))
-			postConfirmationCap := int64(min(25_000_000, math.Floor(postConfirmationRemaining*0.2)))
-			if postConfirmationCap < confirmationCap {
-				return "", 0, smartLedgerState{}, errSmartDegradationBudget
-			}
-			if confirmationCap < 1_100_000 || confirmationCap > capBytes || allowance < smartDegradationWorstCase(2*confirmationCap+capBytes) {
-				return "", 0, smartLedgerState{}, errSmartDegradationBudget
-			}
-			capBytes = confirmationCap
-		} else {
-			if allowance < smartDegradationWorstCase(confirmationCap) || capBytes < confirmationCap {
-				return "", 0, smartLedgerState{}, errSmartDegradationBudget
-			}
-			capBytes = min(capBytes, allowance/11*10+allowance%11*10/11)
-		}
+	remaining := max(0, limitBytes-l.state.Days[networkType+"/"+day])
+	if remaining < estimateBytes {
+		return "", 0, smartLedgerState{}, errSmartBudget
 	}
 	state := l.cloneStateLocked()
 	state.Latest[networkType] = day
@@ -512,7 +464,7 @@ func (l *smartLedger) reservationLocked(networkType string, now time.Time, offse
 	state.LatestTime = nowUnix
 	maps.DeleteFunc(state.DegradationCooldowns, func(_ string, until time.Time) bool { return !until.After(time.Unix(nowUnix, 0)) })
 	state.Starts = slices.DeleteFunc(state.Starts, func(at int64) bool { return at <= nowUnix-3600 })
-	if len(state.Starts) >= 4 {
+	if len(state.Starts) >= 30 {
 		return "", 0, smartLedgerState{}, errSmartTestRate
 	}
 	var random [16]byte
@@ -520,9 +472,9 @@ func (l *smartLedger) reservationLocked(networkType string, now time.Time, offse
 		return "", 0, smartLedgerState{}, err
 	}
 	id := hex.EncodeToString(random[:])
-	state.Reservations[id] = smartReservation{NetworkType: networkType, Day: day, Bytes: capBytes, Purpose: purpose}
+	state.Reservations[id] = smartReservation{NetworkType: networkType, Day: day, Bytes: remaining, Format: "charged-v2"}
 	state.Starts = append(state.Starts, nowUnix)
-	return id, capBytes, state, nil
+	return id, remaining, state, nil
 }
 
 func (l *smartLedger) Reconcile(ctx context.Context, id string, bytes int64, uncertain bool) error {
@@ -594,9 +546,6 @@ func (l *smartLedger) reconcilePending() error {
 	if pending.bytes != 0 {
 		key := reservation.NetworkType + "/" + reservation.Day
 		state.Days[key] += pending.bytes
-		if reservation.Purpose != "" {
-			state.Days[smartDegradationDayKey(reservation.NetworkType, reservation.Day)] += pending.bytes
-		}
 	}
 	state.Latest[reservation.NetworkType] = max(state.Latest[reservation.NetworkType], reservation.Day)
 	l.mu.Unlock()

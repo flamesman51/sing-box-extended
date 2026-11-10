@@ -17,11 +17,7 @@ func (s *Smart) profileEngine() bool { return s.preference.profile != "" && !s.p
 
 func smartFreshDownload(member *smartMember, now time.Time) (float64, bool) {
 	value := member.throughput
-	ttl := 24 * time.Hour
-	if value.Source == "passive" {
-		ttl = 6 * time.Hour
-	}
-	return value.Download, !value.At.IsZero() && now.Sub(value.At) < ttl && smartFinite(value.Download) && value.Download >= 0
+	return value.Download, value.Source == "active" && !value.At.IsZero() && now.Sub(value.At) < 24*time.Hour && smartFinite(value.Download) && value.Download >= 0
 }
 
 func smartProfileRTTQuantiles(values []float64) (p50, p90 float64) {
@@ -36,15 +32,24 @@ func smartProfileRTTQuantiles(values []float64) (p50, p90 float64) {
 }
 
 func (s *Smart) meetsFloorLocked(member *smartMember, now time.Time) bool {
-	download, fresh := smartFreshDownload(member, now)
-	if !fresh {
+	s.clearRecoveredFloorLocked(member, now)
+	state := member.floorState
+	at := member.throughput.At
+	if result := member.throughput.DownloadResult; result.Valid {
+		at = result.At
+	}
+	if state.Kind == "proven" && now.Sub(state.At) < 24*time.Hour && state.Target >= s.targetMbps && !at.After(state.At) {
+		return true
+	}
+	if state.Kind == "revoked" {
 		return false
 	}
+	download, fresh := s.effectiveDownloadLocked(member, now)
 	threshold := s.targetMbps
-	if member == s.primary && !member.floorDegraded {
+	if member == s.primary {
 		threshold *= 1 - s.preference.hysteresis
 	}
-	return download >= threshold
+	return fresh && download >= threshold
 }
 
 func (s *Smart) rankProfileMemberLocked(member *smartMember, now time.Time) {
@@ -61,7 +66,7 @@ func (s *Smart) rankProfileMemberLocked(member *smartMember, now time.Time) {
 	member.rankThroughput = s.throughputClass(member, now)
 	member.rankFloor = s.meetsFloorLocked(member, now)
 	member.rankDownload = math.MaxInt
-	if download, fresh := smartFreshDownload(member, now); fresh {
+	if download, fresh := s.effectiveDownloadLocked(member, now); fresh {
 		member.rankDownload = 1 << 30
 		if download > 0 {
 			member.rankDownload = -int(math.Floor(math.Log(download) / math.Log(1.25)))
@@ -112,6 +117,14 @@ func (s *Smart) profileCriterionCompareLocked(a, b *smartMember, criterion strin
 		return cmp.Compare(a.rankDownload, b.rankDownload)
 	case "throughput":
 		return cmp.Compare(a.rankThroughput, b.rankThroughput)
+	case "upload":
+		aValue, aFresh := smartFreshUpload(a, now)
+		bValue, bFresh := smartFreshUpload(b, now)
+		return cmp.Compare(smartSpeedBucket(aValue, aFresh), smartSpeedBucket(bValue, bFresh))
+	case "rtt", "jitter":
+		var aBuffer, bBuffer [64]float64
+		return cmp.Compare(smartRTTBucket(smartFreshRTTSamples(a, now, aBuffer[:]), criterion),
+			smartRTTBucket(smartFreshRTTSamples(b, now, bBuffer[:]), criterion))
 	case "latency":
 		return cmp.Compare(a.rankLatency, b.rankLatency)
 	case "rtt_spread":
@@ -192,9 +205,16 @@ func (s *Smart) betterLocked(candidate, primary *smartMember, now time.Time) (bo
 		return false, criterion
 	}
 	if criterion == "download" || criterion == "speed_floor" && !candidate.rankFloor && !primary.rankFloor {
-		candidateDownload, candidateFresh := smartFreshDownload(candidate, now)
-		primaryDownload, primaryFresh := smartFreshDownload(primary, now)
+		candidateDownload, candidateFresh := s.effectiveDownloadLocked(candidate, now)
+		primaryDownload, primaryFresh := s.effectiveDownloadLocked(primary, now)
 		if !candidateFresh || primaryFresh && candidateDownload < s.preference.speedMargin*primaryDownload {
+			return false, criterion
+		}
+	}
+	if criterion == "upload" {
+		candidateUpload, candidateFresh := smartFreshUpload(candidate, now)
+		primaryUpload, primaryFresh := smartFreshUpload(primary, now)
+		if !candidateFresh || primaryFresh && candidateUpload < s.preference.speedMargin*primaryUpload {
 			return false, criterion
 		}
 	}
@@ -211,16 +231,27 @@ func (s *Smart) safeToProbeLocked(candidate, primary *smartMember, now time.Time
 func smartCriterionObservation(member *smartMember, criterion string) time.Time {
 	switch criterion {
 	case "speed_floor", "download", "throughput":
+		if result := member.throughput.DownloadResult; result.Valid {
+			return result.At
+		}
 		return member.throughput.At
+	case "upload":
+		return member.throughput.UploadResult.At
+	case "rtt":
+		return member.udpObservation.At
+	case "jitter":
+		return member.jitterObservation.At
 	case "udp":
 		return member.udp.at
 	case "quic":
 		return member.udp443.at
-	default:
+	case "stability", "outages", "latency", "rtt_spread":
 		if member.lastFail.After(member.lastOK) {
 			return member.lastFail
 		}
 		return member.lastOK
+	default:
+		return time.Time{}
 	}
 }
 
@@ -239,6 +270,9 @@ func (s *Smart) resetProfileImprovementLocked() {
 }
 
 func (s *Smart) chooseProfileImprovementLocked(now time.Time) {
+	if s.primary == nil || s.ordinaryImprovementSuppressedLocked() {
+		return
+	}
 	if s.preference.tierRestore > 0 {
 		for _, candidate := range s.members {
 			if candidate != s.primary && candidate.state == "healthy" && candidate.tier < s.primary.tier && now.Sub(candidate.healthySince) >= s.preference.tierRestore {
@@ -271,9 +305,9 @@ func (s *Smart) chooseProfileImprovementLocked(now time.Time) {
 		s.resetProfileImprovementLocked()
 		s.improvementCandidate = winner
 		winner.improvementCriterion = criterion
-		winner.improvementAt = observation
-		winner.improvementObservations = 1
-	} else if observation.After(winner.improvementAt) && observation.Sub(winner.improvementAt) >= s.preference.confirmationInterval {
+	}
+	if !observation.IsZero() && s.profileObservationBetterLocked(winner, s.primary, criterion, now) &&
+		(winner.improvementObservations == 0 || observation.After(winner.improvementAt) && observation.Sub(winner.improvementAt) >= s.preference.confirmationInterval) {
 		winner.improvementAt = observation
 		winner.improvementObservations++
 	}
@@ -289,7 +323,11 @@ func (s *Smart) queueProfileUDPLocked(now time.Time, discovery bool) {
 		return
 	}
 	for index, criterion := range []string{"udp", "quic"} {
-		if discovery && criterion != "quic" || !discovery && !slices.Contains(s.preference.rank, criterion) {
+		active := slices.Contains(s.preference.rank, criterion)
+		if criterion == "udp" {
+			active = active || slices.Contains(s.preference.rank, "rtt") || slices.Contains(s.preference.rank, "jitter")
+		}
+		if discovery && criterion != "quic" || !discovery && !active {
 			continue
 		}
 		interval, kind := 20*time.Minute, "udp"

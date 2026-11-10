@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -92,7 +96,7 @@ func TestSmartImprovementConfirmationScheduledWithinDwell(t *testing.T) {
 		if err := s.ledger.Reconcile(s.ctx, job.reservation, 1_000_000, false); err != nil {
 			t.Fatal(err)
 		}
-		s.applyResultLocked(smartResult{member: candidate, kind: "throughput", purpose: job.purpose, download: 20, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration, primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
+		s.applyResultLocked(smartResult{member: candidate, kind: "throughput", purpose: job.purpose, measurement: smartMeasurementResult{Download: smartDirectionResult{Value: 20, Valid: true, At: clock.Now()}}, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration, primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
 		if candidate.improvementObservations != observations || s.primary != primary {
 			t.Fatalf("observations=%d primary=%s before dwell", candidate.improvementObservations, s.primary.tag)
 		}
@@ -115,11 +119,14 @@ func TestSmartImprovementConfirmationDenialPreservesObservations(t *testing.T) {
 				expected = errSmartBudget
 			case "rate":
 				s.ledger.mu.Lock()
-				s.ledger.state.Starts = []int64{clock.Now().Unix(), clock.Now().Unix(), clock.Now().Unix(), clock.Now().Unix()}
+				s.ledger.state.Starts = make([]int64, 30)
+				for index := range s.ledger.state.Starts {
+					s.ledger.state.Starts[index] = clock.Now().Unix()
+				}
 				s.ledger.mu.Unlock()
 				expected = errSmartTestRate
 			case "busy":
-				id, _, err := s.ledger.Reserve(s.ctx, "wifi", clock.Now(), 0)
+				id, _, err := s.ledger.ReservePlan(s.ctx, "wifi", clock.Now(), 0, 1_000_000)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -240,12 +247,13 @@ func TestSmartImprovementConfirmationAdmissionDeadline(t *testing.T) {
 		}
 		admission := s.admission
 		deadline, ok := admission.job.ctx.Deadline()
-		if !ok || deadline.Sub(began) != 30*time.Second {
-			t.Fatalf("confirmation deadline = %v, present=%v; want 30 seconds from admission", deadline, ok)
+		duration := admission.job.plan.Deadline()
+		if !ok || deadline.Sub(began) != duration {
+			t.Fatalf("confirmation deadline = %v, present=%v; want %s from admission", deadline, ok, duration)
 		}
 		smartLedgerWait(t, blocked.entered)
-		time.Sleep(29 * time.Second)
-		clock.Advance(29 * time.Second)
+		time.Sleep(duration - time.Second)
+		clock.Advance(duration - time.Second)
 		synctest.Wait()
 		if admission.job.ctx.Err() != nil {
 			t.Fatal("confirmation expired before its admission deadline")
@@ -293,11 +301,12 @@ func TestSmartImprovementConfirmationAdmissionDeadline(t *testing.T) {
 			t.Fatal("later confirmation did not retain its own live context and observations")
 		}
 		job := s.pending[0]
-		if deadline, ok = job.ctx.Deadline(); !ok || time.Until(deadline) != 25*time.Second {
+		remaining := duration - 5*time.Second
+		if deadline, ok = job.ctx.Deadline(); !ok || time.Until(deadline) != remaining {
 			t.Fatal("queued confirmation lost its original admission deadline")
 		}
-		time.Sleep(25 * time.Second)
-		clock.Advance(25 * time.Second)
+		time.Sleep(remaining)
+		clock.Advance(remaining)
 		synctest.Wait()
 		if !errors.Is(job.ctx.Err(), context.DeadlineExceeded) {
 			t.Fatal("queued confirmation outlived its admission deadline")
@@ -428,7 +437,7 @@ func TestSmartImprovementConfirmationLateResultScope(t *testing.T) {
 			}
 			before := candidate.throughput
 			observations := candidate.improvementObservations
-			s.applyResultLocked(smartResult{member: candidate, kind: "throughput", purpose: job.purpose, download: 80, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration, primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
+			s.applyResultLocked(smartResult{member: candidate, kind: "throughput", purpose: job.purpose, measurement: smartMeasurementResult{Download: smartDirectionResult{Value: 80, Valid: true, At: clock.Now()}}, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration, primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
 			if candidate.throughput != before || candidate.improvementObservations != observations {
 				t.Fatal("late confirmation result published evidence into a different scope")
 			}
@@ -436,16 +445,18 @@ func TestSmartImprovementConfirmationLateResultScope(t *testing.T) {
 	}
 }
 
-func TestSmartFamilyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) {
+func TestSmartDailyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) {
 	for _, networkType := range []string{"wifi", "cellular"} {
 		t.Run(networkType, func(t *testing.T) {
 			s, clock := smartProfileThroughputTestGroup(t)
-			s.ledger.Register(s.Tag(), map[string]float64{"wifi": 300, "cellular": 50})
 			s.network.Type = networkType
+			s.options.Throughput.Upload = new(bool)
 			primary, candidate := s.primary, s.standby
 			primary.throughput.Download = 3
 			candidate.throughput = smartThroughput{}
 			s.selectedAt = clock.Now()
+			// A 45 MB daily remainder fits one default 25 Mbit/s phase, not the pair.
+			s.ledger.Register(s.Tag(), map[string]float64{"wifi": 45, "cellular": 45})
 			e := smartTestDegradationEpisode(s, clock.Now())
 			s.startDegradationAdmissionLocked(primary, smartDegradationConfirmation, e, clock.Now())
 			var admission smartResult
@@ -454,14 +465,15 @@ func TestSmartFamilyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) 
 			case <-time.After(5 * time.Second):
 				t.Fatal("degradation admission did not finish")
 			}
-			if !errors.Is(admission.err, errSmartDegradationBudget) {
-				t.Fatalf("degradation admission=%v, want allowance denial", admission.err)
+			if !errors.Is(admission.err, errSmartBudget) {
+				t.Fatalf("degradation admission=%v, want daily budget denial", admission.err)
 			}
 			s.applyAdmissionLocked(admission, clock.Now())
 			budget := s.ledger.Snapshot(networkType, clock.Now(), s.network.Offset)
-			if s.degradation.episode != nil || len(s.pending) != 0 || budget.ReservedMB != 0 || budget.Degradation.UsedMB != 0 {
-				t.Fatal("denied family-budget pair retained work or charges")
+			if s.degradation.episode != nil || len(s.pending) != 0 || budget.ReservedMB != 0 {
+				t.Fatal("denied pair retained work or charges")
 			}
+			clock.Advance(time.Second)
 			for _, purpose := range []string{"", smartImprovementConfirmation} {
 				if purpose == "" {
 					s.startThroughputAdmissionLocked(candidate, clock.Now())
@@ -473,7 +485,7 @@ func TestSmartFamilyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) 
 				} else {
 					clock.Advance(s.preference.confirmationInterval)
 					if !s.scheduleImprovementConfirmationLocked(clock.Now()) {
-						t.Fatal("family-budget candidate did not receive a confirmation")
+						t.Fatal("candidate did not receive a confirmation")
 					}
 					admission = smartAwaitConfirmationAdmission(t, s, clock)
 				}
@@ -482,14 +494,14 @@ func TestSmartFamilyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) 
 				}
 				s.applyAdmissionLocked(admission, clock.Now())
 				if len(s.pending) != 1 || s.pending[0].purpose != purpose {
-					t.Fatal("ordinary-budget throughput work was not queued")
+					t.Fatal("single-phase throughput work was not queued")
 				}
 				job := s.pending[0]
 				s.pending = nil
 				if err := s.ledger.Reconcile(s.ctx, job.reservation, 1_000_000, false); err != nil {
 					t.Fatal(err)
 				}
-				s.applyResultLocked(smartResult{member: candidate, kind: "throughput", purpose: job.purpose, download: 30, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration, primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
+				s.applyResultLocked(smartResult{member: candidate, kind: "throughput", purpose: job.purpose, measurement: smartMeasurementResult{Download: smartDirectionResult{Value: 30, Valid: true, At: clock.Now()}}, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration, primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
 			}
 			if candidate.improvementObservations != s.preference.confirmations || s.primary != primary {
 				t.Fatal("regular test and confirmation did not converge within dwell")
@@ -497,8 +509,8 @@ func TestSmartFamilyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) 
 			clock.Advance(s.preference.dwell)
 			s.chooseLocked(clock.Now())
 			budget = s.ledger.Snapshot(networkType, clock.Now(), s.network.Offset)
-			if s.primary != candidate || budget.UsedMB != 2 || budget.ReservedMB != 0 || budget.Degradation.UsedMB != 0 {
-				t.Fatal("family budgets did not permit ordinary confirmed improvement without pair spending")
+			if s.primary != candidate || budget.UsedMB != 2 || budget.ReservedMB != 0 {
+				t.Fatal("daily budget did not permit confirmed improvement without pair spending")
 			}
 		})
 	}
@@ -523,11 +535,15 @@ func TestSmartImprovementConfirmationSurvivesHeartbeatAndSkipsUpload(t *testing.
 		}
 		s.workCtx, s.workCancel = context.WithCancel(s.ctx)
 		s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
+		s.options.Throughput.Window = badoption.Duration(40 * time.Second)
 		s.options.Throughput.DownloadURL = "http://192.0.2.1/down?bytes={bytes}"
 		s.options.Throughput.UploadURL = "http://192.0.2.1/up"
 		started := make(chan struct{})
+		var first sync.Once
+		serverDone := make(chan struct{}, 1)
 		uploads := 0
 		dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
+			defer func() { serverDone <- struct{}{} }()
 			defer conn.Close()
 			reader := bufio.NewReader(conn)
 			for {
@@ -542,12 +558,19 @@ func TestSmartImprovementConfirmationSurvivesHeartbeatAndSkipsUpload(t *testing.
 					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 					continue
 				}
-				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
-				_, _ = io.CopyN(conn, smartZeroReader{}, 100_000)
-				close(started)
-				time.Sleep(s.heartbeat + time.Second)
-				if _, err = io.CopyN(conn, smartZeroReader{}, 900_000); err != nil {
+				size, err := strconv.ParseInt(request.URL.Query().Get("bytes"), 10, 64)
+				if err != nil || size <= 0 {
 					return
+				}
+				_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", size)
+				first.Do(func() { close(started) })
+				for size > 0 {
+					time.Sleep(10 * time.Millisecond)
+					count := min(size, 25_000)
+					if _, err = io.CopyN(conn, smartZeroReader{}, count); err != nil {
+						return
+					}
+					size -= count
 				}
 			}
 		}}
@@ -568,6 +591,7 @@ func TestSmartImprovementConfirmationSurvivesHeartbeatAndSkipsUpload(t *testing.
 		s.pending = nil
 		done := make(chan smartResult, 1)
 		began := time.Now()
+		s.clock = smartConfirmationPacedClock{at: clock.Now(), started: began}
 		go func() { done <- s.runOperation(job) }()
 		<-started
 		time.Sleep(s.heartbeat)
@@ -578,7 +602,9 @@ func TestSmartImprovementConfirmationSurvivesHeartbeatAndSkipsUpload(t *testing.
 			t.Fatal("heartbeat did not preempt ordinary work independently of confirmation")
 		}
 		result := <-done
-		if result.err != nil || result.download <= 0 || result.upload != 0 || uploads != 0 || result.bytes <= 0 || time.Since(began) <= s.heartbeat {
+		<-serverDone
+		clock.Advance(time.Since(began) - s.heartbeat)
+		if result.err != nil || !result.measurement.Download.Valid || result.measurement.Download.Value <= 0 || result.measurement.Upload.Valid || uploads != 0 || result.bytes <= 0 || time.Since(began) <= 30*time.Second {
 			t.Fatalf("long download-only confirmation failed: result=%+v uploads=%d elapsed=%s", result, uploads, time.Since(began))
 		}
 		if err := s.ledger.Reconcile(s.ctx, job.reservation, result.bytes, false); err != nil {
@@ -677,5 +703,227 @@ func TestSmartImprovementConfirmationContextCancellation(t *testing.T) {
 				t.Fatalf("%s did not cancel the independent confirmation context", change)
 			}
 		})
+	}
+}
+
+type smartConfirmationPacedClock struct {
+	smartRealClock
+	at, started time.Time
+}
+
+func (c smartConfirmationPacedClock) Now() time.Time { return c.at.Add(time.Since(c.started)) }
+
+func TestSmartDirectConfirmationSourcesExcludeTCP(t *testing.T) {
+	for _, criterion := range []string{"upload", "rtt", "jitter"} {
+		t.Run(criterion, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.rank = []string{criterion}
+			primary, candidate := s.primary, s.standby
+			primary.throughput.UploadResult = smartDirectionResult{Value: 1, At: clock.Now(), Valid: true}
+			primary.throughput.UploadAt = clock.Now()
+			candidate.throughput.UploadResult = smartDirectionResult{Value: 5, At: clock.Now(), Valid: true}
+			candidate.throughput.UploadAt = clock.Now()
+			smartSeedRTTTestSamples(primary, []float64{50, 50, 50, 50, 50, 100, 100, 100, 100, 100}, clock.Now())
+			smartApplyRTTTestResult(s, candidate, []float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, []int{5, 5}, clock.Now())
+			s.chooseLocked(clock.Now())
+			if candidate.improvementObservations != 1 || candidate.improvementCriterion != criterion {
+				t.Fatalf("initial %s observation missing", criterion)
+			}
+			clock.Advance(s.preference.confirmationInterval)
+			s.applyResultLocked(smartResult{member: candidate, kind: "tcp", rtt: time.Millisecond,
+				generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration}, clock.Now())
+			if candidate.improvementObservations != 1 || s.primary != primary {
+				t.Fatalf("TCP heartbeat advanced %s confirmation", criterion)
+			}
+		})
+	}
+}
+
+func TestSmartHistoricalConfirmationsRecomputeEstimates(t *testing.T) {
+	for _, criterion := range []string{"outages", "rtt_spread"} {
+		t.Run(criterion, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.rank = []string{criterion}
+			s.preference.confirmations = 3
+			s.selectedAt = clock.Now().Add(-time.Hour)
+			primary, candidate := s.primary, s.standby
+			primary.rtts = []float64{10, 10, 10, 10, 10, 100, 100, 100}
+			candidate.rtts = []float64{30, 30, 30, 30, 30, 30, 30, 30}
+			for _, member := range []*smartMember{primary, candidate} {
+				stat := s.history.statistic(s.network.Key, member.identity, clock.Now())
+				stat.OutageExposureHours, stat.OutageObservedHours = 4, 4
+				if member == primary {
+					stat.OutageEpisodes = 2
+				}
+			}
+			s.chooseLocked(clock.Now())
+			if candidate.improvementObservations != 1 || candidate.improvementCriterion != criterion {
+				t.Fatalf("initial %s estimate did not start confirmations", criterion)
+			}
+			for observation := 2; observation <= 3; observation++ {
+				clock.Advance(s.preference.confirmationInterval)
+				// A single slow check is not the historical spread estimate.
+				s.applyResultLocked(smartResult{member: candidate, kind: "tcp", rtt: 100 * time.Millisecond,
+					generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration}, clock.Now())
+				if observation < 3 && candidate.improvementObservations != observation {
+					t.Fatalf("%s observation count=%d want=%d", criterion, candidate.improvementObservations, observation)
+				}
+			}
+			if s.primary != candidate {
+				t.Fatalf("%s confirmations did not complete through heartbeat dispatch", criterion)
+			}
+		})
+	}
+}
+
+func TestSmartUploadMarginAndIndependentFreshness(t *testing.T) {
+	s, clock := smartProfileThroughputTestGroup(t)
+	s.preference.rank = []string{"upload"}
+	primary, candidate := s.primary, s.standby
+	primary.throughput.UploadResult = smartDirectionResult{Value: 4, At: clock.Now(), Valid: true}
+	primary.throughput.UploadAt = clock.Now()
+	for _, test := range []struct {
+		value  float64
+		valid  bool
+		age    time.Duration
+		better bool
+	}{
+		{100, false, 0, false}, {4.9, true, 0, false}, {5, true, 0, true},
+		{100, true, 24 * time.Hour, false},
+	} {
+		candidate.throughput.UploadResult = smartDirectionResult{Value: test.value, At: clock.Now().Add(-test.age), Valid: test.valid}
+		candidate.throughput.UploadAt = clock.Now()
+		candidate.throughput.Upload = 1000
+		if got, criterion := s.betterLocked(candidate, primary, clock.Now()); got != test.better || criterion != "upload" && got {
+			t.Fatalf("upload=%g valid=%v age=%s better=%v want=%v criterion=%s", test.value, test.valid, test.age, got, test.better, criterion)
+		}
+	}
+}
+
+func TestSmartUploadConfirmationRunsOnlyUploadPhase(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, clock := smartProfileThroughputTestGroup(t)
+		s.preference.rank = []string{"upload"}
+		s.selectedAt = clock.Now().Add(-time.Hour)
+		primary, candidate := s.primary, s.standby
+		for _, member := range []*smartMember{primary, candidate} {
+			value := 1.0
+			if member == candidate {
+				value = 4
+			}
+			member.throughput.UploadResult = smartDirectionResult{Value: value, Valid: true, At: clock.Now()}
+			member.throughput.UploadAt = clock.Now()
+		}
+		downloads, uploads := 0, 0
+		dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
+			defer conn.Close()
+			reader := bufio.NewReader(conn)
+			for {
+				request, err := http.ReadRequest(reader)
+				if err != nil {
+					return
+				}
+				if request.Method != http.MethodPost {
+					downloads++
+					return
+				}
+				uploads++
+				var received int64
+				buffer := make([]byte, 16_384)
+				for {
+					n, err := request.Body.Read(buffer)
+					received += int64(n)
+					if n > 0 {
+						time.Sleep(25 * time.Millisecond)
+					}
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						return
+					}
+				}
+				_ = request.Body.Close()
+				if _, err = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\ncf-meta-upload-bytes: %d\r\n\r\n", received); err != nil {
+					return
+				}
+			}
+		}}
+		candidate.outbound = &smartConfirmationTestOutbound{smartFakeOutbound: &smartFakeOutbound{tag: candidate.tag}, dialer: dialer}
+		s.options.Throughput.UploadURL = "http://192.0.2.1/up?bytes={bytes}"
+		s.chooseLocked(clock.Now())
+		if candidate.improvementObservations != 1 {
+			t.Fatal("verified upload did not start confirmation")
+		}
+		clock.Advance(s.preference.confirmationInterval)
+		if !s.scheduleImprovementConfirmationLocked(clock.Now()) {
+			t.Fatal("upload confirmation was not scheduled")
+		}
+		admission := smartAwaitConfirmationAdmission(t, s, clock)
+		if admission.err != nil {
+			t.Fatal(admission.err)
+		}
+		s.applyAdmissionLocked(admission, clock.Now())
+		if len(s.pending) != 1 {
+			t.Fatalf("confirmation jobs=%d", len(s.pending))
+		}
+		job := s.pending[0]
+		s.pending = nil
+		if job.plan.Download != nil || job.plan.Upload == nil || job.plan.STUNBursts != 0 {
+			t.Fatalf("upload confirmation plan=%+v", job.plan)
+		}
+		previousDownload := candidate.throughput.Download
+		started := time.Now()
+		s.clock = smartConfirmationPacedClock{at: clock.Now(), started: started}
+		result := s.runOperation(job)
+		clock.Advance(time.Since(started))
+		if result.err != nil || !result.measurement.Upload.Valid || result.measurement.Download.Valid || downloads != 0 || uploads < 3 {
+			t.Fatalf("upload-only result=%+v downloads=%d uploads=%d", result, downloads, uploads)
+		}
+		if err := s.ledger.Reconcile(s.ctx, job.reservation, result.bytes, false); err != nil {
+			t.Fatal(err)
+		}
+		s.applyResultLocked(result, clock.Now())
+		if s.primary != candidate || candidate.throughput.Download != previousDownload {
+			t.Fatal("upload confirmation did not switch independently of download")
+		}
+	})
+}
+
+func TestSmartDownloadConfirmationRejectsPassiveAndInconclusiveEvidence(t *testing.T) {
+	s, clock, candidate := smartPrepareConfirmation(t)
+	primary := s.primary
+	clock.Advance(s.preference.confirmationInterval)
+	for _, result := range []smartResult{
+		{member: candidate, kind: "tcp", rtt: time.Millisecond},
+		{member: candidate, kind: "throughput", measurement: smartMeasurementResult{Download: smartDirectionResult{Value: 100, At: clock.Now()}}},
+	} {
+		result.generation, result.memberGeneration, result.configGeneration = s.generation, candidate.generation, s.configGeneration
+		s.applyResultLocked(result, clock.Now())
+		if candidate.improvementObservations != 1 || s.primary != primary {
+			t.Fatal("unrelated or inconclusive result advanced download confirmation")
+		}
+	}
+	candidate.throughput.Source = "passive"
+	candidate.throughput.At = clock.Now()
+	s.chooseLocked(clock.Now())
+	if s.primary != primary || candidate.improvementObservations != 0 {
+		t.Fatal("passive result confirmed download improvement")
+	}
+}
+
+func TestSmartDegradationPhasesNeverConfirmDownloadImprovement(t *testing.T) {
+	s, clock, candidate := smartPrepareConfirmation(t)
+	primary := s.primary
+	primaryDownload, candidateDownload := primary.throughput, candidate.throughput
+	clock.Advance(s.preference.confirmationInterval)
+	episode := smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, episode, primary, smartDegradationConfirmation, 3, clock.Now())
+	smartTestDegradationResult(s, episode, candidate, smartDegradationChallenger, 30, clock.Now())
+	if s.primary != primary || candidate.improvementObservations > 1 {
+		t.Fatal("degradation phases counted as ordinary download confirmations")
+	}
+	if primary.throughput != primaryDownload || candidate.throughput != candidateDownload {
+		t.Fatal("degradation phases replaced regular download observation provenance")
 	}
 }

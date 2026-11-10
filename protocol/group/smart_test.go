@@ -989,7 +989,13 @@ func TestSmartInterruptedDiscoveryRequeuesOnlyCanceledMembers(t *testing.T) {
 			if retries != 1 || !s.lastDiscovery.Equal(clock.Now()) {
 				t.Fatalf("discovery retries=%d last=%v", retries, s.lastDiscovery)
 			}
-			if interrupted.member.state != "healthy" || interrupted.member.udp443 != evidence || len(s.history.Stats) != 0 {
+			healthRecorded := false
+			for _, statistics := range s.history.Stats {
+				for _, statistic := range statistics {
+					healthRecorded = healthRecorded || statistic.W != 0 || len(statistic.RTTs) != 0
+				}
+			}
+			if interrupted.member.state != "healthy" || interrupted.member.udp443 != evidence || healthRecorded {
 				t.Fatal("discovery cancellation penalized member health")
 			}
 			if placement != "running" {

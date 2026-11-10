@@ -3,6 +3,7 @@
 package smartharness_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -88,6 +89,8 @@ type probeFixtures struct {
 	stun               atomic.Int64
 	quic               atomic.Int64
 	downloads          atomic.Int64
+	uploads            atomic.Int64
+	uploadBytes        atomic.Int64
 	bulkBytes          atomic.Int64
 	bulkRate           atomic.Int64
 	downloadRate       atomic.Int64
@@ -95,42 +98,56 @@ type probeFixtures struct {
 	bulkRateOnDownload atomic.Int64
 }
 
+func (f *probeFixtures) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	f.https.Add(1)
+	switch r.URL.Path {
+	case "/cdn-cgi/trace":
+		fmt.Fprintf(w, "h=%s\n", r.Host)
+	case "/":
+		if r.Host == "8.8.8.8" {
+			w.Header().Set("Location", "https://dns.google/")
+			w.WriteHeader(http.StatusFound)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	case "/download":
+		size, err := strconv.ParseInt(r.URL.Query().Get("bytes"), 10, 64)
+		if err != nil || size <= 0 || size > 25_000_000 {
+			http.Error(w, "invalid download size", http.StatusBadRequest)
+			return
+		}
+		f.downloads.Add(1)
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		if rate := f.bulkRateOnDownload.Load(); rate > 0 {
+			f.bulkRate.Store(rate)
+		}
+		writeFixturePayload(r.Context(), w, size, &f.downloadRate, &f.downloadBurst, nil)
+	case "/bulk":
+		writeFixturePayload(r.Context(), w, -1, &f.bulkRate, nil, &f.bulkBytes)
+	case "/upload":
+		size, err := strconv.ParseInt(r.URL.Query().Get("bytes"), 10, 64)
+		if r.Method != http.MethodPost || err != nil || size <= 0 || size > 25_000_000 {
+			http.Error(w, "invalid upload size or method", http.StatusBadRequest)
+			return
+		}
+		received, err := io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, size))
+		if err != nil || received != size {
+			http.Error(w, "incomplete upload", http.StatusBadRequest)
+			return
+		}
+		f.uploads.Add(1)
+		f.uploadBytes.Add(received)
+		w.Header().Set("cf-meta-upload-bytes", strconv.FormatInt(received, 10))
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
 	t.Helper()
 	f := new(probeFixtures)
-	https := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.https.Add(1)
-		switch r.URL.Path {
-		case "/cdn-cgi/trace":
-			fmt.Fprintf(w, "h=%s\n", r.Host)
-		case "/":
-			if r.Host == "8.8.8.8" {
-				w.Header().Set("Location", "https://dns.google/")
-				w.WriteHeader(http.StatusFound)
-			} else {
-				w.WriteHeader(http.StatusOK)
-			}
-		case "/download":
-			size, err := strconv.ParseInt(r.URL.Query().Get("bytes"), 10, 64)
-			if err != nil || size < 0 || size > 25_000_000 {
-				http.Error(w, "invalid download size", http.StatusBadRequest)
-				return
-			}
-			f.downloads.Add(1)
-			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-			if rate := f.bulkRateOnDownload.Load(); rate > 0 {
-				f.bulkRate.Store(rate)
-			}
-			writeFixturePayload(r.Context(), w, size, &f.downloadRate, f.downloadBurst.Load(), nil)
-		case "/bulk":
-			writeFixturePayload(r.Context(), w, -1, &f.bulkRate, 0, &f.bulkBytes)
-		case "/upload":
-			_, _ = io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, 1_000_000))
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	https := httptest.NewUnstartedServer(http.HandlerFunc(f.serveHTTP))
 	https.TLS = &tls.Config{Certificates: []tls.Certificate{harnessCertificate}, MinVersion: tls.VersionTLS12}
 	https.StartTLS()
 	t.Cleanup(https.Close)
@@ -196,23 +213,37 @@ func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
 	return f
 }
 
-func writeFixturePayload(ctx context.Context, w http.ResponseWriter, remaining int64, rate *atomic.Int64, burst int64, counter *atomic.Int64) {
+func writeFixturePayload(ctx context.Context, w http.ResponseWriter, remaining int64, rate *atomic.Int64, burst *atomic.Int64, counter *atomic.Int64) {
 	var buffer [16 * 1024]byte
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	if !timer.Stop() {
 		<-timer.C
 	}
+	next := time.Now()
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 	for remaining != 0 {
 		size := int64(len(buffer))
 		if remaining > 0 {
 			size = min(size, remaining)
 		}
-		if burst > 0 {
-			size = min(size, burst)
-			burst -= size
+		var unpaced int64
+		if burst != nil {
+			for {
+				available := burst.Load()
+				unpaced = min(size, available)
+				if unpaced == 0 || burst.CompareAndSwap(available, available-unpaced) {
+					break
+				}
+			}
+		}
+		if unpaced > 0 {
+			size = unpaced
 		} else if bytesPerSecond := rate.Load(); bytesPerSecond > 0 {
-			timer.Reset(time.Duration(float64(size) / float64(bytesPerSecond) * float64(time.Second)))
+			next = next.Add(time.Duration(float64(size) / float64(bytesPerSecond) * float64(time.Second)))
+			timer.Reset(max(time.Duration(0), time.Until(next)))
 			select {
 			case <-ctx.Done():
 				return
@@ -225,6 +256,9 @@ func writeFixturePayload(ctx context.Context, w http.ResponseWriter, remaining i
 		}
 		if err != nil || ctx.Err() != nil {
 			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
 		}
 		if remaining > 0 {
 			remaining -= int64(n)
@@ -254,4 +288,56 @@ func fixtureUDP(t *testing.T, reply func([]byte, *net.UDPAddr) []byte) uint16 {
 	}()
 	t.Cleanup(func() { _ = conn.Close(); <-done })
 	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
+}
+
+func TestSmartHarnessUploadReceipts(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		size  int
+		body  int
+		valid bool
+	}{
+		{"bootstrap", 65_536, 65_536, true},
+		{"adaptive_above_old_cap", 2_000_000, 2_000_000, true},
+		{"short_body", 65_536, 65_535, false},
+		{"long_body", 65_536, 65_537, false},
+		{"above_request_limit", 25_000_001, 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := new(probeFixtures)
+			request := httptest.NewRequest(http.MethodPost, "/upload?bytes="+strconv.Itoa(test.size), bytes.NewReader(make([]byte, test.body)))
+			response := httptest.NewRecorder()
+			f.serveHTTP(response, request)
+			if !test.valid {
+				if response.Code != http.StatusBadRequest || response.Header().Get("cf-meta-upload-bytes") != "" || f.uploads.Load() != 0 {
+					t.Fatalf("invalid upload received a receipt: status=%d headers=%v uploads=%d", response.Code, response.Header(), f.uploads.Load())
+				}
+				return
+			}
+			if response.Code != http.StatusNoContent || response.Header().Get("cf-meta-upload-bytes") != strconv.Itoa(test.body) || f.uploads.Load() != 1 || f.uploadBytes.Load() != int64(test.body) {
+				t.Fatalf("upload receipt does not match the complete body: status=%d headers=%v uploads=%d bytes=%d", response.Code, response.Header(), f.uploads.Load(), f.uploadBytes.Load())
+			}
+		})
+	}
+}
+
+func TestSmartHarnessRepeatedDownloadPacing(t *testing.T) {
+	f := new(probeFixtures)
+	f.downloadRate.Store(1_000_000)
+	f.downloadBurst.Store(1_000_000)
+	for i, size := range []int{1_000_000, 2_000_000} {
+		started := time.Now()
+		request := httptest.NewRequest(http.MethodGet, "/download?bytes="+strconv.Itoa(size), nil)
+		response := httptest.NewRecorder()
+		f.serveHTTP(response, request)
+		if response.Code != http.StatusOK || response.Body.Len() != size || response.Header().Get("Content-Length") != strconv.Itoa(size) {
+			t.Fatalf("download %d: status=%d bytes=%d headers=%v", i, response.Code, response.Body.Len(), response.Header())
+		}
+		if i == 1 && time.Since(started) < 1900*time.Millisecond {
+			t.Fatalf("repeated GET replayed the initial burst: elapsed=%s", time.Since(started))
+		}
+	}
+	if f.downloads.Load() != 2 || f.downloadBurst.Load() != 0 {
+		t.Fatalf("repeated GET accounting: requests=%d burst=%d", f.downloads.Load(), f.downloadBurst.Load())
+	}
 }

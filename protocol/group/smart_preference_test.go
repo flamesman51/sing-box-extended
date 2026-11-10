@@ -32,9 +32,10 @@ func TestSmartPreferenceProfileTable(t *testing.T) {
 		{"balance-speed-1440p", "speed_floor stability download latency", 2, 15, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
 		{"balance-speed-4k", "speed_floor stability download latency", 2, 25, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
 		{"speed-max", "download stability latency", 2, 25, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 5 * time.Minute, 2},
-		{"responsive", "latency stability download", 2, 4, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
-		{"realtime-calls", "udp stability rtt_spread latency speed_floor", 2, 4, 10 * time.Second, 30 * time.Second, 5 * time.Minute, false, true, 10 * time.Minute, 2},
-		{"realtime-gaming", "udp latency rtt_spread stability", 2, 2, 10 * time.Second, 30 * time.Second, 5 * time.Minute, false, true, 10 * time.Minute, 2},
+		{"speed-upload", "upload stability rtt", 2, 25, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
+		{"responsive", "rtt stability download", 2, 4, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
+		{"realtime-calls", "udp stability jitter rtt speed_floor", 2, 4, 10 * time.Second, 30 * time.Second, 5 * time.Minute, false, true, 10 * time.Minute, 2},
+		{"realtime-gaming", "udp rtt jitter stability", 2, 2, 10 * time.Second, 30 * time.Second, 5 * time.Minute, false, true, 10 * time.Minute, 2},
 		{"data-saver", "stability latency", -1, 4, 30 * time.Second, 2 * time.Minute, 15 * time.Minute, true, false, 10 * time.Minute, 2},
 		{"phone", "speed_floor stability download latency", 2, 8, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
 		{"desktop", "speed_floor stability download latency", 2, 25, 15 * time.Second, time.Minute, 5 * time.Minute, true, true, 10 * time.Minute, 2},
@@ -56,6 +57,13 @@ func TestSmartPreferenceProfileTable(t *testing.T) {
 			}
 			if options.Throughput.TargetMbps != test.target || options.Throughput.Enabled == nil || *options.Throughput.Enabled != test.throughput {
 				t.Fatalf("throughput defaults = %#v", options.Throughput)
+			}
+			streams := 1
+			if test.profile == "desktop" || test.profile == "server" || test.profile == "speed-max" {
+				streams = 4
+			}
+			if options.Throughput.Streams != streams {
+				t.Fatalf("streams = %d, want %d", options.Throughput.Streams, streams)
 			}
 			if time.Duration(options.Probe.HeartbeatInterval) != test.heartbeat || time.Duration(options.Probe.StandbyInterval) != test.standby || time.Duration(options.Probe.BackgroundInterval) != test.background {
 				t.Fatalf("probe defaults = %#v", options.Probe)
@@ -130,6 +138,7 @@ func TestSmartPreferenceLegacyZeroDefaults(t *testing.T) {
 			`"probe":{"timeout":"0s"}`,
 			`"throughput":{"target_mbps":0}`,
 			`"udp":{"quic_policy":""}`,
+			`"throughput":{"streams":0,"window":"0s","warmup":"0s","upload_window":"0s","upload_warmup":"0s"}`,
 			`"probe":{"heartbeat_interval":"0s","standby_interval":"0s","background_interval":"0s","timeout":"0s"},"throughput":{"target_mbps":0},"udp":{"quic_policy":""}`,
 		} {
 			document := `{` + fields + preference + `}`
@@ -176,6 +185,11 @@ func TestSmartPreferenceExistingFieldsRequirePositiveOverrides(t *testing.T) {
 			{`"probe":{"background_interval":"0s"}`, "probe.background_interval"},
 			{`"probe":{"timeout":"0s"}`, "probe.timeout"},
 			{`"throughput":{"target_mbps":0}`, "throughput.target_mbps"},
+			{`"throughput":{"streams":0}`, "throughput.streams"},
+			{`"throughput":{"window":"0s"}`, "throughput.window"},
+			{`"throughput":{"warmup":"0s"}`, "throughput.warmup"},
+			{`"throughput":{"upload_window":"0s"}`, "throughput.upload_window"},
+			{`"throughput":{"upload_warmup":"0s"}`, "throughput.upload_warmup"},
 			{`"udp":{"quic_policy":""}`, "udp.quic_policy"},
 		} {
 			document := `{"preference":` + preference + `,` + test.fields + `}`
@@ -204,6 +218,11 @@ func TestSmartPreferenceExistingFieldsRejectInvalidValues(t *testing.T) {
 			`"probe":{"background_interval":"-1s"}`,
 			`"probe":{"timeout":"-1s"}`,
 			`"throughput":{"target_mbps":-1}`,
+			`"throughput":{"streams":-1}`,
+			`"throughput":{"window":"4.999s"}`,
+			`"throughput":{"warmup":"999ms"}`,
+			`"throughput":{"upload_window":"4.999s"}`,
+			`"throughput":{"upload_warmup":"999ms"}`,
 			`"udp":{"quic_policy":"invalid"}`,
 		} {
 			document := `{` + fields + preference + `}`
@@ -222,7 +241,7 @@ func TestSmartPreferenceExistingFieldsRejectInvalidValues(t *testing.T) {
 
 func TestSmartPreferenceExplicitLeavesWin(t *testing.T) {
 	var options option.SmartOutboundOptions
-	if err := json.Unmarshal([]byte(`{"preference":{"profile":"speed-max","rank":["quic","outages"],"min_stability":"none","speed_floor_hysteresis":0,"switch":{"improvement":false,"dwell":"1m","confirmations":1,"confirmation_interval":"2s","tier_restore":"0s","speed_margin":1}},"probe":{"heartbeat_interval":"7s","standby_interval":"11s","background_interval":"13s","timeout":"3s"},"throughput":{"enabled":false,"target_mbps":9,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":1,"other_daily_budget_mb":2},"interrupt_on_failover":false,"udp":{"enabled":false,"quic_policy":"off"},"notify_all_dead":false}`), &options); err != nil {
+	if err := json.Unmarshal([]byte(`{"preference":{"profile":"speed-max","rank":["quic","outages"],"min_stability":"none","speed_floor_hysteresis":0,"switch":{"improvement":false,"dwell":"1m","confirmations":1,"confirmation_interval":"2s","tier_restore":"0s","speed_margin":1}},"probe":{"heartbeat_interval":"7s","standby_interval":"11s","background_interval":"13s","timeout":"3s"},"throughput":{"enabled":false,"target_mbps":9,"streams":2,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":1,"other_daily_budget_mb":2},"interrupt_on_failover":false,"udp":{"enabled":false,"quic_policy":"off"},"notify_all_dead":false}`), &options); err != nil {
 		t.Fatal(err)
 	}
 	before, err := json.Marshal(options)
@@ -391,7 +410,7 @@ func TestSmartPreferenceCustomBaseDefaults(t *testing.T) {
 }
 
 func TestSmartPreferenceAcceptsEveryRankCriterion(t *testing.T) {
-	rank := []string{"stability", "speed_floor", "download", "throughput", "latency", "rtt_spread", "udp", "quic", "outages"}
+	rank := []string{"stability", "speed_floor", "download", "upload", "throughput", "rtt", "jitter", "latency", "rtt_spread", "udp", "quic", "outages"}
 	options := option.SmartOutboundOptions{Preference: &option.SmartPreferenceOptions{Rank: &rank}}
 	actual, err := resolveSmartPreference(&options)
 	if err != nil {
@@ -399,5 +418,40 @@ func TestSmartPreferenceAcceptsEveryRankCriterion(t *testing.T) {
 	}
 	if !reflect.DeepEqual(actual.rank, rank) {
 		t.Fatalf("explicit rank changed: %#v", actual.rank)
+	}
+}
+
+func TestSmartMeasurementConfigurationDefaultsAndOverrides(t *testing.T) {
+	for _, profile := range []string{"default", "speed-max", "speed-upload", "desktop", "responsive"} {
+		t.Run(profile, func(t *testing.T) {
+			s := &Smart{options: option.SmartOutboundOptions{Preference: &option.SmartPreferenceOptions{Profile: &profile}}}
+			if err := s.configure(); err != nil {
+				t.Fatal(err)
+			}
+			throughput := s.options.Throughput
+			streams := 1
+			if profile == "speed-max" || profile == "desktop" {
+				streams = 4
+			}
+			if throughput.Streams != streams || time.Duration(throughput.Window) != 7*time.Second || time.Duration(throughput.Warmup) != time.Second ||
+				time.Duration(throughput.UploadWindow) != 7*time.Second || time.Duration(throughput.UploadWarmup) != time.Second ||
+				throughput.Upload == nil || !*throughput.Upload || throughput.UploadURL != "https://speed.cloudflare.com/__up?bytes={bytes}" {
+				t.Fatalf("measurement defaults = %#v", throughput)
+			}
+			var options option.SmartOutboundOptions
+			if err := json.Unmarshal([]byte(`{"preference":{"profile":"`+profile+`"},"throughput":{"streams":2,"window":"5s","warmup":"1s","upload":false,"upload_window":"6s","upload_warmup":"2s"}}`), &options); err != nil {
+				t.Fatal(err)
+			}
+			s = &Smart{options: options}
+			if err := s.configure(); err != nil {
+				t.Fatal(err)
+			}
+			throughput = s.options.Throughput
+			if throughput.Streams != 2 || time.Duration(throughput.Window) != 5*time.Second || time.Duration(throughput.Warmup) != time.Second ||
+				time.Duration(throughput.UploadWindow) != 6*time.Second || time.Duration(throughput.UploadWarmup) != 2*time.Second ||
+				throughput.Upload == nil || *throughput.Upload {
+				t.Fatalf("measurement overrides = %#v", throughput)
+			}
+		})
 	}
 }
