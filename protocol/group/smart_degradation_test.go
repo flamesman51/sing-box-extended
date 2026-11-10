@@ -603,3 +603,34 @@ func TestSmartDegradationDelayedAdmissionFencing(t *testing.T) {
 		})
 	}
 }
+
+func TestSmartDegradationRotationAcrossCooldown(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	primary, b := s.primary, s.standby
+	c := &smartMember{tag: "c", identity: "c", serverIdentity: "c", outbound: &smartFakeOutbound{"c"}, tier: 1, generation: 1, state: "healthy", queued: make(map[string]bool), throughput: primary.throughput}
+	s.members = append(s.members, c)
+	e := smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+	if e.challenger != b || !b.queued["throughput"] {
+		t.Fatal("first untried challenger was not queued")
+	}
+	// Complete the queued phase through its normal accounting ownership.
+	s.pending = nil
+	e.accountingWait.Done()
+	smartTestDegradationResult(s, e, b, smartDegradationChallenger, 3, clock.Now())
+	if s.degradation.episode != nil || s.primary != primary {
+		t.Fatal("slow challenger did not finish without switching")
+	}
+	clock.Advance(time.Hour)
+	e = smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, e, primary, smartDegradationConfirmation, 3, clock.Now())
+	if e.challenger != c || !c.queued["throughput"] {
+		t.Fatal("failed B starved untried fast C after cooldown")
+	}
+	s.pending = nil
+	e.accountingWait.Done()
+	smartTestDegradationResult(s, e, c, smartDegradationChallenger, 50, clock.Now())
+	if s.primary != c {
+		t.Fatal("fresh fast C did not waive dwell")
+	}
+}

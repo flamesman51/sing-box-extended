@@ -274,6 +274,9 @@ func (s *Smart) smartConfirmationPlanLocked(member *smartMember) smartMeasuremen
 		phase := s.downloadPhaseLocked()
 		return smartMeasurementPlan{Download: &phase}
 	case "upload":
+		if s.options.Throughput.Upload != nil && !*s.options.Throughput.Upload {
+			return smartMeasurementPlan{}
+		}
 		phase := s.uploadPhaseLocked()
 		return smartMeasurementPlan{Upload: &phase}
 	case "rtt":

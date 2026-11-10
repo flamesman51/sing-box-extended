@@ -112,7 +112,7 @@ func (f *probeFixtures) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case "/download":
 		size, err := strconv.ParseInt(r.URL.Query().Get("bytes"), 10, 64)
-		if err != nil || size <= 0 || size > 25_000_000 {
+		if err != nil || size <= 0 || size > 100_000_000 {
 			http.Error(w, "invalid download size", http.StatusBadRequest)
 			return
 		}
@@ -316,6 +316,37 @@ func TestSmartHarnessUploadReceipts(t *testing.T) {
 			}
 			if response.Code != http.StatusNoContent || response.Header().Get("cf-meta-upload-bytes") != strconv.Itoa(test.body) || f.uploads.Load() != 1 || f.uploadBytes.Load() != int64(test.body) {
 				t.Fatalf("upload receipt does not match the complete body: status=%d headers=%v uploads=%d bytes=%d", response.Code, response.Header(), f.uploads.Load(), f.uploadBytes.Load())
+			}
+		})
+	}
+}
+
+func TestSmartHarnessDownloadRequestLimit(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		size  int
+		valid bool
+	}{
+		{"above_upload_limit", 25_000_001, true},
+		{"at_download_limit", 100_000_000, true},
+		{"above_download_limit", 100_000_001, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := new(probeFixtures)
+			f.downloadRate.Store(1)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			request := httptest.NewRequest(http.MethodGet, "/download?bytes="+strconv.Itoa(test.size), nil).WithContext(ctx)
+			response := httptest.NewRecorder()
+			f.serveHTTP(response, request)
+			if !test.valid {
+				if response.Code != http.StatusBadRequest || f.downloads.Load() != 0 {
+					t.Fatalf("invalid download accepted: status=%d downloads=%d", response.Code, f.downloads.Load())
+				}
+				return
+			}
+			if response.Code != http.StatusOK || response.Header().Get("Content-Length") != strconv.Itoa(test.size) || f.downloads.Load() != 1 {
+				t.Fatalf("download limit rejected: status=%d headers=%v downloads=%d", response.Code, response.Header(), f.downloads.Load())
 			}
 		})
 	}

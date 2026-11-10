@@ -433,13 +433,13 @@ func TestSmartMeasurementConfigurationDefaultsAndOverrides(t *testing.T) {
 			if profile == "speed-max" || profile == "desktop" {
 				streams = 4
 			}
-			if throughput.Streams != streams || time.Duration(throughput.Window) != 7*time.Second || time.Duration(throughput.Warmup) != time.Second ||
-				time.Duration(throughput.UploadWindow) != 7*time.Second || time.Duration(throughput.UploadWarmup) != time.Second ||
+			if throughput.Streams != streams || time.Duration(throughput.Window) != 7*time.Second || time.Duration(throughput.Warmup) != 2*time.Second ||
+				time.Duration(throughput.UploadWindow) != 8*time.Second || time.Duration(throughput.UploadWarmup) != 2*time.Second ||
 				throughput.Upload == nil || !*throughput.Upload || throughput.UploadURL != "https://speed.cloudflare.com/__up?bytes={bytes}" {
 				t.Fatalf("measurement defaults = %#v", throughput)
 			}
 			var options option.SmartOutboundOptions
-			if err := json.Unmarshal([]byte(`{"preference":{"profile":"`+profile+`"},"throughput":{"streams":2,"window":"5s","warmup":"1s","upload":false,"upload_window":"6s","upload_warmup":"2s"}}`), &options); err != nil {
+			if err := json.Unmarshal([]byte(`{"preference":{"profile":"`+profile+`"},"throughput":{"streams":2,"window":"5s","warmup":"1s","upload":false,"upload_window":"9s","upload_warmup":"2s"}}`), &options); err != nil {
 				t.Fatal(err)
 			}
 			s = &Smart{options: options}
@@ -448,7 +448,7 @@ func TestSmartMeasurementConfigurationDefaultsAndOverrides(t *testing.T) {
 			}
 			throughput = s.options.Throughput
 			if throughput.Streams != 2 || time.Duration(throughput.Window) != 5*time.Second || time.Duration(throughput.Warmup) != time.Second ||
-				time.Duration(throughput.UploadWindow) != 6*time.Second || time.Duration(throughput.UploadWarmup) != 2*time.Second ||
+				time.Duration(throughput.UploadWindow) != 9*time.Second || time.Duration(throughput.UploadWarmup) != 2*time.Second ||
 				throughput.Upload == nil || *throughput.Upload {
 				t.Fatalf("measurement overrides = %#v", throughput)
 			}

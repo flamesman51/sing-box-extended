@@ -19,6 +19,13 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+const (
+	smartDownloadRequestTarget = 4 * time.Second
+	smartDownloadRequestLimit  = 100_000_000
+	smartUploadRequestTarget   = 2 * time.Second
+	smartUploadRequestLimit    = 25_000_000
+)
+
 var errSmartMeasureCap = errors.New("smart measurement byte allowance exhausted")
 
 type smartMeasurementPhase struct {
@@ -305,11 +312,11 @@ func smartMeasure(ctx context.Context, dialer N.Dialer, downloadURL, uploadURL s
 	return
 }
 
-func smartAdaptiveSize(bytes int64, elapsed time.Duration, interval time.Duration, minimum int64) int64 {
+func smartAdaptiveSize(bytes int64, elapsed time.Duration, interval time.Duration, minimum, maximum int64) int64 {
 	if elapsed <= 0 {
 		return minimum
 	}
-	return int64(math.Max(float64(minimum), math.Min(25_000_000, float64(bytes)*float64(interval)/float64(elapsed))))
+	return int64(math.Max(float64(minimum), math.Min(float64(maximum), float64(bytes)*float64(interval)/float64(elapsed))))
 }
 
 type smartDownloadWindow struct {
@@ -404,7 +411,7 @@ func smartMeasureDownload(ctx context.Context, dialer N.Dialer, url string, mete
 						break
 					}
 				}
-				size = smartAdaptiveSize(received, clock.Now().Sub(started), 2*time.Second, 1_000_000)
+				size = smartAdaptiveSize(received, clock.Now().Sub(started), smartDownloadRequestTarget, 1_000_000, smartDownloadRequestLimit)
 			}
 		}()
 	}
@@ -580,7 +587,7 @@ func smartMeasureUpload(ctx context.Context, dialer N.Dialer, url string, meter 
 					cancel()
 					return
 				}
-				size = smartAdaptiveSize(size, ended.Sub(began), time.Second, 65_536)
+				size = smartAdaptiveSize(size, ended.Sub(began), smartUploadRequestTarget, 65_536, smartUploadRequestLimit)
 			}
 		}()
 	}

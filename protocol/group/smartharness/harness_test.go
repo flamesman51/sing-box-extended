@@ -147,13 +147,19 @@ type harnessStatus struct {
 		Total int `json:"total"`
 	} `json:"panics"`
 	Members []struct {
-		Tag       string   `json:"tag"`
-		State     string   `json:"state"`
-		UDP       string   `json:"udp"`
-		QUIC      string   `json:"udp443"`
-		Download  *float64 `json:"download_mbps"`
-		Source    string   `json:"throughput_source"`
-		At        int64    `json:"throughput_at"`
+		Tag              string   `json:"tag"`
+		State            string   `json:"state"`
+		UDP              string   `json:"udp"`
+		QUIC             string   `json:"udp443"`
+		Download         *float64 `json:"download_mbps"`
+		Source           string   `json:"throughput_source"`
+		At               int64    `json:"throughput_at"`
+		DownloadEvidence struct {
+			Window float64 `json:"window"`
+		} `json:"download"`
+		UploadEvidence struct {
+			Window float64 `json:"window"`
+		} `json:"upload"`
 		UnderLoad struct {
 			Value float64 `json:"value"`
 			At    int64   `json:"at"`
@@ -359,6 +365,9 @@ func TestSmartHarness(t *testing.T) {
 			t.Logf("%s calibrated %.2f Mbit/s", member.Tag, rate)
 			if member.Tag == "fast" && rate < 10 || member.Tag != "fast" && rate >= 10 {
 				t.Fatalf("%s calibrated %.2f Mbit/s, inconsistent with configured link", member.Tag, rate)
+			}
+			if member.DownloadEvidence.Window != 7 || member.UploadEvidence.Window != 8 {
+				t.Fatalf("%s measurement windows: download=%gs upload=%gs, want 7s and 8s", member.Tag, member.DownloadEvidence.Window, member.UploadEvidence.Window)
 			}
 		}
 		for i, fixture := range members {

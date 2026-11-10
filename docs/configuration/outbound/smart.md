@@ -26,10 +26,10 @@
     "target_mbps": 25,
     "streams": 1,
     "window": "7s",
-    "warmup": "1s",
+    "warmup": "2s",
     "upload": true,
-    "upload_window": "7s",
-    "upload_warmup": "1s",
+    "upload_window": "8s",
+    "upload_warmup": "2s",
     "download_url": "https://speed.cloudflare.com/__down?bytes={bytes}",
     "upload_url": "https://speed.cloudflare.com/__up?bytes={bytes}",
     "wifi_daily_budget_mb": 300,
@@ -79,10 +79,10 @@ Generic UDP and UDP/443 are tested separately: a server can carry DNS or STUN su
 - `target_mbps`: sufficient download rate in Mbit/s; default `25`. An explicitly configured target must be positive and finite on the profile engine; on the legacy policy, `0` selects the built-in default `25`. Negative and non-finite targets are invalid on both engines. Profiles can supply a different default. The legacy policy stops favoring throughput improvements after this target is met; profile criteria can rank measured download speed separately.
 - `streams`: parallel HTTPS connections per direction; default `1`, or `4` for `desktop`, `server`, and `speed-max`. On the profile engine an explicitly configured value must be an integer at least `1`; legacy `0` selects `1`.
 - `window`: download measurement window, default `7s`; at least `5s`.
-- `warmup`: download warmup, default `1s`; at least `1s`.
+- `warmup`: download warmup, default `2s`; at least `1s`.
 - `upload`: enables active upload measurement, default `true`. Explicit `false` disables upload phases without disabling downloads.
-- `upload_window`: upload measurement window, default `7s`; at least `5s`.
-- `upload_warmup`: upload warmup, default `1s`; at least `1s`.
+- `upload_window`: upload measurement window, default `8s`; at least `8s`.
+- `upload_warmup`: upload warmup, default `2s`; at least `1s`.
 - `download_url`: default `https://speed.cloudflare.com/__down?bytes={bytes}`. It must be a valid URL containing the literal `{bytes}` placeholder.
 - `upload_url`: default `https://speed.cloudflare.com/__up?bytes={bytes}`; it must be a valid URL. A literal `{bytes}` placeholder, when present, is replaced with the POST body size. Upload is usable only when the final 2xx response carries `cf-meta-upload-bytes` equal to that body size. Missing receipts mark upload `unverified`; early, mismatched, or incomplete receipts never produce ranked upload evidence.
 - `wifi_daily_budget_mb`: default `300`.
@@ -136,7 +136,7 @@ No `preference`, an empty `preference` object, or only `profile: "default"` reta
 
 #### Built-in policies
 
-Unless a row says otherwise, defaults are: heartbeat `15s`, standby `1m`, background `5m`, `interrupt_on_failover: true`, `udp.quic_policy: "auto"`, throughput and upload enabled, `streams: 1`, download and upload windows `7s`, warmups `1s`, improvement enabled, dwell `10m`, two confirmations at least `30s` apart, tier restoration hold `60s`, speed-floor hysteresis `0.2`, and speed margin `1.25`.
+Unless a row says otherwise, defaults are: heartbeat `15s`, standby `1m`, background `5m`, `interrupt_on_failover: true`, `udp.quic_policy: "auto"`, throughput and upload enabled, `streams: 1`, download window `7s`, upload window `8s`, both warmups `2s`, improvement enabled, dwell `10m`, two confirmations at least `30s` apart, tier restoration hold `60s`, speed-floor hysteresis `0.2`, and speed margin `1.25`.
 
 | Profile | Intent | Rank | Minimum stability | Target Mbit/s | Other defaults |
 | --- | --- | --- | --- | --- | --- |
@@ -353,16 +353,18 @@ Download and upload results carry independent timestamps, validity, source, stre
 
 Old `download_mbps` cache data remains active download at its original timestamp. Every pre-v2 upload is unknown for ranking because it lacks receipt provenance, including positive values; a positive old value is kept only as `legacy_upload`, and a verified upload is scheduled when enabled.
 
-Measurement status retains `download_mbps` and `upload_mbps`, with independent `download_at` and `upload_at`. Additive fields are `download_p10_mbps`, `download_mean_mbps`, and `upload_post_min_mbps`. The `download` and `upload` objects expose `value`, `streams`, `window` (seconds), `source`, `at`, `valid`, and `fresh`; download additionally has `p10` and `mean`, and upload has `post_min`. Status timestamps are Unix seconds. `upload_status` is `unknown`, `verified`, `unverified`, or `inconclusive`; group-level `upload_verified: false` identifies an endpoint lacking receipts.
+Measurement status retains the existing flat fields `download_mbps`, `upload_mbps`, `throughput_source`, and `throughput_at`. Apps should bind to the `download` and `upload` objects for directional evidence: each exposes `value`, `streams`, `window` (seconds), `source`, `at`, `valid`, and `fresh`; download additionally has `p10` and `mean`, and upload has `post_min`. Status timestamps are Unix seconds. `upload_status` is `unknown`, `verified`, `unverified`, or `inconclusive`; group-level `upload_verified: false` identifies an endpoint lacking receipts.
 
 `download_under_load` uses the download object shape. A recorded `floor_state` exposes `kind`, `target`, `at`, `value`, and `effective`, where `effective` describes the record for the current target and time. `legacy_episode_obs` exposes `value` and `at`; `throughput_source: "under_load"` identifies when the legacy class uses it rather than the regular download. The removed passive source never appears. Known packet estimates appear as `udp_rtt_ms` and `jitter_ms`; `quic_rtt_ms` is a separate diagnostic. `observed_peak_down` and `offered_up` are diagnostic Mbit/s values. Group-level `budget_exhausted` is true only when no eligible regular plan fits.
 
 Real-traffic observations are **diagnostic and trigger-only**, never ranking credit, floor proof, improvement confirmation, or a reason to skip an active test, on any engine. A per-member `1s` read-byte ring drives degradation triggers and `observed_peak_down`, the best `5s` read mean in the last `6h`. The analogous write diagnostic is `offered_up`. Status and insights label these as “observed during use”; they are never compared with targets. Buffered reads and locally accepted writes do not prove delivered capacity.
 These diagnostics describe traffic observed since the VPN started on this network. Their in-memory ring resets after a restart or network change; it is not persisted.
 
-Download uses parallel HTTP/1.1 GET streams. Each begins with `1,000,000` bytes and adapts subsequent request sizes toward `2s`, within `1 MB` to `25 MB` per request. Completed requests reach EOF for connection reuse. Warmup begins at the first response headers; measurement uses aligned `1s` bins after warmup, excluding a partial final bin. `download` is the median bin, with `download_p10` and `download_mean` diagnostics. At least five complete bins and bytes from every stream are required. At window end, requests stop and in-flight work is cancelled; trailing bytes are charged but not ranked.
+Download uses parallel HTTP/1.1 GET streams. Each begins with `1,000,000` bytes and adapts subsequent request sizes toward `4s`, within `1 MB` to `100 MB` (`100,000,000` bytes) per request. Completed requests reach EOF for connection reuse. Warmup begins at the first response headers; measurement uses aligned `1s` bins after warmup, excluding a partial final bin. `download` is the median bin, with `download_p10` and `download_mean` diagnostics. At least five complete bins and bytes from every stream are required. At window end, requests stop and in-flight work is cancelled; trailing bytes are charged but not ranked.
 
-Upload uses parallel POST streams, bootstrapping at `65,536` bytes from the uplink itself and adapting toward `1s` per verified POST, between `64 KiB` and `25 MB`. Each observation runs from the first written body byte through the final matching receipt; delayed responses can only lower the reported rate. The measured set contains POSTs started after upload warmup and before window end. `upload` is their total verified bytes divided by the span from earliest start to latest final response, aggregated across streams. At least three POSTs must qualify, and every POST in the set must complete with its matching receipt. A `5s` tail permits in-flight completion; any unverified, cancelled, or mismatched member makes the phase inconclusive. `upload_post_min` is a diagnostic minimum per-POST rate multiplied by streams; no synthetic upload median or p10 is reported.
+Upload uses parallel POST streams, bootstrapping at `65,536` bytes from the uplink itself and adapting toward `2s` per verified POST, between `64 KiB` and `25 MB` (`25,000,000` bytes). Each observation runs from the first written body byte through the final matching receipt; delayed responses can only lower the reported rate. The measured set contains POSTs started after upload warmup and before window end. `upload` is their total verified bytes divided by the span from earliest start to latest final response, aggregated across streams. At least three POSTs must qualify, and every POST in the set must complete with its matching receipt. A `5s` tail permits in-flight completion; any unverified, cancelled, or mismatched member makes the phase inconclusive. `upload_post_min` is a diagnostic minimum per-POST rate multiplied by streams; no synthetic upload median or p10 is reported.
+
+Download and upload evidence remains raw, without RTT compensation. At the adaptive request targets, conservative residual per-request round-trip bias is about `RTT / 4s` for download and `RTT / 2s` for upload. Request byte caps can shorten transfers and increase that bias.
 
 #### Degradation checks
 

@@ -300,6 +300,10 @@ func (s *Smart) chooseProfileImprovementLocked(now time.Time) {
 		s.resetProfileImprovementLocked()
 		return
 	}
+	if !s.profileCriterionFreshLocked(winner, criterion, now) {
+		s.resetProfileImprovementLocked()
+		return
+	}
 	observation := smartCriterionObservation(winner, criterion)
 	if winner != s.improvementCandidate || criterion != winner.improvementCriterion {
 		s.resetProfileImprovementLocked()

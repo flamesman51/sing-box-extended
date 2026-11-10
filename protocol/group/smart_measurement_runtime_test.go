@@ -22,11 +22,11 @@ func TestSmartMeasurementPlanEstimatesOnlyPlannedDirections(t *testing.T) {
 	s.primary.throughput = smartThroughput{Download: 25, At: now, Source: "active", UploadResult: smartDirectionResult{Value: 10000, At: now, Valid: true}}
 	s.standby.throughput = smartThroughput{Download: 25, At: now, Source: "active"}
 	plan := s.downloadMeasurementPlanLocked()
-	if got := s.measurementEstimateLocked(s.primary, plan, nil); got != 34_375_000 {
+	if got := s.measurementEstimateLocked(s.primary, plan, nil); got != 38_671_875 {
 		t.Fatalf("download-only estimate=%d", got)
 	}
 	e := smartTestDegradationEpisode(s, now)
-	if got := s.measurementEstimateLocked(s.primary, e.plan, e); got != 68_750_000 {
+	if got := s.measurementEstimateLocked(s.primary, e.plan, e); got != 77_343_750 {
 		t.Fatalf("two-download estimate=%d", got)
 	}
 	ledger, err := getSmartLedger(new(smartLedgerTestCache))
@@ -45,7 +45,7 @@ func TestSmartMeasurementPlanEstimatesOnlyPlannedDirections(t *testing.T) {
 	s.options.Throughput.Upload = &disabled
 	s.primary.throughput.At = now.Add(-25 * time.Hour)
 	regular := s.regularMeasurementPlanLocked(s.primary, now)
-	if regular.Download == nil || regular.Upload != nil || s.measurementEstimateLocked(s.primary, regular, nil) != 34_375_000 {
+	if regular.Download == nil || regular.Upload != nil || s.measurementEstimateLocked(s.primary, regular, nil) != 38_671_875 {
 		t.Fatal("disabled upload entered regular estimate")
 	}
 }
@@ -144,6 +144,16 @@ func TestSmartMeasurementStatusDirectionalSourcesAndFloor(t *testing.T) {
 	}
 	if member["floor_state"].(map[string]any)["effective"] != true || member["udp_rtt_ms"] != float64(10) || member["jitter_ms"] != float64(0) {
 		t.Fatal(encoded)
+	}
+	for _, field := range []string{"download_at", "upload_at", "download_p10_mbps", "download_mean_mbps", "upload_post_min_mbps"} {
+		if _, exists := member[field]; exists {
+			t.Fatalf("redundant flat measurement field %q remains", field)
+		}
+	}
+	download, upload := member["download"].(map[string]any), member["upload"].(map[string]any)
+	if download["at"] != float64(now.Add(-time.Hour).Unix()) || download["fresh"] != true || download["p10"] != nil || download["mean"] != nil ||
+		upload["at"] != nil || upload["fresh"] != false || upload["post_min"] != nil {
+		t.Fatal("nested measurements lost timestamps, freshness or diagnostics")
 	}
 	if _, exists := member["offered_up"]; !exists {
 		t.Fatal("missing write diagnostic")
@@ -337,5 +347,32 @@ func TestSmartMeasurementEpisodeCancelsWhenEitherMemberLeavesHealthy(t *testing.
 		if e.ctx.Err() == nil || s.degradation.episode != nil {
 			t.Fatal("unhealthy episode member did not cancel the entire plan")
 		}
+	}
+}
+
+func TestSmartMigratedLegacyUploadSurvivesVerifiedReplacement(t *testing.T) {
+	s, clock := smartTestGroup()
+	defer s.Close()
+	now := clock.Now()
+	stat := s.history.statistic(s.network.Key, s.primary.identity, now)
+	stat.Upload = 10
+	s.dirty = false
+	s.restoreThroughputLocked(now)
+	if !s.dirty {
+		t.Error("legacy upload migration did not mark history dirty")
+	}
+	verified := smartDirectionResult{Value: 3, At: now, Valid: true, Source: "active", Streams: 1, Window: 8 * time.Second}
+	s.applyMeasurementResultLocked(smartResult{member: s.primary, measurement: smartMeasurementResult{Upload: verified}}, now)
+	encoded, err := s.history.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.history, err = decodeSmartHistory(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.restoreThroughputLocked(now)
+	if s.primary.throughput.LegacyUpload != 10 || s.primary.throughput.UploadResult != verified {
+		t.Fatalf("verified replacement lost migrated diagnostic: %+v", s.primary.throughput)
 	}
 }

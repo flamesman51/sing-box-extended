@@ -334,3 +334,70 @@ func TestSmartPartialBurstDoesNotRefreshConfirmationObservation(t *testing.T) {
 		t.Fatal("partial burst extended an old RTT or jitter confirmation observation")
 	}
 }
+
+func TestSmartSTUNConfirmationBlocksOverlappingAdmission(t *testing.T) {
+	for _, criterion := range []string{"rtt", "jitter"} {
+		t.Run(criterion, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.rank = []string{criterion}
+			primary, candidate := s.primary, s.standby
+			smartApplyRTTTestResult(s, primary, []float64{40, 40, 40, 40, 40, 100, 100, 100, 100, 100}, []int{5, 5}, clock.Now())
+			smartApplyRTTTestResult(s, candidate, []float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, []int{5, 5}, clock.Now())
+			clock.Advance(s.preference.confirmationInterval)
+			if !s.scheduleImprovementConfirmationLocked(clock.Now()) {
+				t.Fatal("STUN confirmation was not scheduled")
+			}
+			admission := smartAwaitConfirmationAdmission(t, s, clock)
+			s.applyAdmissionLocked(admission, clock.Now())
+			if len(s.pending) != 1 || s.pending[0].kind != "udp" {
+				t.Fatal("STUN confirmation was not queued")
+			}
+			job := s.pending[0]
+			s.startThroughputAdmissionLocked(candidate, clock.Now())
+			if job.ctx.Err() != nil || s.admission != nil {
+				t.Fatal("regular admission cancelled or overlapped the live STUN confirmation")
+			}
+			s.pending = nil
+			s.applyResultLocked(smartResult{member: candidate, kind: job.kind, purpose: job.purpose,
+				udpRTTs: []float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, udpBursts: 2, udpBurstSizes: []int{5, 5},
+				generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration,
+				primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
+			s.startThroughputAdmissionLocked(candidate, clock.Now())
+			if s.admission == nil {
+				t.Fatal("completed STUN confirmation blocked regular admission")
+			}
+		})
+	}
+}
+
+func TestSmartExpiredRTTConfirmationCannotSwitchAfterDwell(t *testing.T) {
+	for _, criterion := range []string{"rtt", "jitter"} {
+		t.Run(criterion, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.rank = []string{criterion}
+			s.preference.dwell = time.Hour
+			s.selectedAt = clock.Now()
+			primary, candidate := s.primary, s.standby
+			smartApplyRTTTestResult(s, primary, []float64{40, 40, 40, 40, 40, 100, 100, 100, 100, 100}, []int{5, 5}, clock.Now())
+			for range s.preference.confirmations {
+				smartApplyRTTTestResult(s, candidate, []float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, []int{5, 5}, clock.Now())
+				clock.Advance(s.preference.confirmationInterval)
+			}
+			if candidate.improvementObservations != s.preference.confirmations || s.primary != primary {
+				t.Fatal("confirmations did not complete before dwell")
+			}
+			clock.Advance(30 * time.Minute)
+			// Keep generic UDP healthy without refreshing the decisive burst or cohort.
+			candidate.udp = smartEvidence{state: "ok", at: clock.Now(), expires: clock.Now().Add(2 * time.Hour)}
+			s.chooseLocked(clock.Now())
+			if candidate.improvementObservations != 0 {
+				t.Error("expired decisive observations preserved confirmation count")
+			}
+			clock.Advance(time.Hour)
+			s.chooseLocked(clock.Now())
+			if s.primary != primary {
+				t.Fatal("expired RTT or jitter evidence switched after dwell")
+			}
+		})
+	}
+}

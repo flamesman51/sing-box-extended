@@ -151,6 +151,47 @@ func smartTestPhase(streams int) *smartMeasurementPhase {
 	return &smartMeasurementPhase{Streams: streams, Warmup: time.Second, Window: 5 * time.Second}
 }
 
+func smartTestUploadPhase(streams int) *smartMeasurementPhase {
+	phase := smartTestPhase(streams)
+	phase.Window = 8 * time.Second
+	return phase
+}
+
+func TestSmartAdaptiveSize(t *testing.T) {
+	for _, direction := range []struct {
+		name    string
+		target  time.Duration
+		minimum int64
+		maximum int64
+		want    int64
+		cap     int64
+	}{
+		{"download", smartDownloadRequestTarget, 1_000_000, smartDownloadRequestLimit, 4_000_000, 100_000_000},
+		{"upload", smartUploadRequestTarget, 65_536, smartUploadRequestLimit, 2_000_000, 25_000_000},
+	} {
+		t.Run(direction.name, func(t *testing.T) {
+			for _, test := range []struct {
+				name    string
+				bytes   int64
+				elapsed time.Duration
+				want    int64
+			}{
+				{"target", 1_000_000, time.Second, direction.want},
+				{"cap", 100_000_000, time.Millisecond, direction.cap},
+				{"minimum", 1, time.Second, direction.minimum},
+				{"zero_elapsed", 1_000_000, 0, direction.minimum},
+				{"negative_elapsed", 1_000_000, -time.Second, direction.minimum},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					if got := smartAdaptiveSize(test.bytes, test.elapsed, direction.target, direction.minimum, direction.maximum); got != test.want {
+						t.Fatalf("adaptive size = %d, want %d", got, test.want)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestSmartMeasurementPacedDownloadTwentyMbps(t *testing.T) {
 	t.Parallel()
 	server := &smartMeasurementServer{downRate: func(time.Duration) float64 { return 20 }}
@@ -171,8 +212,8 @@ func TestSmartMeasurementPacedDownloadTwentyMbps(t *testing.T) {
 	}
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if len(server.requests) < 2 || server.requests[0] != 1_000_000 || server.requests[1] < 4_500_000 || server.requests[1] > 5_250_000 {
-		t.Fatalf("adaptive ~2 s requests: %v", server.requests)
+	if len(server.requests) < 2 || server.requests[0] != 1_000_000 || server.requests[1] < 9_000_000 || server.requests[1] > 10_500_000 {
+		t.Fatalf("adaptive ~4 s requests: %v", server.requests)
 	}
 }
 
@@ -260,7 +301,7 @@ func TestSmartMeasurementUploadRejectsEarlyAndMismatchedReceipts(t *testing.T) {
 		t.Run(receipt, func(t *testing.T) {
 			t.Parallel()
 			server := &smartMeasurementServer{receipt: receipt, upRate: func(int, int) float64 { return 10 }}
-			result, meter, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestPhase(1)})
+			result, meter, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestUploadPhase(1)})
 			if result.Upload.Valid || result.UploadUnverified != (receipt != "mismatch") || meter.chargedBytes() == 0 {
 				t.Fatalf("bad receipt became evidence: %+v charged=%d", result, meter.chargedBytes())
 			}
@@ -271,7 +312,7 @@ func TestSmartMeasurementUploadRejectsEarlyAndMismatchedReceipts(t *testing.T) {
 func TestSmartMeasurementUnequalUploadWallClockAggregate(t *testing.T) {
 	t.Parallel()
 	server := &smartMeasurementServer{upRate: func(id, _ int) float64 { return float64(id) * .5 }}
-	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestPhase(4)})
+	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestUploadPhase(4)})
 	if !result.Upload.Valid || len(result.UploadPosts) < 3 {
 		t.Fatalf("no verified cohort: %+v posts=%v", result.Upload, result.UploadPosts)
 	}
@@ -303,13 +344,13 @@ func TestSmartMeasurementUnequalUploadWallClockAggregate(t *testing.T) {
 func TestSmartMeasurementDelayedWarmupPostExcludedAndConservative(t *testing.T) {
 	t.Parallel()
 	server := &smartMeasurementServer{upRate: func(int, int) float64 { return 4 }, delay: func(int, int) time.Duration { return 1400 * time.Millisecond }}
-	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestPhase(1)})
+	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestUploadPhase(1)})
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	if !result.Upload.Valid || len(server.posts) < 4 || len(result.UploadPosts) != len(server.posts)-1 {
 		t.Fatalf("warmup set: %+v measured=%v server=%v", result.Upload, result.UploadPosts, server.posts)
 	}
-	if result.UploadPosts[0].Start.Before(server.posts[0].End) || result.Upload.Value >= 1 {
+	if result.UploadPosts[0].Start.Before(server.posts[0].End) || result.Upload.Value >= 2 {
 		t.Fatalf("delayed response inflated rate or warmup counted: %+v", result.Upload)
 	}
 }
@@ -323,14 +364,14 @@ func TestSmartMeasurementUploadRateDropPastTailInconclusive(t *testing.T) {
 		return 1
 	}}
 	started := time.Now()
-	result, meter, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestPhase(1)})
+	result, meter, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: smartTestUploadPhase(1)})
 	verified := 0
 	for _, post := range result.UploadPosts {
 		if post.Verified {
 			verified++
 		}
 	}
-	if result.Upload.Valid || verified < 3 || meter.chargedBytes() == 0 || time.Since(started) > 13*time.Second {
+	if result.Upload.Valid || verified < 3 || meter.chargedBytes() == 0 || time.Since(started) > 16*time.Second {
 		t.Fatalf("tail truncation became success: %+v posts=%v elapsed=%s", result.Upload, result.UploadPosts, time.Since(started))
 	}
 	if !slices.ContainsFunc(result.UploadPosts, func(post smartUploadObservation) bool { return !post.Verified }) {
@@ -341,11 +382,37 @@ func TestSmartMeasurementUploadRateDropPastTailInconclusive(t *testing.T) {
 func TestSmartMeasurementAsymmetricUploadBootstrapsIndependently(t *testing.T) {
 	t.Parallel()
 	server := &smartMeasurementServer{downRate: func(time.Duration) float64 { return 100 }, upRate: func(int, int) float64 { return 1 }}
-	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Download: smartTestPhase(1), Upload: smartTestPhase(1)})
+	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Download: smartTestPhase(1), Upload: smartTestUploadPhase(1)})
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if !result.Download.Valid || !result.Upload.Valid || len(server.posts) < 2 || server.posts[0].Bytes != 65_536 || server.posts[1].Bytes < 110_000 || server.posts[1].Bytes > 130_000 || math.Abs(result.Upload.Value-1) > .1 {
+	if !result.Download.Valid || !result.Upload.Valid || len(server.posts) < 2 || server.posts[0].Bytes != 65_536 || server.posts[1].Bytes < 220_000 || server.posts[1].Bytes > 260_000 || math.Abs(result.Upload.Value-1) > .1 {
 		t.Fatalf("100/1 bootstrap: %+v posts=%v", result, server.posts)
+	}
+}
+
+func TestSmartMeasurementDefaultUploadWindowExcludesWarmupCrossingPost(t *testing.T) {
+	t.Parallel()
+	server := &smartMeasurementServer{upRate: func(int, int) float64 { return 1 }}
+	phase := smartTestUploadPhase(1)
+	phase.Warmup = 2 * time.Second
+	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: phase})
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if !result.Upload.Valid || len(result.UploadPosts) < 3 || len(server.posts) < 5 {
+		t.Fatalf("default upload window lacks a measured cohort: %+v posts=%v", result.Upload, result.UploadPosts)
+	}
+	warmupEnd := server.posts[0].Start.Add(phase.Warmup)
+	crossing := server.posts[1]
+	if !crossing.Start.Before(warmupEnd) || !crossing.End.After(warmupEnd) {
+		t.Fatalf("second POST did not cross warmup: warmup_end=%s post=%+v", warmupEnd, crossing)
+	}
+	if len(result.UploadPosts) != len(server.posts)-2 || result.UploadPosts[0].Start.Before(crossing.End) {
+		t.Fatalf("warmup-crossing POST entered measured evidence: measured=%v server=%v", result.UploadPosts, server.posts)
+	}
+	for _, post := range result.UploadPosts {
+		if !post.Verified {
+			t.Fatalf("measured POST lacks a receipt: %+v", post)
+		}
 	}
 }
 
@@ -357,12 +424,12 @@ func TestSmartMeasurementOverestimatedUploadAdaptsDown(t *testing.T) {
 		}
 		return 1
 	}}
-	phase := smartTestPhase(1)
-	phase.Window = 8 * time.Second
+	phase := smartTestUploadPhase(1)
+	phase.Window = 14 * time.Second
 	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Upload: phase})
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if !result.Upload.Valid || len(server.posts) < 3 || server.posts[1].Bytes < 400_000 || server.posts[2].Bytes > 130_000 || math.Abs(result.Upload.Value-1) > .1 {
+	if !result.Upload.Valid || len(server.posts) < 3 || server.posts[1].Bytes < 800_000 || server.posts[2].Bytes > 260_000 || math.Abs(result.Upload.Value-1) > .1 {
 		t.Fatalf("overestimated POST did not adapt down: %+v posts=%v", result.Upload, server.posts)
 	}
 }
@@ -370,7 +437,7 @@ func TestSmartMeasurementOverestimatedUploadAdaptsDown(t *testing.T) {
 func TestSmartMeasurementInconclusiveUploadKeepsDownload(t *testing.T) {
 	t.Parallel()
 	server := &smartMeasurementServer{receipt: "missing", downRate: func(time.Duration) float64 { return 20 }, upRate: func(int, int) float64 { return 1 }}
-	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Download: smartTestPhase(1), Upload: smartTestPhase(1)})
+	result, _, _ := smartRunMeasurement(t, server, smartMeasurementPlan{Download: smartTestPhase(1), Upload: smartTestUploadPhase(1)})
 	if !result.Download.Valid || result.Upload.Valid || !result.UploadUnverified {
 		t.Fatalf("upload erased independent download: %+v", result)
 	}

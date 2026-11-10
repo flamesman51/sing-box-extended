@@ -31,13 +31,13 @@ func (s *Smart) normalizeMeasurementOptions() {
 		t.Window = badoption.Duration(7 * time.Second)
 	}
 	if t.Warmup == 0 {
-		t.Warmup = badoption.Duration(time.Second)
+		t.Warmup = badoption.Duration(2 * time.Second)
 	}
 	if t.UploadWindow == 0 {
-		t.UploadWindow = badoption.Duration(7 * time.Second)
+		t.UploadWindow = badoption.Duration(8 * time.Second)
 	}
 	if t.UploadWarmup == 0 {
-		t.UploadWarmup = badoption.Duration(time.Second)
+		t.UploadWarmup = badoption.Duration(2 * time.Second)
 	}
 	if t.Upload == nil {
 		enabled := true
@@ -55,7 +55,7 @@ func (s *Smart) downloadPhaseLocked() smartMeasurementPhase {
 		window = 7 * time.Second
 	}
 	if warmup == 0 {
-		warmup = time.Second
+		warmup = 2 * time.Second
 	}
 	return smartMeasurementPhase{Streams: streams, Window: window, Warmup: warmup}
 }
@@ -64,10 +64,10 @@ func (s *Smart) uploadPhaseLocked() smartMeasurementPhase {
 	phase := s.downloadPhaseLocked()
 	phase.Window, phase.Warmup = time.Duration(s.options.Throughput.UploadWindow), time.Duration(s.options.Throughput.UploadWarmup)
 	if phase.Window == 0 {
-		phase.Window = 7 * time.Second
+		phase.Window = 8 * time.Second
 	}
 	if phase.Warmup == 0 {
-		phase.Warmup = time.Second
+		phase.Warmup = 2 * time.Second
 	}
 	return phase
 }
@@ -160,12 +160,16 @@ func (s *Smart) cancelMemberMeasurementLocked(member *smartMember) {
 		member.measurementCancel()
 		member.measurementCancel = nil
 	}
+	member.measurementCtx = nil
 }
 
 func (s *Smart) queueDegradationChallengerLocked(episode *smartDegradationEpisode, now time.Time) {
 	member := episode.challenger
 	if !s.degradationValidLocked(episode, now) || member == nil {
 		s.finishDegradationLocked(now, 30*time.Minute, "inconclusive")
+		return
+	}
+	if member.measurementCtx != nil && member.measurementCtx.Err() == nil {
 		return
 	}
 	s.queueLocked(member, "throughput", 0, false, now)
@@ -177,6 +181,11 @@ func (s *Smart) queueDegradationChallengerLocked(episode *smartDegradationEpisod
 			job.timeout = episode.plan.Deadline()
 			episode.accountingWait.Add(1)
 			member.degradationQueued = episode
+			member.measurementCtx, member.measurementCancel = episode.ctx, episode.cancel
+			if s.degradation.attempts == nil {
+				s.degradation.attempts = make(map[string]time.Time)
+			}
+			s.degradation.attempts[member.identity] = now
 			s.degradation.state = "checking"
 			return
 		}
@@ -217,10 +226,14 @@ func (s *Smart) measurementContextLocked(member *smartMember, plan smartMeasurem
 	s.cancelMemberMeasurementLocked(member)
 	ctx, cancel := context.WithTimeout(ctx, plan.Deadline())
 	member.measurementCancel = cancel
+	member.measurementCtx = ctx
 	return ctx
 }
 
 func (s *Smart) measurementPlanAllowedLocked(plan smartMeasurementPlan, now time.Time) bool {
+	if plan.Upload != nil && s.options.Throughput.Upload != nil && !*s.options.Throughput.Upload {
+		return false
+	}
 	if plan.STUNBursts == 0 {
 		return s.throughputAllowedLocked(now)
 	}

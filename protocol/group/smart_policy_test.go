@@ -183,7 +183,7 @@ func TestSmartPolicyStreamsOverride(t *testing.T) {
 		}
 		want := policy.Throughput.Streams
 		var options option.SmartOutboundOptions
-		if err = json.Unmarshal([]byte(`{"preference":{"profile":"phone"},"throughput":{"streams":0,"window":"5s","warmup":"1s","upload":false,"upload_window":"6s","upload_warmup":"2s"}}`), &options); err != nil {
+		if err = json.Unmarshal([]byte(`{"preference":{"profile":"phone"},"throughput":{"streams":0,"window":"5s","warmup":"1s","upload":false,"upload_window":"9s","upload_warmup":"2s"}}`), &options); err != nil {
 			t.Fatal(err)
 		}
 		options.ApplySmartPolicy(policy)
@@ -192,7 +192,7 @@ func TestSmartPolicyStreamsOverride(t *testing.T) {
 			t.Fatal(err)
 		}
 		throughput := s.options.Throughput
-		if throughput.Streams != want || throughput.Window.Build().String() != "5s" || throughput.Upload == nil || *throughput.Upload || throughput.UploadWindow.Build().String() != "6s" {
+		if throughput.Streams != want || throughput.Window.Build().String() != "5s" || throughput.Upload == nil || *throughput.Upload || throughput.UploadWindow.Build().String() != "9s" {
 			t.Fatalf("streams replacement changed measurement controls: %#v", throughput)
 		}
 		resolved := s.resolvedSmartPolicy()

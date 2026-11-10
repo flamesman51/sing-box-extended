@@ -124,6 +124,7 @@ type smartMember struct {
 	downloadUnderLoad                                                         smartDirectionResult
 	passiveBins                                                               *smartPassiveBins
 	measurementCancel                                                         context.CancelFunc
+	measurementCtx                                                            context.Context
 	measurementBackoff                                                        map[smartMeasurementKey]smartMeasurementBackoff
 }
 
@@ -1240,6 +1241,8 @@ func (s *Smart) restoreThroughputLocked(now time.Time) {
 				member.throughput.Upload, member.throughput.UploadAt = stat.UploadResult.Value, stat.UploadResult.At
 			} else if stat.Upload > 0 {
 				member.throughput.LegacyUpload = stat.Upload
+				stat.LegacyUpload = stat.Upload
+				s.dirty = true
 			}
 			s.clearRecoveredFloorLocked(member, now)
 		}

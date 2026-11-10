@@ -85,7 +85,8 @@ func (s *Smart) startDegradationAdmissionLocked(member *smartMember, purpose str
 }
 
 func (s *Smart) startThroughputPurposeAdmissionLocked(member *smartMember, purpose string, episode *smartDegradationEpisode, now time.Time) {
-	if s.admission != nil && s.admission.job.ctx.Err() == nil {
+	if member.measurementCtx != nil && member.measurementCtx.Err() == nil ||
+		s.admission != nil && s.admission.job.ctx.Err() == nil {
 		return
 	}
 	plan := s.regularMeasurementPlanLocked(member, now)
@@ -101,12 +102,15 @@ func (s *Smart) startThroughputPurposeAdmissionLocked(member *smartMember, purpo
 		plan.STUNBursts == 0 && s.measurementPlanBackedOffLocked(member, plan, now) {
 		return
 	}
-	ctx := s.measurementContextLocked(member, plan)
-	if purpose == smartImprovementConfirmation {
-		member.confirmationCancel = member.measurementCancel
-	}
+	var ctx context.Context
 	if episode != nil {
 		ctx = episode.ctx
+		member.measurementCtx, member.measurementCancel = ctx, episode.cancel
+	} else {
+		ctx = s.measurementContextLocked(member, plan)
+	}
+	if purpose == smartImprovementConfirmation {
+		member.confirmationCancel = member.measurementCancel
 	}
 	kind := "throughput"
 	if plan.STUNBursts > 0 {
@@ -215,7 +219,9 @@ func (s *Smart) applyAdmissionLocked(result smartResult, now time.Time) {
 		}
 	}
 	if !accepted {
-		s.cancelMemberMeasurementLocked(job.member)
+		if job.member.measurementCtx == job.ctx {
+			s.cancelMemberMeasurementLocked(job.member)
+		}
 		if job.episode != nil && s.degradation.episode == job.episode {
 			s.finishDegradationLocked(now, 30*time.Minute, "admission_blocked")
 		}

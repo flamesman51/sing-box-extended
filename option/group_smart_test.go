@@ -184,7 +184,7 @@ func TestSmartMeasurementFieldPresence(t *testing.T) {
 			if err := throughput.ValidateMeasurementFields(true); err == nil {
 				t.Fatal("profile accepted explicit zero")
 			}
-			if err := decode.run([]byte(`{"throughput":{"streams":2,"window":"5s","warmup":"1s","upload":false,"upload_window":"5s","upload_warmup":"1s"}}`), &options); err != nil {
+			if err := decode.run([]byte(`{"throughput":{"streams":2,"window":"5s","warmup":"1s","upload":false,"upload_window":"8s","upload_warmup":"1s"}}`), &options); err != nil {
 				t.Fatal(err)
 			}
 			if err := options.ValidateProfileFields(); err != nil {
@@ -218,7 +218,7 @@ func TestSmartMeasurementFieldPresence(t *testing.T) {
 func TestSmartMeasurementFieldBounds(t *testing.T) {
 	for _, field := range []string{
 		`"streams":-1`, `"window":"-1s"`, `"window":"4.999s"`, `"warmup":"999ms"`,
-		`"upload_window":"4.999s"`, `"upload_warmup":"999ms"`,
+		`"upload_window":"4.999s"`, `"upload_window":"5s"`, `"upload_window":"7.999s"`, `"upload_warmup":"999ms"`,
 	} {
 		t.Run(field, func(t *testing.T) {
 			var throughput SmartThroughputOptions
@@ -248,7 +248,7 @@ func TestSmartMeasurementFieldBounds(t *testing.T) {
 
 func TestSmartPolicyReplacesStreamsOnly(t *testing.T) {
 	var options, policy SmartOutboundOptions
-	if err := json.Unmarshal([]byte(`{"throughput":{"streams":0,"window":"5s","warmup":"1s","upload":false,"upload_window":"6s","upload_warmup":"2s"}}`), &options); err != nil {
+	if err := json.Unmarshal([]byte(`{"throughput":{"streams":0,"window":"5s","warmup":"1s","upload":false,"upload_window":"9s","upload_warmup":"2s"}}`), &options); err != nil {
 		t.Fatal(err)
 	}
 	before := options.Throughput

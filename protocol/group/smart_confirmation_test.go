@@ -455,8 +455,8 @@ func TestSmartDailyBudgetDeniesPairButAllowsRegularConfirmations(t *testing.T) {
 			primary.throughput.Download = 3
 			candidate.throughput = smartThroughput{}
 			s.selectedAt = clock.Now()
-			// A 45 MB daily remainder fits one default 25 Mbit/s phase, not the pair.
-			s.ledger.Register(s.Tag(), map[string]float64{"wifi": 45, "cellular": 45})
+			// A 50 MB remainder fits a default phase and a 30 Mbit/s confirmation, not the pair.
+			s.ledger.Register(s.Tag(), map[string]float64{"wifi": 50, "cellular": 50})
 			e := smartTestDegradationEpisode(s, clock.Now())
 			s.startDegradationAdmissionLocked(primary, smartDegradationConfirmation, e, clock.Now())
 			var admission smartResult
@@ -925,5 +925,46 @@ func TestSmartDegradationPhasesNeverConfirmDownloadImprovement(t *testing.T) {
 	}
 	if primary.throughput != primaryDownload || candidate.throughput != candidateDownload {
 		t.Fatal("degradation phases replaced regular download observation provenance")
+	}
+}
+
+func TestSmartUploadConfirmationRespectsDisabledUpload(t *testing.T) {
+	for _, disableAt := range []string{"planning", "admission"} {
+		t.Run(disableAt, func(t *testing.T) {
+			s, clock := smartProfileThroughputTestGroup(t)
+			s.preference.rank = []string{"upload"}
+			primary, candidate := s.primary, s.standby
+			primary.throughput.UploadResult = smartDirectionResult{Value: 1, At: clock.Now(), Valid: true}
+			candidate.throughput.UploadResult = smartDirectionResult{Value: 10, At: clock.Now(), Valid: true}
+			s.selectedAt = clock.Now()
+			s.chooseLocked(clock.Now())
+			clock.Advance(s.preference.confirmationInterval)
+			disabled := false
+			if disableAt == "planning" {
+				s.options.Throughput.Upload = &disabled
+				if plan := s.smartConfirmationPlanLocked(candidate); plan.Upload != nil {
+					t.Error("disabled upload entered confirmation plan")
+				}
+				if s.scheduleImprovementConfirmationLocked(clock.Now()) {
+					t.Fatal("disabled upload confirmation entered admission")
+				}
+			} else {
+				if !s.scheduleImprovementConfirmationLocked(clock.Now()) {
+					t.Fatal("enabled upload confirmation was not admitted")
+				}
+				result := smartAwaitConfirmationAdmission(t, s, clock)
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+				s.options.Throughput.Upload = &disabled
+				s.applyAdmissionLocked(result, clock.Now())
+				if len(s.pending) != 0 || candidate.queued["throughput"] {
+					t.Fatal("upload disabled during admission still queued POSTs")
+				}
+			}
+			if s.improvementCandidate != candidate || candidate.improvementObservations != 1 || s.primary != primary {
+				t.Fatal("disabled upload reset the pending observation")
+			}
+		})
 	}
 }

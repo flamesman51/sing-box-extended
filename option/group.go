@@ -268,7 +268,7 @@ func (o *SmartThroughputOptions) ValidateMeasurementFields(profile bool) error {
 	}{
 		{"window", o.Window, o.windowSet, 5 * time.Second},
 		{"warmup", o.Warmup, o.warmupSet, time.Second},
-		{"upload_window", o.UploadWindow, o.uploadWindowSet, 5 * time.Second},
+		{"upload_window", o.UploadWindow, o.uploadWindowSet, 8 * time.Second},
 		{"upload_warmup", o.UploadWarmup, o.uploadWarmupSet, time.Second},
 	} {
 		if (field.value != 0 || (profile && field.present)) && time.Duration(field.value) < field.minimum {

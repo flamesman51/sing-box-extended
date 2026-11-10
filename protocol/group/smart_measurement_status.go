@@ -24,14 +24,6 @@ func (s *Smart) measurementStatusLocked(member *smartMember, entry map[string]an
 	}
 	entry["download"] = smartDirectionStatus(download, true, now)
 	entry["upload"] = smartDirectionStatus(value.UploadResult, false, now)
-	entry["download_at"], entry["upload_at"] = smartTime(download.At), smartTime(value.UploadResult.At)
-	entry["download_p10_mbps"], entry["download_mean_mbps"], entry["upload_post_min_mbps"] = nil, nil, nil
-	if download.Valid && now.Sub(download.At) < 24*time.Hour {
-		entry["download_p10_mbps"], entry["download_mean_mbps"] = smartNumber(download.P10), smartNumber(download.Mean)
-	}
-	if value.UploadResult.Valid && now.Sub(value.UploadResult.At) < 24*time.Hour {
-		entry["upload_post_min_mbps"] = smartNumber(value.UploadResult.PostMin)
-	}
 	if value.UploadUnverified {
 		entry["upload_status"] = "unverified"
 	} else if value.UploadInconclusive {
