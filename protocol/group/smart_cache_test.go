@@ -129,3 +129,43 @@ func TestSmartStartPreservesHistoryLoadErrors(t *testing.T) {
 		t.Fatalf("history load error = %v, want %v", err, want)
 	}
 }
+
+func TestSmartFailedReplacementKeepsLiveHistoryOwnership(t *testing.T) {
+	for _, failure := range []string{"missing-member", "invalid-history"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx := context.Background()
+			cache := cachefile.New(ctx, nil, option.CacheFileOptions{Path: filepath.Join(t.TempDir(), "cache.db")})
+			scope := adapter.NewScope(ctx, nil)
+			if err := cache.Start(adapter.StartStateInitialize, scope); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = scope.Close() })
+			live := newSmartCacheTestGroup(t, cache, "auto")
+			if err := live.Start(adapter.StartStateStart, scope); err != nil {
+				t.Fatal(err)
+			}
+			replacement := newSmartCacheTestGroup(t, cache, "auto")
+			if failure == "missing-member" {
+				replacement.options.Outbounds = []string{"missing"}
+			} else if err := cache.SaveSmartHistory("auto", &adapter.SmartHistory{Data: []byte("invalid"), Generation: live.historyGeneration}); err != nil {
+				t.Fatal(err)
+			}
+			if err := replacement.Start(adapter.StartStateStart, scope); err == nil {
+				t.Fatal("invalid replacement unexpectedly started")
+			}
+			live.recordObservationLocked(live.primary, true, time.Millisecond, live.clock.Now())
+			live.flushHistory(true)
+			stored, err := cache.LoadSmartHistory("auto")
+			if err != nil {
+				t.Fatal(err)
+			}
+			history, err := decodeSmartHistory(stored.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if history.Stats[live.network.Key][live.primary.identity] == nil {
+				t.Fatal("failed replacement fenced out the surviving group's history")
+			}
+		})
+	}
+}

@@ -313,9 +313,6 @@ func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			s.priors = ledger.Metadata().Priors[s.Tag()]
 		}
 		if s.cache != nil {
-			if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
-				s.historyGeneration = generations.NewSmartHistoryGeneration(s.Tag())
-			}
 			stored, err := s.cache.LoadSmartHistory(s.Tag())
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
@@ -342,6 +339,9 @@ func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			member.startupRank = rank
 		}
 		s.primary = s.members[0]
+		if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
+			s.historyGeneration = generations.NewSmartHistoryGeneration(s.Tag())
+		}
 	case adapter.StartStateStarted:
 		ctx := s.ctx
 		s.workCtx, s.workCancel = context.WithCancel(ctx)

@@ -517,22 +517,23 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 			}
 		}
 		s.persistenceMu.Lock()
-		if s.cache != nil {
-			if err := s.cache.ResetSmartHistory(s.Tag()); err != nil {
-				if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
-					s.mu.Lock()
-					s.historyGeneration = generations.NewSmartHistoryGeneration(s.Tag())
-					s.mu.Unlock()
-				}
-				s.persistenceMu.Unlock()
-				return err
-			}
+		s.mu.Lock()
+		generation := s.historyGeneration
+		s.mu.Unlock()
+		var resetErr error
+		if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
+			generation, resetErr = generations.ResetSmartHistoryGeneration(s.Tag(), generation)
+		} else if s.cache != nil {
+			resetErr = s.cache.ResetSmartHistory(s.Tag())
 		}
 		s.mu.Lock()
-		s.priors = nil
-		if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
-			s.historyGeneration = generations.NewSmartHistoryGeneration(s.Tag())
+		s.historyGeneration = generation
+		if resetErr != nil {
+			s.mu.Unlock()
+			s.persistenceMu.Unlock()
+			return resetErr
 		}
+		s.priors = nil
 		s.history.Reset()
 		s.eventLocked("reset", "", "", s.network.Key, "learned history reset; live health and budget retained", s.clock.Now())
 		s.notifyUpdatedLocked()

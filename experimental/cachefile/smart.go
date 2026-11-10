@@ -22,6 +22,10 @@ var _ adapter.SmartHistoryGeneration = (*CacheFile)(nil)
 func (c *CacheFile) NewSmartHistoryGeneration(group string) uint64 {
 	c.smartAccess.Lock()
 	defer c.smartAccess.Unlock()
+	return c.nextSmartHistoryGenerationLocked(group)
+}
+
+func (c *CacheFile) nextSmartHistoryGenerationLocked(group string) uint64 {
 	if c.smartGenerations == nil {
 		c.smartGenerations = make(map[string]uint64)
 	}
@@ -84,6 +88,24 @@ func (c *CacheFile) ResetSmartHistory(group string) error {
 		}
 		return bucket.Delete([]byte(group))
 	})
+}
+
+func (c *CacheFile) ResetSmartHistoryGeneration(group string, generation uint64) (uint64, error) {
+	next := generation
+	err := c.update(func(tx *bbolt.Tx) error {
+		c.smartAccess.Lock()
+		defer c.smartAccess.Unlock()
+		if generation != c.smartGenerations[group] {
+			return os.ErrInvalid
+		}
+		next = c.nextSmartHistoryGenerationLocked(group)
+		bucket := c.bucket(tx, bucketSmartHistory)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete([]byte(group))
+	})
+	return next, err
 }
 
 func (c *CacheFile) LoadSmartMetadata() (*adapter.SmartMetadata, error) {

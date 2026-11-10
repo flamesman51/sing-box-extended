@@ -25,6 +25,8 @@ type SmartHistory struct {
 type SmartHistoryGeneration interface {
 	// NewSmartHistoryGeneration invalidates earlier tokens for this cache ID and group.
 	NewSmartHistoryGeneration(group string) uint64
+	// ResetSmartHistoryGeneration resets only the current owner and returns its next token.
+	ResetSmartHistoryGeneration(group string, generation uint64) (uint64, error)
 }
 
 // SmartMetadata is an engine-owned, installation-wide metadata document.

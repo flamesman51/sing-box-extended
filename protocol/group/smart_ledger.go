@@ -75,6 +75,8 @@ type smartLedger struct {
 	operation    chan struct{}
 	operations   int
 	ready        chan struct{}
+	retireStop   chan struct{}
+	retireDone   chan struct{}
 	loadErr      error
 	cache        adapter.CacheFile
 	installation smartInstallation
@@ -129,12 +131,15 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 	}
 	ledger := &smartLedger{
 		cache: cache, operation: make(chan struct{}, 1), ready: make(chan struct{}),
+		retireStop: make(chan struct{}), retireDone: make(chan struct{}),
 		limits: make(map[string]map[string]float64), raw: make(map[string]json.RawMessage),
 	}
 	smartLedgers.byCache[cache] = ledger
 	smartLedgers.Unlock()
 	if cacheDone != nil {
 		go ledger.retireOnCacheClose(cacheDone)
+	} else {
+		close(ledger.retireDone)
 	}
 	ledger.loadErr = ledger.initialize()
 	if ledger.loadErr != nil {
@@ -150,13 +155,20 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 }
 
 func (l *smartLedger) retireOnCacheClose(done <-chan struct{}) {
+	defer close(l.retireDone)
 	select {
+	case <-l.retireStop:
+		return
 	case <-done:
 	case <-l.ready:
 		if l.loadErr != nil {
 			return
 		}
-		<-done
+		select {
+		case <-done:
+		case <-l.retireStop:
+			return
+		}
 	}
 	smartLedgers.Lock()
 	if smartLedgers.byCache[l.cache] == l {
@@ -233,6 +245,7 @@ func (l *smartLedger) prune() {
 	defer l.mu.Unlock()
 	if l.cache != nil && len(l.limits) == 0 && l.operations == 0 && len(l.state.Reservations) == 0 && l.pending.id == "" && smartLedgers.byCache[l.cache] == l {
 		delete(smartLedgers.byCache, l.cache)
+		close(l.retireStop)
 	}
 }
 

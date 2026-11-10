@@ -184,3 +184,27 @@ func TestSmartLedgerCacheRetirementDropsFailedReconciliationOwner(t *testing.T) 
 		}
 	})
 }
+
+func TestSmartLedgerPruneStopsCacheRetirementWatcher(t *testing.T) {
+	cache := &smartLedgerLifetimeCache{smartLedgerBlockingCache: new(smartLedgerBlockingCache), done: make(chan struct{})}
+	defer close(cache.done)
+	for range 10 {
+		ledger, err := acquireSmartLedger(cache, "auto", map[string]float64{"wifi": 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledger.Unregister("auto")
+		smartLedgerWait(t, ledger.retireDone)
+		select {
+		case <-cache.done:
+			t.Fatal("watcher stopped only because cache closed")
+		default:
+		}
+		smartLedgers.Lock()
+		retained := smartLedgers.byCache[cache]
+		smartLedgers.Unlock()
+		if retained != nil {
+			t.Fatal("pruned ledger remains registered")
+		}
+	}
+}

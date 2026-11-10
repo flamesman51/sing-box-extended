@@ -205,3 +205,50 @@ func TestSmartHistoryGenerationCannotWrapToLegacy(t *testing.T) {
 	}()
 	cache.NewSmartHistoryGeneration("auto")
 }
+
+func TestSmartHistoryResetRejectsStaleOwnerInsideTransaction(t *testing.T) {
+	cache, gate := newSmartHistoryGenerationCache(t, "profile")
+	old := cache.NewSmartHistoryGeneration("auto")
+	entered, resume := gate.blockNext(t)
+	type resetResult struct {
+		generation uint64
+		err        error
+	}
+	done := make(chan resetResult, 1)
+	go func() {
+		generation, err := cache.ResetSmartHistoryGeneration("auto", old)
+		done <- resetResult{generation, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset did not reach the transaction boundary")
+	}
+	replacement := cache.NewSmartHistoryGeneration("auto")
+	if err := cache.SaveSmartHistory("auto", &adapter.SmartHistory{Data: []byte("replacement"), Generation: replacement}); err != nil {
+		t.Fatal(err)
+	}
+	resume()
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, os.ErrInvalid) || result.generation != old {
+			t.Fatalf("stale reset returned %d, %v", result.generation, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale reset did not complete")
+	}
+	history, err := cache.LoadSmartHistory("auto")
+	if err != nil || string(history.Data) != "replacement" {
+		t.Fatalf("stale reset changed replacement history: %v, %v", history, err)
+	}
+	next, err := cache.ResetSmartHistoryGeneration("auto", replacement)
+	if err != nil || next <= replacement {
+		t.Fatalf("current owner reset returned %d, %v", next, err)
+	}
+	if err = cache.SaveSmartHistory("auto", &adapter.SmartHistory{Data: []byte("after reset"), Generation: next}); err != nil {
+		t.Fatal(err)
+	}
+	if err = cache.SaveSmartHistory("auto", &adapter.SmartHistory{Data: []byte("stale"), Generation: replacement}); !errors.Is(err, os.ErrInvalid) {
+		t.Fatalf("pre-reset owner save returned %v", err)
+	}
+}
