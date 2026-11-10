@@ -173,12 +173,14 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			case "degraded_primary":
 				faults := members[0].faults
 				faults.bytesPerSecond = 187_500
+				faults.queuePackets = 32
 				members[0].relay.set(faults)
 			case "local_bottleneck":
 				shared := &sharedDownstream{bytesPerSecond: 375_000}
 				for _, member := range members {
 					faults := member.faults
 					faults.downstream = shared
+					faults.queuePackets = 32
 					member.relay.set(faults)
 				}
 			case "two_slow_one_fast":
@@ -203,19 +205,21 @@ func TestSmartHarnessDegradation(t *testing.T) {
 					faults.blackhole = false
 					if i < 2 {
 						faults.bytesPerSecond = 187_500
+						faults.queuePackets = 32
 					}
 					member.relay.set(faults)
 				}
 			case "shared_link_correction":
-				shared := &sharedDownstream{bytesPerSecond: 2_500_000}
+				shared := &sharedDownstream{bytesPerSecond: 5_000_000}
 				for _, member := range members {
 					faults := member.faults
+					faults.bytesPerSecond = 5_000_000
 					faults.downstream = shared
 					member.relay.set(faults)
 				}
-				// Suspicion sees paced demand; confirmation gets a saturated same-primary flow.
+				// Keep aggregate traffic above target without filling the link's queue.
 				primary.downloadRate.Store(375_000)
-				primary.unpaceBulkOnDownload.Store(true)
+				primary.bulkRateOnDownload.Store(2_500_000)
 			case "burst_then_slow":
 				primary.downloadBurst.Store(1_000_000 + 781_250)
 				primary.downloadRate.Store(187_500)
@@ -296,7 +300,7 @@ func TestSmartHarnessDegradation(t *testing.T) {
 							corrected = true
 						}
 					}
-					if !corrected || primary.bulkRate.Load() != 0 {
+					if !corrected || primary.bulkRate.Load() != 2_500_000 {
 						t.Fatal("same-interval passive traffic did not correct the sub-half-target active probe")
 					}
 				} else {

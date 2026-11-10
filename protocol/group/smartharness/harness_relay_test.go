@@ -20,6 +20,7 @@ type relayFaults struct {
 	blackhole      bool
 	maxDatagram    int
 	downstream     *sharedDownstream
+	queuePackets   int
 }
 
 type relayPacket struct {
@@ -96,13 +97,8 @@ func newFaultRelay(t *testing.T, server *net.UDPAddr, faults relayFaults) *fault
 				r.buffers.Put(buffer)
 				continue
 			}
-			// Bound slow-link queueing without dropping fast calibration bursts.
 			faults := r.current()
-			rate := faults.bytesPerSecond
-			if queue == down && faults.downstream != nil {
-				rate = min(rate, faults.downstream.bytesPerSecond)
-			}
-			if rate > 0 && rate <= 375_000 && len(queue) >= 32 {
+			if faults.queuePackets > 0 && len(queue) >= faults.queuePackets {
 				r.buffers.Put(buffer)
 				r.dropped.Add(1)
 				continue

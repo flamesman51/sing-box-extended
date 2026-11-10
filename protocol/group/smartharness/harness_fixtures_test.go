@@ -79,20 +79,20 @@ func harnessMain(m *testing.M) (int, error) {
 }
 
 type probeFixtures struct {
-	httpsPort            uint16
-	dnsPort              uint16
-	stunPort             uint16
-	quicPort             uint16
-	https                atomic.Int64
-	dns                  atomic.Int64
-	stun                 atomic.Int64
-	quic                 atomic.Int64
-	downloads            atomic.Int64
-	bulkBytes            atomic.Int64
-	bulkRate             atomic.Int64
-	downloadRate         atomic.Int64
-	downloadBurst        atomic.Int64
-	unpaceBulkOnDownload atomic.Bool
+	httpsPort          uint16
+	dnsPort            uint16
+	stunPort           uint16
+	quicPort           uint16
+	https              atomic.Int64
+	dns                atomic.Int64
+	stun               atomic.Int64
+	quic               atomic.Int64
+	downloads          atomic.Int64
+	bulkBytes          atomic.Int64
+	bulkRate           atomic.Int64
+	downloadRate       atomic.Int64
+	downloadBurst      atomic.Int64
+	bulkRateOnDownload atomic.Int64
 }
 
 func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
@@ -118,8 +118,8 @@ func newProbeFixtures(t *testing.T, overlay netip.Addr) *probeFixtures {
 			}
 			f.downloads.Add(1)
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-			if f.unpaceBulkOnDownload.Load() {
-				f.bulkRate.Store(0)
+			if rate := f.bulkRateOnDownload.Load(); rate > 0 {
+				f.bulkRate.Store(rate)
 			}
 			writeFixturePayload(r.Context(), w, size, &f.downloadRate, f.downloadBurst.Load(), nil)
 		case "/bulk":
