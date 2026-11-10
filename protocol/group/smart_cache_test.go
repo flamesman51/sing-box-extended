@@ -76,7 +76,7 @@ func TestSmartStartsWithMissingCacheDocuments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = cache.SaveSmartHistory("auto", &adapter.SmartHistory{Data: data}); err != nil {
+	if err = cache.SaveSmartHistory("auto", &adapter.SmartHistory{Data: data, Generation: fresh.historyGeneration}); err != nil {
 		t.Fatal(err)
 	}
 	if err = fresh.Close(); err != nil {

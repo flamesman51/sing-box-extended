@@ -59,6 +59,10 @@ type CacheFile struct {
 	optimisticTimeout  time.Duration
 	DB                 *bbolt.DB
 	dbAccess           sync.RWMutex
+	smartAccess        sync.Mutex
+	smartGenerations   map[string]uint64
+	smartDone          chan struct{}
+	smartCloseOnce     sync.Once
 	saveMetadataAccess sync.Mutex
 	saveMetadata       *adapter.FakeIPMetadata
 	saveMetadataTimer  *time.Timer
@@ -125,6 +129,7 @@ func New(ctx context.Context, logger logger.Logger, options option.CacheFileOpti
 		saveAddress6:       make(map[string]netip.Addr),
 		saveRDRC:           make(map[saveCacheKey]bool),
 		saveDNSCache:       make(map[saveCacheKey]saveDNSCacheEntry),
+		smartDone:          make(chan struct{}),
 	}
 }
 
@@ -138,6 +143,10 @@ func (c *CacheFile) Dependencies() []string {
 
 func (c *CacheFile) CacheID() string {
 	return c.cacheIDText
+}
+
+func (c *CacheFile) SmartCacheDone() <-chan struct{} {
+	return c.smartDone
 }
 
 func (c *CacheFile) SetOptimisticTimeout(timeout time.Duration) {
@@ -156,6 +165,7 @@ func (c *CacheFile) Start(stage adapter.StartStage, scope *adapter.Scope) error 
 			return err
 		}
 		scope.Add(func() error {
+			c.smartCloseOnce.Do(func() { close(c.smartDone) })
 			return c.database().Close()
 		})
 	case adapter.StartStateStart:

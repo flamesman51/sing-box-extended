@@ -90,8 +90,35 @@ var smartLedgers = struct {
 	byCache map[adapter.CacheFile]*smartLedger
 }{byCache: make(map[adapter.CacheFile]*smartLedger)}
 
+func acquireSmartLedger(cache adapter.CacheFile, group string, limits map[string]float64) (*smartLedger, error) {
+	for {
+		ledger, err := getSmartLedger(cache)
+		if err != nil {
+			return nil, err
+		}
+		smartLedgers.Lock()
+		// Lookup alone does not pin an owner against asynchronous cleanup.
+		if smartLedgers.byCache[cache] == ledger {
+			ledger.Register(group, limits)
+			smartLedgers.Unlock()
+			return ledger, nil
+		}
+		smartLedgers.Unlock()
+	}
+}
+
 func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
+	var cacheDone <-chan struct{}
+	if lifetime, ok := cache.(interface{ SmartCacheDone() <-chan struct{} }); ok {
+		cacheDone = lifetime.SmartCacheDone()
+	}
 	smartLedgers.Lock()
+	select {
+	case <-cacheDone:
+		smartLedgers.Unlock()
+		return nil, os.ErrClosed
+	default:
+	}
 	if ledger := smartLedgers.byCache[cache]; ledger != nil {
 		smartLedgers.Unlock()
 		<-ledger.ready
@@ -106,6 +133,9 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 	}
 	smartLedgers.byCache[cache] = ledger
 	smartLedgers.Unlock()
+	if cacheDone != nil {
+		go ledger.retireOnCacheClose(cacheDone)
+	}
 	ledger.loadErr = ledger.initialize()
 	if ledger.loadErr != nil {
 		smartLedgers.Lock()
@@ -117,6 +147,22 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 		return nil, ledger.loadErr
 	}
 	return ledger, nil
+}
+
+func (l *smartLedger) retireOnCacheClose(done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-l.ready:
+		if l.loadErr != nil {
+			return
+		}
+		<-done
+	}
+	smartLedgers.Lock()
+	if smartLedgers.byCache[l.cache] == l {
+		delete(smartLedgers.byCache, l.cache)
+	}
+	smartLedgers.Unlock()
 }
 
 func (ledger *smartLedger) initialize() error {

@@ -15,8 +15,16 @@ import (
 )
 
 // SmartHistory is an engine-owned history document scoped to one cache ID and group.
+// Generation is a runtime-only write token; zero is valid only before ownership or reset.
 type SmartHistory struct {
-	Data []byte
+	Data       []byte
+	Generation uint64 `json:"-"`
+}
+
+// SmartHistoryGeneration fences history writes across group replacements and resets.
+type SmartHistoryGeneration interface {
+	// NewSmartHistoryGeneration invalidates earlier tokens for this cache ID and group.
+	NewSmartHistoryGeneration(group string) uint64
 }
 
 // SmartMetadata is an engine-owned, installation-wide metadata document.

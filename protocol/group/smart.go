@@ -98,6 +98,7 @@ type smartMember struct {
 	throughput                                                                smartThroughput
 	inflight                                                                  bool
 	queued                                                                    map[string]bool
+	discoveryPreempted                                                        bool
 	improvementAt                                                             time.Time
 	improvementObservations                                                   int
 	improvementSignature                                                      int
@@ -158,6 +159,7 @@ type Smart struct {
 	generation, configGeneration, selectionGeneration, memberGeneration                  uint64
 	network                                                                              smartNetwork
 	history                                                                              *smartHistory
+	historyGeneration                                                                    uint64
 	priors                                                                               []smartPrior
 	timezone                                                                             *time.Location
 	urlHistory                                                                           *urltest.HistoryStorage
@@ -183,6 +185,8 @@ type Smart struct {
 	workers                                                                              sync.WaitGroup
 	admissionWorkers, accountingWorkers                                                  sync.WaitGroup
 	admission                                                                            *smartAdmission
+	admissionRetryAt                                                                     time.Time
+	admissionRetryNetwork                                                                string
 	loopDone                                                                             chan struct{}
 	leases                                                                               map[*smartMember]map[*smartLease]struct{}
 	startedAt, selectedAt, lastDemand, lastNetworkRead, lastFullRound                    time.Time
@@ -293,7 +297,13 @@ func (s *Smart) configure() error {
 func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateStart:
-		ledger, err := getSmartLedger(s.cache)
+		value := func(p *float64, d float64) float64 {
+			if p != nil {
+				return *p
+			}
+			return d
+		}
+		ledger, err := acquireSmartLedger(s.cache, s.Tag(), map[string]float64{"wifi": value(s.options.Throughput.WIFIDailyBudgetMB, 300), "cellular": value(s.options.Throughput.CellularDailyBudgetMB, 50), "other": value(s.options.Throughput.OtherDailyBudgetMB, 300)})
 		if err != nil {
 			return err
 		}
@@ -301,15 +311,11 @@ func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if ledger != nil {
 			s.installID, s.seed, s.directSeed = ledger.Installation()
 			s.priors = ledger.Metadata().Priors[s.Tag()]
-			value := func(p *float64, d float64) float64 {
-				if p != nil {
-					return *p
-				}
-				return d
-			}
-			ledger.Register(s.Tag(), map[string]float64{"wifi": value(s.options.Throughput.WIFIDailyBudgetMB, 300), "cellular": value(s.options.Throughput.CellularDailyBudgetMB, 50), "other": value(s.options.Throughput.OtherDailyBudgetMB, 300)})
 		}
 		if s.cache != nil {
+			if generations, ok := s.cache.(adapter.SmartHistoryGeneration); ok {
+				s.historyGeneration = generations.NewSmartHistoryGeneration(s.Tag())
+			}
 			stored, err := s.cache.LoadSmartHistory(s.Tag())
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
@@ -728,6 +734,7 @@ func (s *Smart) revokeLocked(member *smartMember) []io.Closer {
 	s.memberGeneration++
 	member.generation = s.memberGeneration
 	member.queued = make(map[string]bool)
+	member.discoveryPreempted = false
 	member.inflight = false
 	var closers []io.Closer
 	if s.interrupt {
@@ -877,6 +884,7 @@ func (s *Smart) handleRequest(request smartRequest) {
 			for _, m := range s.members {
 				m.inflight = false
 				m.queued = make(map[string]bool)
+				m.discoveryPreempted = false
 			}
 			s.directInflight = false
 			s.updateNotificationLocked(now)
@@ -1007,6 +1015,7 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 		member.udp443 = smartEvidence{}
 		member.inflight = false
 		member.queued = make(map[string]bool)
+		member.discoveryPreempted = false
 		member.lastProbe = time.Time{}
 		member.rtts = nil
 		member.emergency = false
@@ -1263,6 +1272,13 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		delete(member.queued, result.kind)
 		if result.kind == "tcp" {
 			member.inflight = false
+		}
+		if result.kind == "udp443" {
+			retry := member.discoveryPreempted && errors.Is(result.err, context.Canceled)
+			member.discoveryPreempted = false
+			if retry {
+				s.queueLocked(member, "udp443", 0, false, now)
+			}
 		}
 	}
 	if result.kind == "direct" {
@@ -1834,12 +1850,13 @@ func (s *Smart) flushHistory(force bool) {
 		return
 	}
 	snapshot := cloneSmartHistory(s.history)
+	generation := s.historyGeneration
 	s.dirty = false
 	s.lastWrite = now
 	s.mu.Unlock()
 	data, err := snapshot.Encode()
 	if err == nil {
-		err = s.cache.SaveSmartHistory(s.Tag(), &adapter.SmartHistory{Data: data})
+		err = s.cache.SaveSmartHistory(s.Tag(), &adapter.SmartHistory{Data: data, Generation: generation})
 	}
 	if err != nil {
 		s.mu.Lock()

@@ -17,6 +17,22 @@ var (
 	keySmartMetadata    = []byte("installation")
 )
 
+var _ adapter.SmartHistoryGeneration = (*CacheFile)(nil)
+
+func (c *CacheFile) NewSmartHistoryGeneration(group string) uint64 {
+	c.smartAccess.Lock()
+	defer c.smartAccess.Unlock()
+	if c.smartGenerations == nil {
+		c.smartGenerations = make(map[string]uint64)
+	}
+	generation := c.smartGenerations[group] + 1
+	if generation == 0 {
+		panic("smart history generation exhausted")
+	}
+	c.smartGenerations[group] = generation
+	return generation
+}
+
 func (c *CacheFile) LoadSmartHistory(group string) (*adapter.SmartHistory, error) {
 	var history *adapter.SmartHistory
 	err := c.view(func(tx *bbolt.Tx) error {
@@ -45,6 +61,12 @@ func (c *CacheFile) SaveSmartHistory(group string, history *adapter.SmartHistory
 		return errors.New("smart history exceeds 1 MiB")
 	}
 	return c.update(func(tx *bbolt.Tx) error {
+		c.smartAccess.Lock()
+		defer c.smartAccess.Unlock()
+		// Zero is valid only before this group has acquired or reset a generation.
+		if history.Generation != c.smartGenerations[group] {
+			return os.ErrInvalid
+		}
 		bucket, err := c.createBucket(tx, bucketSmartHistory)
 		if err != nil {
 			return err
@@ -55,6 +77,7 @@ func (c *CacheFile) SaveSmartHistory(group string, history *adapter.SmartHistory
 
 func (c *CacheFile) ResetSmartHistory(group string) error {
 	return c.update(func(tx *bbolt.Tx) error {
+		c.NewSmartHistoryGeneration(group)
 		bucket := c.bucket(tx, bucketSmartHistory)
 		if bucket == nil {
 			return nil

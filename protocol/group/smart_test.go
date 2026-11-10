@@ -861,6 +861,172 @@ func smartAwaitProbe(t *testing.T, calls <-chan smartProbeCall, tag string, oper
 	}
 }
 
+func TestSmartCompletedDiscoveryKeepsTenMinuteCadence(t *testing.T) {
+	s, clock := smartTestGroup()
+	t.Cleanup(s.cancel)
+	started, primary := clock.Now(), s.primary
+	s.generationSucceeded = true
+	s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.ctx)
+	s.lastDirect = started
+	primary.lastUDP, primary.lastUDP443 = started, started
+	for _, member := range s.members {
+		member.lastProbe = started
+	}
+	s.handleRequest(smartRequest{kind: "udp443"})
+	jobs := s.pending
+	s.pending = nil
+	if len(jobs) != len(s.members) {
+		t.Fatalf("initial discovery jobs=%d", len(jobs))
+	}
+	for _, job := range jobs {
+		s.applyResultLocked(smartResult{member: job.member, kind: job.kind, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration}, started)
+	}
+	for heartbeat := 1; heartbeat <= 40; heartbeat++ {
+		clock.Advance(s.heartbeat)
+		now := clock.Now()
+		s.lastDemand = now
+		s.tickLocked(now)
+		s.handleRequest(smartRequest{kind: "udp443"})
+		if heartbeat < 40 && !s.lastDiscovery.Equal(started) {
+			t.Fatalf("heartbeat %d changed the completed discovery cadence", heartbeat)
+		}
+		jobs, s.pending = s.pending, nil
+		discoveryJobs := 0
+		for _, job := range jobs {
+			if job.kind == "udp443" {
+				discoveryJobs++
+				if heartbeat < 40 && (job.member != primary || heartbeat != 20) {
+					t.Fatalf("heartbeat %d repeated completed discovery for %s", heartbeat, job.member.tag)
+				}
+			}
+			s.applyResultLocked(smartResult{member: job.member, kind: job.kind, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, rtt: time.Millisecond}, now)
+		}
+		if heartbeat == 40 && (discoveryJobs != len(s.members) || !s.lastDiscovery.Equal(now)) {
+			t.Fatalf("ten-minute discovery jobs=%d last=%v", discoveryJobs, s.lastDiscovery)
+		}
+	}
+}
+
+func TestSmartInterruptedDiscoveryRequeuesOnlyCanceledMembers(t *testing.T) {
+	for _, placement := range []string{"pending", "buffered", "running"} {
+		t.Run(placement, func(t *testing.T) {
+			s, clock := smartTestGroup()
+			s.workCtx, s.workCancel = context.WithCancel(s.ctx)
+			s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
+			s.healthJobs, s.otherJobs = make(chan smartJob, 3), make(chan smartJob, 2)
+			s.members = append(s.members, &smartMember{outbound: &smartFakeOutbound{tag: "c"}, tag: "c", identity: "c", serverIdentity: "c", tier: 1, configOrder: 2, generation: 1, state: "healthy"})
+			s.handleRequest(smartRequest{kind: "udp443"})
+			completed, buffered, interrupted := s.pending[0], s.pending[1], s.pending[2]
+			s.pending = nil
+			s.applyResultLocked(smartResult{member: completed.member, kind: completed.kind, generation: completed.generation, memberGeneration: completed.memberGeneration, configGeneration: completed.configGeneration}, clock.Now())
+			s.results <- smartResult{member: buffered.member, kind: buffered.kind, generation: buffered.generation, memberGeneration: buffered.memberGeneration, configGeneration: buffered.configGeneration}
+			interrupted.member.udp443 = smartEvidence{state: "ok", at: clock.Now().Add(-time.Minute), expires: clock.Now().Add(9 * time.Minute)}
+			evidence := interrupted.member.udp443
+			started := make(chan struct{}, 1)
+			s.udpProbe = func(ctx context.Context, _ N.Dialer, _ bool) (time.Duration, error) {
+				started <- struct{}{}
+				<-ctx.Done()
+				return 0, ctx.Err()
+			}
+			s.probe = func(context.Context, N.Dialer, int) (time.Duration, error) {
+				return time.Millisecond, nil
+			}
+			startWorker := func() {
+				s.workers.Add(1)
+				go s.worker(s.ctx, false)
+			}
+			t.Cleanup(func() {
+				s.cancel()
+				s.workers.Wait()
+			})
+			if placement == "pending" {
+				s.pending = append(s.pending, interrupted)
+			} else {
+				s.otherJobs <- interrupted
+			}
+			if placement == "running" {
+				startWorker()
+				select {
+				case <-started:
+				case <-time.After(2 * time.Second):
+					t.Fatal("discovery did not start")
+				}
+			}
+			s.queueLocked(s.primary, "tcp", 1, false, clock.Now())
+			if interrupted.ctx.Err() != context.Canceled {
+				t.Fatal("primary heartbeat did not cancel unfinished discovery")
+			}
+			if placement == "pending" {
+				s.dispatchLocked()
+			}
+			if placement != "running" {
+				startWorker()
+			}
+			timeout := time.NewTimer(2 * time.Second)
+			defer timeout.Stop()
+			completions := 0
+			for completions < 2 {
+				select {
+				case result := <-s.results:
+					if result.kind != "udp443" {
+						continue
+					}
+					if result.member == interrupted.member && !errors.Is(result.err, context.Canceled) {
+						t.Fatalf("unfinished discovery result=%v", result.err)
+					}
+					selectionGeneration := s.selectionGeneration
+					s.applyResultLocked(result, clock.Now())
+					if result.member == interrupted.member && s.selectionGeneration != selectionGeneration {
+						t.Fatal("cancellation changed UDP/443 selection evidence")
+					}
+					completions++
+				case <-timeout.C:
+					t.Fatal("discovery results did not arrive")
+				}
+			}
+			s.handleRequest(smartRequest{kind: "udp443"})
+			retries := 0
+			for _, job := range s.pending {
+				if job.kind != "udp443" {
+					continue
+				}
+				retries++
+				if job.member != interrupted.member || job.ctx != s.backgroundCtx || job.ctx.Err() != nil {
+					t.Fatalf("unexpected discovery retry for %s", job.member.tag)
+				}
+			}
+			if retries != 1 || !s.lastDiscovery.Equal(clock.Now()) {
+				t.Fatalf("discovery retries=%d last=%v", retries, s.lastDiscovery)
+			}
+			if interrupted.member.state != "healthy" || interrupted.member.udp443 != evidence || len(s.history.Stats) != 0 {
+				t.Fatal("discovery cancellation penalized member health")
+			}
+			if placement != "running" {
+				select {
+				case <-started:
+					t.Fatal("canceled queued discovery reached the probe")
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestSmartUnpreemptedDiscoveryCancellationDoesNotRetry(t *testing.T) {
+	s, clock := smartTestGroup()
+	t.Cleanup(s.cancel)
+	s.handleRequest(smartRequest{kind: "udp443"})
+	jobs := s.pending
+	s.pending = nil
+	for _, job := range jobs {
+		s.applyResultLocked(smartResult{member: job.member, kind: job.kind, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, err: context.Canceled}, clock.Now())
+	}
+	s.handleRequest(smartRequest{kind: "udp443"})
+	if len(s.pending) != 0 || len(s.history.Stats) != 0 {
+		t.Fatal("unpreempted cancellation retried discovery or changed health")
+	}
+}
+
 func TestSmartPrimaryDeadlinePreemptsOnlyBackgroundContext(t *testing.T) {
 	for _, workGeneration := range []bool{false, true} {
 		t.Run(fmt.Sprintf("work_generation=%t", workGeneration), func(t *testing.T) {
@@ -894,8 +1060,8 @@ func TestSmartPrimaryDeadlinePreemptsOnlyBackgroundContext(t *testing.T) {
 				}
 			}
 			background := s.backgroundCtx
-			if background == oldBackground || background.Err() != nil || !s.lastDiscovery.IsZero() {
-				t.Fatal("primary deadline did not reopen background discovery")
+			if background == oldBackground || background.Err() != nil || !s.lastDiscovery.Equal(clock.Now()) {
+				t.Fatal("primary deadline did not renew background context and preserve discovery cadence")
 			}
 			if !s.primary.lastUDP.Equal(clock.Now()) || !s.primary.lastUDP443.Equal(clock.Now()) {
 				t.Fatal("preemption changed UDP probe cadence")
