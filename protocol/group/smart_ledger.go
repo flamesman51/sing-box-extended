@@ -27,12 +27,13 @@ var (
 )
 
 type smartBudget struct {
-	NetworkType string  `json:"network_type"`
-	Day         string  `json:"day"`
-	UsedMB      float64 `json:"used_mb"`
-	ReservedMB  float64 `json:"reserved_mb"`
-	LimitMB     float64 `json:"limit_mb"`
-	ActiveTests bool    `json:"active_tests"`
+	NetworkType string    `json:"network_type"`
+	Day         string    `json:"day"`
+	DayEndsAt   time.Time `json:"day_ends_at"`
+	UsedMB      float64   `json:"used_mb"`
+	ReservedMB  float64   `json:"reserved_mb"`
+	LimitMB     float64   `json:"limit_mb"`
+	ActiveTests bool      `json:"active_tests"`
 }
 
 type smartInstallation struct {
@@ -290,6 +291,14 @@ func (l *smartLedger) dayLocked(networkType string, now time.Time, offset int) s
 	return max(day, l.state.Latest[networkType])
 }
 
+func smartBudgetDayEnd(day string, offset int) time.Time {
+	start, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return time.Time{}
+	}
+	return start.AddDate(0, 0, 1).Add(-time.Duration(offset) * time.Second)
+}
+
 func (l *smartLedger) snapshotLocked(networkType, day string) smartBudget {
 	limit := l.limitLocked(networkType)
 	var reserved int64
@@ -307,7 +316,9 @@ func (l *smartLedger) Snapshot(networkType string, now time.Time, offset int) sm
 	networkType = smartBudgetType(networkType)
 	day := l.dayLocked(networkType, now, offset)
 	l.state.Latest[networkType] = day
-	return l.snapshotLocked(networkType, day)
+	snapshot := l.snapshotLocked(networkType, day)
+	snapshot.DayEndsAt = smartBudgetDayEnd(day, offset)
+	return snapshot
 }
 
 func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.Time, offset int) (string, int64, error) {
@@ -462,6 +473,9 @@ func (l *smartLedger) Reconcile(ctx context.Context, id string, bytes int64, unc
 			if pending {
 				attempt.err = func() (err error) {
 					defer smartContextRecover(ctx, "ledger-reconcile", &err)
+					if s, ok := ctx.Value(smartContainmentKey{}).(*Smart); ok {
+						s.injectPanic("ledger-accounting")
+					}
 					return l.reconcilePending()
 				}()
 			}

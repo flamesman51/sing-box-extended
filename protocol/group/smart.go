@@ -1425,6 +1425,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 		}
 	case "tcp":
 		if result.err == nil {
+			s.syncDegraded = false
 			wasHealthy := member.state == "healthy"
 			member.lastOK = now
 			member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(2 * s.memberIntervalLocked(member, now))}
@@ -1456,7 +1457,6 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			}
 			if !s.generationSucceeded {
 				s.generationSucceeded = true
-				s.syncDegraded = false
 				if member.state == "healthy" {
 					s.switchLocked(member, "recover", "first success this network", now)
 				}

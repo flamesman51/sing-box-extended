@@ -42,6 +42,16 @@ func TestSmartPanicScrubbing(t *testing.T) {
 			}
 		}
 	}
+	for _, test := range []struct{ message, want string }{
+		{"failed to reach 2001:db8::1.", "failed to reach <ip>."},
+		{"2001:db8::1: connection failed", "<ip>: connection failed"},
+		{"failed to reach 2001:db8::.", "failed to reach <ip>."},
+		{"2001:db8::: connection failed", "<ip>: connection failed"},
+	} {
+		if message := smartScrubMessage(test.message); message != test.want {
+			t.Fatalf("punctuated IPv6 scrub = %q; want %q", message, test.want)
+		}
+	}
 }
 
 func TestSmartContainedOperationsLeaveHealthUnchanged(t *testing.T) {
@@ -480,5 +490,176 @@ func TestSmartLedgerBackgroundPanicsReleaseOperations(t *testing.T) {
 	}
 	if s.panicSnapshot().Total != 2 {
 		t.Fatalf("background panics not recorded once: %+v", s.panicSnapshot())
+	}
+}
+
+func TestSmartValidatedSelectionPanicRecoversOnSuccessfulProbe(t *testing.T) {
+	s, clock := smartTestGroup()
+	defer s.Close()
+	s.generationSucceeded = true
+	s.testHook = func(site string) {
+		if site == "select" {
+			panic("validated selection interrupted")
+		}
+	}
+	if _, err := s.SelectMember(s.ctx, "tcp", M.Socksaddr{}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.degradedLocked() {
+		t.Fatal("selection panic did not mark containment degradation")
+	}
+	member := s.primary
+	s.applyResultLocked(smartResult{kind: "tcp", member: member, generation: s.generation, configGeneration: s.configGeneration, memberGeneration: member.generation, rtt: time.Millisecond}, clock.Now())
+	status, err := SmartStatus(s.ctx, smartTestManager{values: []adapter.Outbound{s}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Degraded bool `json:"degraded"`
+	}
+	if err = json.Unmarshal([]byte(status), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Degraded || !s.generationSucceeded || s.panicSnapshot().Total != 1 {
+		t.Fatal("successful probe did not clear validated-network containment degradation")
+	}
+}
+
+func TestSmartAccountingHookPanicLeavesRetryableSettlement(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(map[bool]string{false: "known_bytes", true: "unknown_consumption"}[unknown], func(t *testing.T) {
+			s, clock := smartTestGroup()
+			defer s.Close()
+			ledger, err := getSmartLedger(new(smartLedgerTestCache))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.ledger = ledger
+			ledger.Register(s.Tag(), map[string]float64{"wifi": 100})
+			ledger.Register("other-group", map[string]float64{"wifi": 100})
+			defer ledger.Unregister("other-group")
+			id, capBytes, err := ledger.Reserve(s.ctx, "wifi", clock.Now(), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.testHook = func(site string) {
+				if site == "ledger-accounting" || unknown && site == "probe/throughput" {
+					panic("interrupted settlement")
+				}
+			}
+			wantBytes := int64(1_250_000)
+			if unknown {
+				result := s.runJob(smartJob{kind: "throughput", member: s.primary, ctx: s.ctx, timeout: time.Second, generation: s.generation, networkType: "wifi", reservation: id, capBytes: capBytes})
+				if !result.contained || !errors.Is(result.err, errSmartContained) {
+					t.Fatalf("throughput operation was not contained: %+v", result)
+				}
+				wantBytes = capBytes
+			} else if err = s.reconcileReservation(id, wantBytes, false); !errors.Is(err, errSmartContained) {
+				t.Fatalf("accounting hook panic was not contained: %v", err)
+			}
+			if budget := ledger.Snapshot("wifi", clock.Now(), 0); budget.ReservedMB == 0 || budget.UsedMB != 0 {
+				t.Fatalf("accounting panic lost durable reservation: %+v", budget)
+			}
+			next, _, err := ledger.Reserve(context.Background(), "wifi", clock.Now(), 0)
+			if err != nil {
+				t.Fatalf("accounting panic left shared throughput admission busy: %v", err)
+			}
+			if err = ledger.Reconcile(context.Background(), next, 0, false); err != nil {
+				t.Fatal(err)
+			}
+			if budget := ledger.Snapshot("wifi", clock.Now(), 0); budget.ReservedMB != 0 || budget.UsedMB != float64(wantBytes)/1e6 {
+				t.Fatalf("wrong resumed settlement: %+v", budget)
+			}
+		})
+	}
+}
+
+func TestSmartResetMetadataPanicAttributedToCurrentGroup(t *testing.T) {
+	for _, earlierGroup := range []bool{false, true} {
+		t.Run(map[bool]string{false: "first_group", true: "later_group"}[earlierGroup], func(t *testing.T) {
+			s, _ := smartTestGroup()
+			defer s.Close()
+			cache := new(smartPanicMetadataCache)
+			ledger, err := getSmartLedger(cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.ledger = ledger
+			ledger.Register(s.Tag(), map[string]float64{"wifi": 100})
+			first, _ := smartTestGroup()
+			defer first.Close()
+			groups := []adapter.Outbound{s}
+			if earlierGroup {
+				groups = append([]adapter.Outbound{first}, groups...)
+			}
+			cache.panicSave.Store(true)
+			if err = SmartReset(s.ctx, smartTestManager{values: groups}, ""); !errors.Is(err, errSmartContained) {
+				t.Fatalf("reset metadata panic escaped: %v", err)
+			}
+			if s.panicSnapshot().Total != 1 || first.panicSnapshot().Total != 0 {
+				t.Fatalf("reset panic misattributed: current=%+v earlier=%+v", s.panicSnapshot(), first.panicSnapshot())
+			}
+			cache.panicSave.Store(false)
+			if err = SmartReset(s.ctx, smartTestManager{values: groups}, ""); err != nil {
+				t.Fatalf("reset remained locked after panic: %v", err)
+			}
+		})
+	}
+}
+
+func TestSmartBudgetDayEndsAtUsesAccountingDateAndOffset(t *testing.T) {
+	for _, test := range []struct {
+		offset            int
+		latest, day, want string
+	}{
+		{19800, "", "2026-11-10", "2026-11-10T18:30:00Z"},
+		{-25200, "", "2026-11-09", "2026-11-10T07:00:00Z"},
+		{19800, "2026-11-12", "2026-11-12", "2026-11-12T18:30:00Z"},
+	} {
+		for _, withLedger := range []bool{false, true} {
+			if !withLedger && test.latest != "" {
+				continue
+			}
+			s, clock := smartTestGroup()
+			defer s.Close()
+			clock.mu.Lock()
+			clock.now = time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC)
+			clock.mu.Unlock()
+			s.network.Offset = test.offset
+			if withLedger {
+				ledger, err := getSmartLedger(new(smartLedgerTestCache))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ledger.Register(s.Tag(), map[string]float64{"wifi": 100, "cellular": 50, "other": 75})
+				s.ledger = ledger
+				for _, class := range []string{"wifi", "cellular", "other"} {
+					ledger.state.Latest[class] = test.latest
+				}
+			}
+			status, err := SmartStatus(s.ctx, smartTestManager{values: []adapter.Outbound{s}}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document struct {
+				Version int `json:"version"`
+				Budgets map[string]struct {
+					Day       string `json:"day"`
+					DayEndsAt string `json:"day_ends_at"`
+				} `json:"budgets"`
+			}
+			if err = json.Unmarshal([]byte(status), &document); err != nil {
+				t.Fatal(err)
+			}
+			if document.Version != 1 {
+				t.Fatal("additive field changed status version")
+			}
+			for _, class := range []string{"wifi", "cellular", "other"} {
+				budget := document.Budgets[class]
+				if budget.Day != test.day || budget.DayEndsAt != test.want {
+					t.Fatalf("%s offset=%d latest=%q ledger=%t: day=%q ends=%q; want day=%q ends=%q", class, test.offset, test.latest, withLedger, budget.Day, budget.DayEndsAt, test.day, test.want)
+				}
+			}
+		}
 	}
 }

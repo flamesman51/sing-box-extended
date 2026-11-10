@@ -130,7 +130,7 @@ Panic diagnostics are logged at error level and exposed as additive **version 1*
 
 - `panics`: `{ "total": N, "recent": [{ "at": "RFC3339 UTC", "site": "...", "message": "...", "stack": "..." }] }`. The ring holds at most `20` entries; messages are at most `512` UTF-8 bytes and stacks at most `4096` bytes.
 - `degraded`: boolean indicating containment fallback or a stopped scheduler.
-- `budgets`: current ledger snapshots for **all three** keys, `wifi`, `cellular`, and `other`, each containing `day`, `used_mb`, `reserved_mb`, and `limit_mb` (plus the existing budget metadata). Remaining budget is `max(0, limit_mb - used_mb - reserved_mb)`. The existing current-network `budget` field is unchanged.
+- `budgets`: current ledger snapshots for **all three** keys, `wifi`, `cellular`, and `other`, each containing `day`, `day_ends_at`, `used_mb`, `reserved_mb`, and `limit_mb` (plus the existing budget metadata). `day_ends_at` is RFC3339 UTC for the end of that accounting day, calculated using the device's local offset; clock rollback retains the end of the latest accounting day already seen. Remaining budget is `max(0, limit_mb - used_mb - reserved_mb)`. The existing current-network `budget` field remains available.
 
 Messages replace URLs, IP addresses, and host/domain names with `<url>`, `<ip>`, and `<host>` before logging or status storage. Stacks retain only function names and source basenames with line numbers, not arguments, memory addresses, or build paths. Containment is a last-resort availability guard, not proof that an interrupted operation completed.
 
@@ -183,7 +183,7 @@ Reservations are persisted before testing, reconciled afterward, and charged in 
 
 Active speed results last `24h`. A passive result needs a busy window of at least `10s`, proves only a lower bound on achieved speed, and lasts `6h`; a newer active result supersedes older passive observations. Expired results become unknown.
 
-If a completed test's accounting write fails, its durable reservation remains charged as reserved space. Smart retries the pending reconciliation before admitting another test; a temporary storage failure does not require a restart.
+If a completed test's accounting write or callback fails, its durable reservation remains charged as reserved space, with its settlement queued before the callback runs. Smart retries the pending reconciliation before admitting another test; a temporary storage failure or contained accounting panic does not require a restart.
 
 ### History, privacy, and backup
 

@@ -135,7 +135,6 @@ func (s *Smart) throughputAllowedLocked(now time.Time) bool {
 
 func (s *Smart) reconcileReservation(id string, bytes int64, uncertain bool) (err error) {
 	defer s.recoverError("ledger-accounting", &err)
-	s.injectPanic("ledger-accounting")
 	ctx, cancel := context.WithTimeout(context.Background(), smartShutdownTimeout)
 	defer cancel()
 	return s.ledger.Reconcile(context.WithValue(ctx, smartContainmentKey{}, s), id, bytes, uncertain)

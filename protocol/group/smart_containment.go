@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/netip"
 	"path/filepath"
 	"regexp"
@@ -52,12 +51,12 @@ func smartTruncate(value string, limit int) string {
 func smartScrubMessage(value string) string {
 	value = smartPanicURL.ReplaceAllLiteralString(value, "<url>")
 	value = smartPanicIPv6.ReplaceAllStringFunc(value, func(candidate string) string {
-		if _, err := netip.ParseAddr(candidate); err == nil {
-			return "<ip>"
-		}
-		if host, _, err := net.SplitHostPort(candidate); err == nil {
-			if _, err = netip.ParseAddr(host); err == nil {
-				return "<ip>"
+		for address := candidate; address != ""; address = address[:len(address)-1] {
+			if _, err := netip.ParseAddr(address); err == nil {
+				return "<ip>" + candidate[len(address):]
+			}
+			if !strings.HasSuffix(address, ".") && !strings.HasSuffix(address, ":") {
+				break
 			}
 		}
 		return candidate

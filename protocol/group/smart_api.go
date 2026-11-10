@@ -168,6 +168,7 @@ func SmartStatus(_ context.Context, outbounds adapter.OutboundManager, tag strin
 	budgets := make(map[string]smartBudget, 3)
 	for _, networkType := range []string{"wifi", "cellular", "other"} {
 		value := smartBudget{NetworkType: networkType, Day: now.In(time.FixedZone("", s.network.Offset)).Format("2006-01-02")}
+		value.DayEndsAt = smartBudgetDayEnd(value.Day, s.network.Offset)
 		if s.ledger != nil {
 			value = s.ledger.Snapshot(networkType, now, s.network.Offset)
 		}
@@ -528,6 +529,7 @@ func SmartReset(_ context.Context, outbounds adapter.OutboundManager, tag string
 		groups = []*Smart{group}
 	}
 	for _, s := range groups {
+		guard.group = s
 		if s.ledger != nil {
 			if err := s.ledger.UpdatePriors(s.Tag(), nil, nil); err != nil {
 				return err
