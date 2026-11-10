@@ -88,6 +88,8 @@ func smartReadNetwork(ctx context.Context, seed []byte, now time.Time) smartNetw
 	var ifaceIndex int
 	if iface != nil {
 		ifaceName, ifaceIndex = iface.Name, iface.Index
+	}
+	if iface != nil && platform != nil {
 		result.Type = iface.Type.String()
 		switch iface.Type {
 		case C.InterfaceTypeWIFI:

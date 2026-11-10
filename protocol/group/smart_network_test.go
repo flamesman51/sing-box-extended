@@ -104,3 +104,25 @@ func TestSmartNetworkNilPlatform(t *testing.T) {
 		t.Fatalf("invalid coarse network: %+v", n)
 	}
 }
+
+func TestSmartNetworkWithoutPlatformUsesOtherBudget(t *testing.T) {
+	for _, interfaceType := range []C.InterfaceType{C.InterfaceTypeWIFI, C.InterfaceTypeEthernet, C.InterfaceTypeCellular} {
+		t.Run(interfaceType.String(), func(t *testing.T) {
+			manager := &smartNetworkTestManager{iface: &adapter.NetworkInterface{Interface: control.Interface{Name: "link", Index: 1}, Type: interfaceType}}
+			ctx := service.ContextWith[adapter.NetworkManager](context.Background(), manager)
+			now := time.Unix(1800000000, 0)
+			network := smartReadNetwork(ctx, nil, now)
+			if network.Type != "other" || network.Key != "other" || len(network.Path) != 1 || network.Path[0] != "other" || !network.Link {
+				t.Fatalf("network without platform was classified by interface type: %+v", network)
+			}
+			ledger, err := getSmartLedger(&smartLedgerTestCache{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledger.Register("test", map[string]float64{"wifi": 300, "cellular": 50, "other": 7})
+			if budget := ledger.Snapshot(network.Type, now, network.Offset); budget.LimitMB != 7 {
+				t.Fatalf("wrong network budget: %+v", budget)
+			}
+		})
+	}
+}
