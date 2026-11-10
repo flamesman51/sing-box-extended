@@ -118,6 +118,9 @@ func TestSmartMeasurementLoadedSuccessCannotConfirm(t *testing.T) {
 			if candidate.lastOK != previous || candidate.improvementObservations != count || candidate.improvementAt != at {
 				t.Fatal("loaded success advanced observation or confirmations")
 			}
+			if candidate.tcp.value(clock.Now()) != "ok" {
+				t.Fatal("loaded success did not refresh the display-only TCP verdict")
+			}
 		})
 	}
 }

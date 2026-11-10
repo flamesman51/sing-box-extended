@@ -1540,6 +1540,10 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			if result.err != nil && member == s.primary {
 				s.openMeasurementPrimaryGateLocked(now)
 			}
+			if result.err == nil && member != nil {
+				// Display-only verdict; no decision reads member.tcp, so load cannot bias selection.
+				member.tcp = smartEvidence{state: "ok", at: now, expires: now.Add(2 * s.memberIntervalLocked(member, now))}
+			}
 			s.finishURLWaitersLocked(result)
 		}
 		return nil
