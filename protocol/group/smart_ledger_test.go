@@ -91,7 +91,7 @@ func TestSmartLedgerMinimumSerialRateAndRollback(t *testing.T) {
 		if _, _, reserveErr = ledger.Reserve(context.Background(), "wifi", now, 0); !errors.Is(reserveErr, errSmartTestBusy) {
 			t.Fatalf("serial admission: %v", reserveErr)
 		}
-		if err = ledger.Reconcile(id, 1_000_000, false); err != nil {
+		if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -163,7 +163,7 @@ func TestSmartLedgerUncertainChargesCellularAndDisabledCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = ledger.Reconcile(id, 1_100_000, true); err != nil {
+	if err = ledger.Reconcile(context.Background(), id, 1_100_000, true); err != nil {
 		t.Fatal(err)
 	}
 	if ledger.Snapshot("wifi", now, 0).UsedMB != 0 || math.Abs(ledger.Snapshot("cellular", now, 0).UsedMB-1.1) > 1e-9 {
@@ -221,7 +221,7 @@ func TestSmartLedgerConcurrentAdmissionAndMinimumCap(t *testing.T) {
 	if winner.id == "" || winner.bytes != 1_100_000 {
 		t.Fatalf("minimum reservation: %+v", winner)
 	}
-	if err = ledger.Reconcile(winner.id, 1_100_000, false); err != nil {
+	if err = ledger.Reconcile(context.Background(), winner.id, 1_100_000, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err = ledger.Reserve(context.Background(), "wifi", now.Add(2*time.Hour), 0); !errors.Is(err, errSmartBudget) {
@@ -246,7 +246,7 @@ func TestSmartLedgerReconcileSaveFailureKeepsReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache.fail = true
-	if err = ledger.Reconcile(id, 1_000_000, false); err == nil {
+	if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err == nil {
 		t.Fatal("failed reconciliation save accepted")
 	}
 	snapshot := ledger.Snapshot("wifi", now, 0)
@@ -254,7 +254,7 @@ func TestSmartLedgerReconcileSaveFailureKeepsReservation(t *testing.T) {
 		t.Fatalf("reconciliation did not roll back: %+v", snapshot)
 	}
 	cache.fail = false
-	if err = ledger.Reconcile(id, 1_000_000, false); err != nil {
+	if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -276,7 +276,7 @@ func TestSmartLedgerReserveRetriesPendingReconciliation(t *testing.T) {
 			}
 			durable := string(cache.data)
 			cache.fail = true
-			if err = ledger.Reconcile(id, 1_250_000, uncertain); err == nil {
+			if err = ledger.Reconcile(context.Background(), id, 1_250_000, uncertain); err == nil {
 				t.Fatal("failed reconciliation save accepted")
 			}
 			shared, err := getSmartLedger(cache)
@@ -315,14 +315,14 @@ func TestSmartLedgerReserveRetriesPendingReconciliation(t *testing.T) {
 			if _, exists := persisted.Ledger.Reservations[id]; exists || len(persisted.Ledger.Reservations) != 1 || persisted.Ledger.Reservations[nextID].Bytes == 0 {
 				t.Fatalf("recovered reservations = %+v", persisted.Ledger.Reservations)
 			}
-			if err = shared.Reconcile(nextID, 0, false); err != nil {
+			if err = shared.Reconcile(context.Background(), nextID, 0, false); err != nil {
 				t.Fatal(err)
 			}
 			thirdID, _, err := ledger.Reserve(context.Background(), "wifi", now.Add(2*time.Minute), 0)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err = ledger.Reconcile(thirdID, 0, false); err != nil {
+			if err = ledger.Reconcile(context.Background(), thirdID, 0, false); err != nil {
 				t.Fatal(err)
 			}
 			if snapshot := ledger.Snapshot(chargeType, now, 0); snapshot.UsedMB != 1.25 || snapshot.ReservedMB != 0 {
@@ -352,7 +352,7 @@ func TestSmartLedgerRestartAfterFailedReconciliationChargesReservation(t *testin
 		t.Fatal(err)
 	}
 	cache.fail = true
-	if err = ledger.Reconcile(id, 1_000_000, false); err == nil {
+	if err = ledger.Reconcile(context.Background(), id, 1_000_000, false); err == nil {
 		t.Fatal("failed reconciliation save accepted")
 	}
 	restartedCache := &smartLedgerTestCache{data: append([]byte(nil), cache.data...)}

@@ -133,6 +133,7 @@ type smartResult struct {
 	download, upload                               float64
 	bytes                                          int64
 	reservation                                    string
+	admission                                      *smartAdmission
 }
 
 type smartURLWaiter struct {
@@ -151,6 +152,7 @@ type Smart struct {
 	mu                                                                                   sync.Mutex
 	persistenceMu                                                                        sync.Mutex
 	persistenceKick, persistenceStop, persistenceDone                                    chan struct{}
+	persistenceAbandoned                                                                 bool
 	members                                                                              []*smartMember
 	primary, standby                                                                     *smartMember
 	generation, configGeneration, selectionGeneration, memberGeneration                  uint64
@@ -179,6 +181,8 @@ type Smart struct {
 	backgroundCtx                                                                        context.Context
 	backgroundCancel                                                                     context.CancelFunc
 	workers                                                                              sync.WaitGroup
+	admissionWorkers, accountingWorkers                                                  sync.WaitGroup
+	admission                                                                            *smartAdmission
 	loopDone                                                                             chan struct{}
 	leases                                                                               map[*smartMember]map[*smartLease]struct{}
 	startedAt, selectedAt, lastDemand, lastNetworkRead, lastFullRound                    time.Time
@@ -757,6 +761,9 @@ func (s *Smart) worker(ctx context.Context, reserved bool) {
 			}
 		}
 		if ctx.Err() != nil {
+			if job.kind == "throughput" {
+				s.discardReservation(job.reservation)
+			}
 			return
 		}
 		result := smartResult{member: job.member, kind: job.kind, operator: job.operator, confirm: job.confirm, generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration, reservation: job.reservation}
@@ -780,7 +787,7 @@ func (s *Smart) worker(ctx context.Context, reserved bool) {
 			s.mu.Lock()
 			uncertain := job.generation != s.generation || job.networkType != s.network.Type
 			s.mu.Unlock()
-			result.err = errors.Join(result.err, s.ledger.Reconcile(job.reservation, result.bytes, uncertain))
+			result.err = errors.Join(result.err, s.reconcileReservation(job.reservation, result.bytes, uncertain))
 		}
 		select {
 		case s.results <- result:
@@ -1018,8 +1025,8 @@ func (s *Smart) newGenerationLocked(network smartNetwork, now time.Time) {
 
 func (s *Smart) clearPendingLocked() {
 	for _, job := range s.pending {
-		if job.reservation != "" && s.ledger != nil {
-			_ = s.ledger.Reconcile(job.reservation, 0, false)
+		if job.kind == "throughput" {
+			s.discardReservation(job.reservation)
 		}
 	}
 	s.pending = nil
@@ -1091,6 +1098,7 @@ func (s *Smart) queueLocked(member *smartMember, kind string, operator int, conf
 		}
 		return
 	}
+	s.preemptBackgroundLocked(job)
 	s.pending = append(s.pending, job)
 }
 
@@ -1240,6 +1248,10 @@ func (s *Smart) memberTimeoutLocked(member *smartMember) time.Duration {
 }
 
 func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer {
+	if result.kind == "admission" {
+		s.applyAdmissionLocked(result, now)
+		return nil
+	}
 	if s.closed || s.ctx.Err() != nil || result.generation != s.generation || result.configGeneration != s.configGeneration || s.paused {
 		return nil
 	}
@@ -1368,10 +1380,6 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			if !result.confirm {
 				if member.state == "healthy" {
 					member.state = "suspect"
-				}
-				if member == s.primary && s.backgroundCancel != nil {
-					s.backgroundCancel()
-					s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
 				}
 				s.queueLocked(member, "tcp", (result.operator+1)%3, true, now)
 				if member == s.primary && s.standby != nil {
@@ -1697,23 +1705,7 @@ func (s *Smart) scheduleThroughputLocked(now time.Time) {
 	if candidate == nil || candidate.queued["throughput"] {
 		return
 	}
-	id, capBytes, err := s.ledger.Reserve(s.ctx, s.network.Type, now, s.network.Offset)
-	if err != nil {
-		return
-	}
-	if candidate != s.primary && candidate != s.standby {
-		s.lastChallenger = now
-	}
-	s.queueLocked(candidate, "throughput", 0, false, now)
-	for i := len(s.pending) - 1; i >= 0; i-- {
-		if s.pending[i].member == candidate && s.pending[i].kind == "throughput" {
-			s.pending[i].reservation = id
-			s.pending[i].capBytes = capBytes
-			s.pending[i].timeout = 30 * time.Second
-			return
-		}
-	}
-	_ = s.ledger.Reconcile(id, 0, false)
+	s.startThroughputAdmissionLocked(candidate, now)
 }
 
 func (s *Smart) updateNotificationLocked(now time.Time) {
@@ -1837,7 +1829,7 @@ func (s *Smart) flushHistory(force bool) {
 	defer s.persistenceMu.Unlock()
 	s.mu.Lock()
 	now := s.clock.Now()
-	if !s.dirty || !force && now.Sub(s.lastWrite) < time.Minute {
+	if s.persistenceAbandoned || !s.dirty || !force && now.Sub(s.lastWrite) < time.Minute {
 		s.mu.Unlock()
 		return
 	}
@@ -1912,6 +1904,8 @@ func (s *Smart) cancelURLWaitersLocked(err error) {
 }
 
 func (s *Smart) Close() error {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), smartShutdownTimeout)
+	defer shutdownCancel()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -1929,6 +1923,12 @@ func (s *Smart) Close() error {
 		s.workCancel()
 	}
 	s.clearPendingLocked()
+	s.discardBufferedJobsLocked()
+	if s.cache != nil {
+		s.startHistoryPersistenceLocked()
+		close(s.persistenceStop)
+	}
+	persistenceDone := s.persistenceDone
 	s.cancelURLWaitersLocked(context.Canceled)
 	s.updateNotificationLocked(s.clock.Now())
 	var closers []io.Closer
@@ -1942,7 +1942,10 @@ func (s *Smart) Close() error {
 		_ = closer.Close()
 	}
 	if s.loopDone != nil {
-		<-s.loopDone
+		select {
+		case <-s.loopDone:
+		case <-shutdownCtx.Done():
+		}
 	}
 	if s.pauseManager != nil && s.pauseCallback != nil {
 		s.pauseManager.UnregisterCallback(s.pauseCallback)
@@ -1950,16 +1953,25 @@ func (s *Smart) Close() error {
 	for provider, callback := range s.providerCallbacks {
 		provider.UnregisterCallback(callback)
 	}
-	s.workers.Wait()
-	s.mu.Lock()
-	if s.cache != nil {
-		s.startHistoryPersistenceLocked()
-		close(s.persistenceStop)
-	}
-	persistenceDone := s.persistenceDone
-	s.mu.Unlock()
-	if persistenceDone != nil {
-		<-persistenceDone
+	finished := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		s.admissionWorkers.Wait()
+		s.accountingWorkers.Wait()
+		if persistenceDone != nil {
+			<-persistenceDone
+		}
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-shutdownCtx.Done():
+		s.mu.Lock()
+		s.persistenceAbandoned = true
+		s.mu.Unlock()
+		if s.logger != nil {
+			s.logger.Error("smart persistence shutdown exceeded ", smartShutdownTimeout, "; abandoning final writes")
+		}
 	}
 	if s.ledger != nil {
 		s.ledger.Unregister(s.Tag())

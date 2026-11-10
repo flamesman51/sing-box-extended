@@ -246,7 +246,7 @@ func TestSmartBlockedHistoryPersistenceDoesNotBlockOwner(t *testing.T) {
 		started: make(chan struct{}), release: make(chan struct{}),
 		completed: make(chan smartHistorySave, 4),
 	}
-	s.cache = cache
+	metadataStarted := smartEnableBlockedThroughput(t, s, cache)
 	primary, standby := s.primary, s.standby
 	s.timeout, s.udpEnabled, s.generationSucceeded = 8*time.Second, false, true
 	s.lastDirect, s.lastFullRound, s.lastNetworkRead = started, started, started.Add(time.Hour)
@@ -259,7 +259,7 @@ func TestSmartBlockedHistoryPersistenceDoesNotBlockOwner(t *testing.T) {
 			delay: 8 * time.Second, blackhole: member == primary,
 		}
 	}
-	smartStartTestOwner(t, s, clock)
+	smartStartTestOwner(t, s, clock, nil)
 	var release sync.Once
 	unblock := func() { release.Do(func() { close(cache.release) }) }
 	t.Cleanup(unblock)
@@ -268,6 +268,7 @@ func TestSmartBlockedHistoryPersistenceDoesNotBlockOwner(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("history save did not start")
 	}
+	smartLedgerWait(t, metadataStarted)
 	selected := make(chan error, 1)
 	go func() {
 		decision, err := s.SelectMember(context.Background(), "tcp", M.Socksaddr{})

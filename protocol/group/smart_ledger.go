@@ -64,12 +64,23 @@ type smartReconciliation struct {
 	uncertain bool
 }
 
+type smartReconciliationAttempt struct {
+	id   string
+	done chan struct{}
+	err  error
+}
+
 type smartLedger struct {
 	mu           sync.Mutex
+	operation    chan struct{}
+	operations   int
+	ready        chan struct{}
+	loadErr      error
 	cache        adapter.CacheFile
 	installation smartInstallation
 	state        smartLedgerState
 	pending      smartReconciliation
+	attempt      *smartReconciliationAttempt
 	raw          map[string]json.RawMessage
 	limits       map[string]map[string]float64
 }
@@ -81,29 +92,53 @@ var smartLedgers = struct {
 
 func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 	smartLedgers.Lock()
-	defer smartLedgers.Unlock()
 	if ledger := smartLedgers.byCache[cache]; ledger != nil {
+		smartLedgers.Unlock()
+		<-ledger.ready
+		if ledger.loadErr != nil {
+			return nil, ledger.loadErr
+		}
 		return ledger, nil
 	}
-	ledger := &smartLedger{cache: cache, limits: make(map[string]map[string]float64), raw: make(map[string]json.RawMessage)}
+	ledger := &smartLedger{
+		cache: cache, operation: make(chan struct{}, 1), ready: make(chan struct{}),
+		limits: make(map[string]map[string]float64), raw: make(map[string]json.RawMessage),
+	}
+	smartLedgers.byCache[cache] = ledger
+	smartLedgers.Unlock()
+	ledger.loadErr = ledger.initialize()
+	if ledger.loadErr != nil {
+		smartLedgers.Lock()
+		delete(smartLedgers.byCache, cache)
+		smartLedgers.Unlock()
+	}
+	close(ledger.ready)
+	if ledger.loadErr != nil {
+		return nil, ledger.loadErr
+	}
+	return ledger, nil
+}
+
+func (ledger *smartLedger) initialize() error {
+	cache := ledger.cache
 	if cache != nil {
 		metadata, err := cache.LoadSmartMetadata()
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
+			return err
 		}
 		if metadata != nil && len(metadata.Data) != 0 {
 			if err = json.Unmarshal(metadata.Data, &ledger.raw); err != nil {
-				return nil, fmt.Errorf("decode smart metadata: %w", err)
+				return fmt.Errorf("decode smart metadata: %w", err)
 			}
 			if err = json.Unmarshal(metadata.Data, &ledger.installation); err != nil {
-				return nil, fmt.Errorf("decode smart installation: %w", err)
+				return fmt.Errorf("decode smart installation: %w", err)
 			}
 		}
 	}
 	if ledger.installation.InstallID == "" {
 		var id [16]byte
 		if _, err := rand.Read(id[:]); err != nil {
-			return nil, err
+			return err
 		}
 		ledger.installation.InstallID = hex.EncodeToString(id[:])
 	}
@@ -111,7 +146,7 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 		if len(*seed) == 0 {
 			*seed = make([]byte, 32)
 			if _, err := rand.Read(*seed); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
@@ -124,16 +159,12 @@ func getSmartLedger(cache adapter.CacheFile) (*smartLedger, error) {
 	}
 	for _, reservation := range ledger.state.Reservations {
 		if reservation.Bytes < 0 {
-			return nil, errors.New("negative smart reservation")
+			return errors.New("negative smart reservation")
 		}
 		ledger.state.Days[reservation.NetworkType+"/"+reservation.Day] += reservation.Bytes
 	}
 	ledger.state.Reservations = make(map[string]smartReservation)
-	if err := ledger.saveLocked(); err != nil {
-		return nil, err
-	}
-	smartLedgers.byCache[cache] = ledger
-	return ledger, nil
+	return ledger.save(ledger.state, ledger.installation)
 }
 
 func (l *smartLedger) Register(group string, limits map[string]float64) {
@@ -143,14 +174,32 @@ func (l *smartLedger) Register(group string, limits map[string]float64) {
 }
 
 func (l *smartLedger) Unregister(group string) {
+	l.mu.Lock()
+	delete(l.limits, group)
+	l.mu.Unlock()
+	l.prune()
+}
+
+func (l *smartLedger) prune() {
 	smartLedgers.Lock()
 	defer smartLedgers.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.limits, group)
-	if l.cache != nil && len(l.limits) == 0 && smartLedgers.byCache[l.cache] == l {
+	if l.cache != nil && len(l.limits) == 0 && l.operations == 0 && len(l.state.Reservations) == 0 && l.pending.id == "" && smartLedgers.byCache[l.cache] == l {
 		delete(smartLedgers.byCache, l.cache)
 	}
+}
+
+func (l *smartLedger) releaseOperation() {
+	<-l.operation
+	l.finishOperation()
+}
+
+func (l *smartLedger) finishOperation() {
+	l.mu.Lock()
+	l.operations--
+	l.mu.Unlock()
+	l.prune()
 }
 
 func smartBudgetType(networkType string) string {
@@ -179,11 +228,7 @@ func (l *smartLedger) limitLocked(networkType string) float64 {
 
 func (l *smartLedger) dayLocked(networkType string, now time.Time, offset int) string {
 	day := now.In(time.FixedZone("smart-local", offset)).Format("2006-01-02")
-	if latest := l.state.Latest[networkType]; day < latest {
-		return latest
-	}
-	l.state.Latest[networkType] = day
-	return day
+	return max(day, l.state.Latest[networkType])
 }
 
 func (l *smartLedger) snapshotLocked(networkType, day string) smartBudget {
@@ -201,7 +246,9 @@ func (l *smartLedger) Snapshot(networkType string, now time.Time, offset int) sm
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	networkType = smartBudgetType(networkType)
-	return l.snapshotLocked(networkType, l.dayLocked(networkType, now, offset))
+	day := l.dayLocked(networkType, now, offset)
+	l.state.Latest[networkType] = day
+	return l.snapshotLocked(networkType, day)
 }
 
 func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.Time, offset int) (string, int64, error) {
@@ -215,88 +262,196 @@ func (l *smartLedger) Reserve(ctx context.Context, networkType string, now time.
 		return "", 0, errSmartTestsDisabled
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.cache == nil {
-		return "", 0, errSmartTestsDisabled
+	l.operations++
+	l.mu.Unlock()
+	select {
+	case l.operation <- struct{}{}:
+	case <-ctx.Done():
+		l.finishOperation()
+		return "", 0, ctx.Err()
 	}
-	if err := l.reconcileLocked(); err != nil {
+	type admission struct {
+		id    string
+		bytes int64
+		err   error
+	}
+	result := make(chan admission)
+	// Acknowledgement leaves cleanup with the worker when cancellation wins the handoff.
+	accepted := make(chan bool, 1)
+	go func() {
+		defer l.releaseOperation()
+		id, bytes, err := l.reserve(ctx, networkType, now, offset)
+		select {
+		case result <- admission{id: id, bytes: bytes, err: err}:
+			if <-accepted {
+				return
+			}
+		case <-ctx.Done():
+		}
+		if id != "" {
+			l.mu.Lock()
+			l.pending = smartReconciliation{id: id}
+			l.mu.Unlock()
+			_ = l.reconcilePending()
+		}
+	}()
+	select {
+	case reservation := <-result:
+		err := ctx.Err()
+		accepted <- err == nil
+		if err != nil {
+			return "", 0, err
+		}
+		return reservation.id, reservation.bytes, reservation.err
+	case <-ctx.Done():
+		return "", 0, ctx.Err()
+	}
+}
+
+func (l *smartLedger) reserve(ctx context.Context, networkType string, now time.Time, offset int) (string, int64, error) {
+	if err := ctx.Err(); err != nil {
 		return "", 0, err
 	}
+	if err := l.reconcilePending(); err != nil {
+		return "", 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	l.mu.Lock()
+	id, capBytes, state, err := l.reservationLocked(networkType, now, offset)
+	installation := l.installation
+	l.mu.Unlock()
+	if err != nil {
+		return "", 0, err
+	}
+	if err = l.save(state, installation); err != nil {
+		return "", 0, err
+	}
+	l.mu.Lock()
+	l.setStateLocked(state)
+	l.mu.Unlock()
+	return id, capBytes, nil
+}
+
+func (l *smartLedger) reservationLocked(networkType string, now time.Time, offset int) (string, int64, smartLedgerState, error) {
+	if l.cache == nil {
+		return "", 0, smartLedgerState{}, errSmartTestsDisabled
+	}
 	if len(l.state.Reservations) != 0 {
-		return "", 0, errSmartTestBusy
+		return "", 0, smartLedgerState{}, errSmartTestBusy
 	}
 	networkType = smartBudgetType(networkType)
-	before := l.cloneStateLocked()
 	day := l.dayLocked(networkType, now, offset)
 	snapshot := l.snapshotLocked(networkType, day)
 	if !snapshot.ActiveTests {
-		l.state = before
-		return "", 0, errSmartTestsDisabled
+		return "", 0, smartLedgerState{}, errSmartTestsDisabled
 	}
 	remaining := (snapshot.LimitMB - snapshot.UsedMB - snapshot.ReservedMB) * 1_000_000
 	capBytes := int64(min(25_000_000, math.Max(0, math.Floor(remaining*0.2))))
 	if capBytes < 1_100_000 {
-		l.state = before
-		return "", 0, errSmartBudget
+		return "", 0, smartLedgerState{}, errSmartBudget
 	}
-	nowUnix := max(now.Unix(), l.state.LatestTime)
-	l.state.LatestTime = nowUnix
-	l.state.Starts = slices.DeleteFunc(l.state.Starts, func(at int64) bool { return at <= nowUnix-3600 })
-	if len(l.state.Starts) >= 4 {
-		l.state = before
-		return "", 0, errSmartTestRate
+	state := l.cloneStateLocked()
+	state.Latest[networkType] = day
+	nowUnix := max(now.Unix(), state.LatestTime)
+	state.LatestTime = nowUnix
+	state.Starts = slices.DeleteFunc(state.Starts, func(at int64) bool { return at <= nowUnix-3600 })
+	if len(state.Starts) >= 4 {
+		return "", 0, smartLedgerState{}, errSmartTestRate
 	}
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
-		l.state = before
-		return "", 0, err
+		return "", 0, smartLedgerState{}, err
 	}
 	id := hex.EncodeToString(random[:])
-	l.state.Reservations[id] = smartReservation{NetworkType: networkType, Day: day, Bytes: capBytes}
-	l.state.Starts = append(l.state.Starts, nowUnix)
-	if err := l.saveLocked(); err != nil {
-		l.state = before
-		return "", 0, err
-	}
-	return id, capBytes, nil
+	state.Reservations[id] = smartReservation{NetworkType: networkType, Day: day, Bytes: capBytes}
+	state.Starts = append(state.Starts, nowUnix)
+	return id, capBytes, state, nil
 }
 
-func (l *smartLedger) Reconcile(id string, bytes int64, uncertain bool) error {
+func (l *smartLedger) Reconcile(ctx context.Context, id string, bytes int64, uncertain bool) error {
 	if bytes < 0 {
 		return errors.New("negative smart measured bytes")
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if _, exists := l.state.Reservations[id]; !exists {
+		l.mu.Unlock()
 		return errors.New("unknown smart reservation")
 	}
 	if l.pending.id == "" {
 		l.pending = smartReconciliation{id: id, bytes: bytes, uncertain: uncertain}
 	}
-	return l.reconcileLocked()
+	attempt := l.attempt
+	if attempt == nil || attempt.id != id {
+		attempt = &smartReconciliationAttempt{id: id, done: make(chan struct{})}
+		l.attempt = attempt
+		l.operations++
+		go func() {
+			l.operation <- struct{}{}
+			defer l.releaseOperation()
+			l.mu.Lock()
+			pending := l.pending.id == id
+			l.mu.Unlock()
+			if pending {
+				attempt.err = l.reconcilePending()
+			}
+			l.mu.Lock()
+			if l.attempt == attempt {
+				l.attempt = nil
+			}
+			l.mu.Unlock()
+			close(attempt.done)
+		}()
+	}
+	l.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-attempt.done:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return attempt.err
+	}
 }
 
-func (l *smartLedger) reconcileLocked() error {
-	if l.pending.id == "" {
+func (l *smartLedger) reconcilePending() error {
+	l.mu.Lock()
+	pending := l.pending
+	if pending.id == "" {
+		l.mu.Unlock()
 		return nil
 	}
-	reservation := l.state.Reservations[l.pending.id]
-	before := l.cloneStateLocked()
-	delete(l.state.Reservations, l.pending.id)
-	if l.pending.uncertain {
+	state := l.cloneStateLocked()
+	installation := l.installation
+	reservation := state.Reservations[pending.id]
+	delete(state.Reservations, pending.id)
+	if pending.uncertain {
 		reservation.NetworkType = "cellular"
 	}
-	key := reservation.NetworkType + "/" + reservation.Day
-	l.state.Days[key] += l.pending.bytes
-	if l.state.Latest[reservation.NetworkType] < reservation.Day {
-		l.state.Latest[reservation.NetworkType] = reservation.Day
+	if pending.bytes != 0 {
+		key := reservation.NetworkType + "/" + reservation.Day
+		state.Days[key] += pending.bytes
 	}
-	if err := l.saveLocked(); err != nil {
-		l.state = before
+	state.Latest[reservation.NetworkType] = max(state.Latest[reservation.NetworkType], reservation.Day)
+	l.mu.Unlock()
+	if err := l.save(state, installation); err != nil {
 		return err
 	}
+	l.mu.Lock()
+	l.setStateLocked(state)
 	l.pending = smartReconciliation{}
+	l.mu.Unlock()
 	return nil
+}
+
+func (l *smartLedger) setStateLocked(state smartLedgerState) {
+	// Snapshots may observe a newer date while metadata is being written.
+	for networkType, day := range l.state.Latest {
+		state.Latest[networkType] = max(state.Latest[networkType], day)
+	}
+	l.state = state
 }
 
 func (l *smartLedger) cloneStateLocked() smartLedgerState {
@@ -306,12 +461,11 @@ func (l *smartLedger) cloneStateLocked() smartLedgerState {
 	return state
 }
 
-func (l *smartLedger) saveLocked() error {
+func (l *smartLedger) save(state smartLedgerState, installation smartInstallation) error {
 	if l.cache == nil {
 		return nil
 	}
-	installation := l.installation
-	installation.Ledger = l.state
+	installation.Ledger = state
 	encoded, err := json.Marshal(installation)
 	if err != nil {
 		return err
@@ -320,7 +474,9 @@ func (l *smartLedger) saveLocked() error {
 	if err = json.Unmarshal(encoded, &fields); err != nil {
 		return err
 	}
+	l.mu.Lock()
 	merged := maps.Clone(l.raw)
+	l.mu.Unlock()
 	if merged == nil {
 		merged = make(map[string]json.RawMessage)
 	}
@@ -335,7 +491,9 @@ func (l *smartLedger) saveLocked() error {
 	if err = l.cache.SaveSmartMetadata(&adapter.SmartMetadata{Data: encoded}); err != nil {
 		return err
 	}
+	l.mu.Lock()
 	l.raw = merged
+	l.mu.Unlock()
 	return nil
 }
 
@@ -363,33 +521,41 @@ func (l *smartLedger) Installation() (id string, hmacSeed, directSeed []byte) {
 }
 
 func (l *smartLedger) UpdatePriors(group string, priors []smartPrior, sources []smartPriorSource) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if len(sources) > 16 {
 		return errors.New("too many smart prior sources")
 	}
-	oldPriors, oldSources := l.installation.Priors, l.installation.PriorSources
-	l.installation.Priors = maps.Clone(oldPriors)
-	l.installation.PriorSources = maps.Clone(oldSources)
-	if l.installation.Priors == nil {
-		l.installation.Priors = make(map[string][]smartPrior)
+	l.mu.Lock()
+	l.operations++
+	l.mu.Unlock()
+	l.operation <- struct{}{}
+	defer l.releaseOperation()
+	l.mu.Lock()
+	installation := l.installation
+	state := l.cloneStateLocked()
+	installation.Priors = maps.Clone(installation.Priors)
+	installation.PriorSources = maps.Clone(installation.PriorSources)
+	l.mu.Unlock()
+	if installation.Priors == nil {
+		installation.Priors = make(map[string][]smartPrior)
 	}
-	if l.installation.PriorSources == nil {
-		l.installation.PriorSources = make(map[string][]smartPriorSource)
+	if installation.PriorSources == nil {
+		installation.PriorSources = make(map[string][]smartPriorSource)
 	}
 	if len(priors) == 0 {
-		delete(l.installation.Priors, group)
+		delete(installation.Priors, group)
 	} else {
-		l.installation.Priors[group] = slices.Clone(priors)
+		installation.Priors[group] = slices.Clone(priors)
 	}
 	if len(sources) == 0 {
-		delete(l.installation.PriorSources, group)
+		delete(installation.PriorSources, group)
 	} else {
-		l.installation.PriorSources[group] = slices.Clone(sources)
+		installation.PriorSources[group] = slices.Clone(sources)
 	}
-	if err := l.saveLocked(); err != nil {
-		l.installation.Priors, l.installation.PriorSources = oldPriors, oldSources
+	if err := l.save(state, installation); err != nil {
 		return err
 	}
+	l.mu.Lock()
+	l.installation.Priors, l.installation.PriorSources = installation.Priors, installation.PriorSources
+	l.mu.Unlock()
 	return nil
 }

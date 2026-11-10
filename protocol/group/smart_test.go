@@ -788,7 +788,7 @@ func (o *smartTimedOutbound) DialContext(ctx context.Context, _ string, destinat
 	}
 }
 
-func smartStartTestOwner(t *testing.T, s *Smart, clock *smartFakeClock) {
+func smartStartTestOwner(t *testing.T, s *Smart, clock *smartFakeClock, beforeGeneralWorkers func()) {
 	t.Helper()
 	s.healthJobs, s.otherJobs = make(chan smartJob, 3), make(chan smartJob, 2)
 	if s.workCtx == nil {
@@ -809,16 +809,21 @@ func smartStartTestOwner(t *testing.T, s *Smart, clock *smartFakeClock) {
 		return time.Millisecond, nil
 	}
 	s.loopDone = make(chan struct{})
-	for worker := range 3 {
-		s.workers.Add(1)
-		go s.worker(s.ctx, worker == 0)
-	}
+	s.workers.Add(1)
+	go s.worker(s.ctx, true)
 	go s.loop(s.ctx)
 	t.Cleanup(func() {
 		if err := s.Close(); err != nil {
 			t.Error(err)
 		}
 	})
+	if beforeGeneralWorkers != nil {
+		beforeGeneralWorkers()
+	}
+	for range 2 {
+		s.workers.Add(1)
+		go s.worker(s.ctx, false)
+	}
 }
 
 func smartAwaitGroup(t *testing.T, s *Smart, clock *smartFakeClock, condition func() bool) {
@@ -856,77 +861,179 @@ func smartAwaitProbe(t *testing.T, calls <-chan smartProbeCall, tag string, oper
 	}
 }
 
-func TestSmartOwnerBlackholeBoundWithQueuedBackgroundConfirmations(t *testing.T) {
-	s, clock := smartTestGroup()
-	started := clock.Now()
-	calls := make(chan smartProbeCall, 64)
-	primary, standby := s.primary, s.standby
-	s.timeout, s.udpEnabled, s.generationSucceeded = 8*time.Second, false, true
-	s.lastDirect, s.lastFullRound = started, started
-	s.lastNetworkRead = started.Add(time.Hour)
-	for _, member := range s.members {
-		member.lastProbe = started
-		member.outbound = &smartTimedOutbound{smartFakeOutbound: smartFakeOutbound{tag: member.tag}, clock: clock, calls: calls, delay: 8 * time.Second, blackhole: member == primary}
-	}
-	for order, tag := range []string{"c", "d", "e"} {
-		member := &smartMember{tag: tag, identity: tag, serverIdentity: tag, tier: 1, configOrder: order + 2, generation: 1, state: "suspect", lastProbe: started}
-		member.outbound = &smartTimedOutbound{smartFakeOutbound: smartFakeOutbound{tag: tag}, clock: clock, calls: calls, delay: 8 * time.Second, blackhole: true}
-		s.members = append(s.members, member)
-	}
-	clock.Advance(14 * time.Second)
-	s.workCtx, s.workCancel = context.WithCancel(s.ctx)
-	s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
-	for _, member := range s.members[2:] {
-		s.queueLocked(member, "tcp", 0, true, clock.Now())
-	}
-	smartStartTestOwner(t, s, clock)
-	background := make(map[string]bool)
-	for len(background) < 2 {
-		select {
-		case call := <-calls:
-			if call.tag == "a" || call.tag == "b" {
-				t.Fatalf("unexpected early health probe: %+v", call)
+func TestSmartPrimaryDeadlinePreemptsOnlyBackgroundContext(t *testing.T) {
+	for _, workGeneration := range []bool{false, true} {
+		t.Run(fmt.Sprintf("work_generation=%t", workGeneration), func(t *testing.T) {
+			s, clock := smartTestGroup()
+			t.Cleanup(s.cancel)
+			parent := s.ctx
+			if workGeneration {
+				s.workCtx, s.workCancel = context.WithCancel(s.ctx)
+				t.Cleanup(s.workCancel)
+				parent = s.workCtx
 			}
-			background[call.tag] = true
-		case <-time.After(2 * time.Second):
-			t.Fatal("background workers did not become occupied")
-		}
-	}
-	clock.Advance(time.Second)
-	s.request("demand")
-	first := smartAwaitProbe(t, calls, "a", 1)
-	if first.at.Sub(started) != 15*time.Second {
-		t.Fatalf("primary heartbeat was delayed by background confirmations: %v", first.at.Sub(started))
-	}
-	clock.Advance(8 * time.Second)
-	s.request("demand")
-	health := make(map[string]bool)
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	for len(health) < 2 {
-		select {
-		case call := <-calls:
-			if (call.tag == "a" || call.tag == "b") && call.operator == 2 {
-				if call.at.Sub(started) != 23*time.Second {
-					t.Fatalf("health validation missed its reservation: %+v", call)
+			s.backgroundCtx, s.backgroundCancel = context.WithCancel(parent)
+			oldBackground := s.backgroundCtx
+			s.lastDiscovery = clock.Now()
+			s.primary.lastUDP, s.primary.lastUDP443 = clock.Now(), clock.Now()
+			s.queueLocked(s.primary, "udp443", 0, false, clock.Now())
+			s.queueLocked(s.standby, "tcp", 0, false, clock.Now())
+			if oldBackground.Err() != nil || !s.lastDiscovery.Equal(clock.Now()) {
+				t.Fatal("non-primary health work preempted background discovery")
+			}
+			s.queueLocked(s.primary, "tcp", 1, false, clock.Now())
+			if oldBackground.Err() != context.Canceled {
+				t.Fatal("primary deadline left buffered background work active")
+			}
+			if s.pending[0].ctx != oldBackground || s.pending[0].ctx.Err() != context.Canceled {
+				t.Fatal("buffered background job escaped its canceled context")
+			}
+			for _, job := range s.pending[1:] {
+				if job.ctx != parent || job.ctx.Err() != nil {
+					t.Fatal("primary or standby health was canceled with background work")
 				}
-				health[call.tag] = true
 			}
-		case <-deadline.C:
-			t.Fatal("primary confirmation and standby validation did not start in parallel")
-		}
+			background := s.backgroundCtx
+			if background == oldBackground || background.Err() != nil || !s.lastDiscovery.IsZero() {
+				t.Fatal("primary deadline did not reopen background discovery")
+			}
+			if !s.primary.lastUDP.Equal(clock.Now()) || !s.primary.lastUDP443.Equal(clock.Now()) {
+				t.Fatal("preemption changed UDP probe cadence")
+			}
+			s.queueLocked(s.standby, "udp", 0, false, clock.Now())
+			if s.pending[len(s.pending)-1].ctx != background {
+				t.Fatal("future background job reused the canceled context")
+			}
+			if workGeneration {
+				s.workCancel()
+				if background.Err() != context.Canceled || s.ctx.Err() != nil {
+					t.Fatal("replacement background context escaped work-generation cancellation")
+				}
+			}
+			s.cancel()
+			for _, job := range s.pending {
+				if job.ctx.Err() != context.Canceled {
+					t.Fatal("queued work escaped lifecycle cancellation")
+				}
+			}
+		})
 	}
-	clock.Advance(8 * time.Second)
-	s.request("demand")
-	smartAwaitGroup(t, s, clock, func() bool {
-		return primary.state == "quarantined" && s.primary == standby && standby.lastOK.Equal(clock.Now())
-	})
-	decision, err := s.SelectMember(context.Background(), "tcp", M.Socksaddr{})
-	if err != nil || decision.Outbound() != standby.outbound {
-		t.Fatalf("dead primary remained selectable at 31 seconds: %v", err)
+}
+
+func TestSmartRejectedPrimaryDoesNotPreemptBackground(t *testing.T) {
+	s, clock := smartTestGroup()
+	t.Cleanup(s.cancel)
+	s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.ctx)
+	s.lastDiscovery = clock.Now()
+	s.pending = make([]smartJob, 256)
+	s.queueLocked(s.primary, "tcp", 1, false, clock.Now())
+	if s.backgroundCtx.Err() != nil || !s.lastDiscovery.Equal(clock.Now()) {
+		t.Fatal("rejected primary job canceled background work")
 	}
-	if clock.Now().Sub(started) != 31*time.Second {
-		t.Fatal("regression did not exercise the documented worst-case bound")
+	if s.primary.inflight || s.primary.queued["tcp"] {
+		t.Fatal("rejected primary job remained inflight")
+	}
+}
+
+func TestSmartOwnerBlackholeBoundWithQueuedBackgroundConfirmations(t *testing.T) {
+	for _, standbyBusy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("standby_busy=%t", standbyBusy), func(t *testing.T) {
+			s, clock := smartTestGroup()
+			started := clock.Now()
+			calls := make(chan smartProbeCall, 64)
+			primary, standby := s.primary, s.standby
+			s.timeout, s.udpEnabled, s.generationSucceeded = 8*time.Second, false, true
+			s.lastDirect, s.lastFullRound = started, started
+			s.lastNetworkRead = started.Add(time.Hour)
+			for _, member := range s.members {
+				member.lastProbe = started
+				member.outbound = &smartTimedOutbound{smartFakeOutbound: smartFakeOutbound{tag: member.tag}, clock: clock, calls: calls, delay: 8 * time.Second, blackhole: member == primary}
+			}
+			for order, tag := range []string{"c", "d", "e"} {
+				member := &smartMember{tag: tag, identity: tag, serverIdentity: tag, tier: 1, configOrder: order + 2, generation: 1, state: "suspect", lastProbe: started}
+				member.outbound = &smartTimedOutbound{smartFakeOutbound: smartFakeOutbound{tag: tag}, clock: clock, calls: calls, delay: 8 * time.Second, blackhole: true}
+				s.members = append(s.members, member)
+			}
+			clock.Advance(14 * time.Second)
+			s.workCtx, s.workCancel = context.WithCancel(s.ctx)
+			s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
+			var beforeGeneralWorkers func()
+			if standbyBusy {
+				s.queueLocked(standby, "tcp", 0, false, clock.Now())
+				beforeGeneralWorkers = func() {
+					call := smartAwaitProbe(t, calls, "b", 0)
+					if call.at.Sub(started) != 14*time.Second {
+						t.Fatalf("standby did not occupy the reserved worker before the heartbeat: %+v", call)
+					}
+				}
+			}
+			for _, member := range s.members[2:] {
+				s.queueLocked(member, "tcp", 0, true, clock.Now())
+			}
+			smartStartTestOwner(t, s, clock, beforeGeneralWorkers)
+			background := make(map[string]bool)
+			occupiedDeadline := time.NewTimer(2 * time.Second)
+			defer occupiedDeadline.Stop()
+			for len(background) < 2 {
+				select {
+				case call := <-calls:
+					if call.tag == "a" || call.tag == "b" {
+						t.Fatalf("unexpected early health probe: %+v", call)
+					}
+					if call.at.Sub(started) != 14*time.Second {
+						t.Fatalf("background confirmation did not occupy a general worker: %+v", call)
+					}
+					background[call.tag] = true
+				case <-occupiedDeadline.C:
+					t.Fatal("background workers did not become occupied")
+				}
+			}
+			clock.Advance(time.Second)
+			s.request("demand")
+			first := smartAwaitProbe(t, calls, "a", 1)
+			if first.at.Sub(started) != 15*time.Second {
+				t.Fatalf("primary heartbeat was delayed by worker contention: %v", first.at.Sub(started))
+			}
+			if standbyBusy {
+				clock.Advance(7 * time.Second)
+				s.request("demand")
+				smartAwaitGroup(t, s, clock, func() bool {
+					return standby.lastOK.Equal(started.Add(22*time.Second)) && !standby.inflight
+				})
+				clock.Advance(time.Second)
+			} else {
+				clock.Advance(8 * time.Second)
+			}
+			s.request("demand")
+			health := make(map[string]bool)
+			deadline := time.NewTimer(2 * time.Second)
+			defer deadline.Stop()
+			for len(health) < 2 {
+				select {
+				case call := <-calls:
+					if (call.tag == "a" || call.tag == "b") && call.operator == 2 {
+						if call.at.Sub(started) != 23*time.Second {
+							t.Fatalf("health validation missed its reservation: %+v", call)
+						}
+						health[call.tag] = true
+					}
+				case <-deadline.C:
+					t.Fatal("primary confirmation and standby validation did not start in parallel")
+				}
+			}
+			clock.Advance(8 * time.Second)
+			s.request("demand")
+			smartAwaitGroup(t, s, clock, func() bool {
+				return primary.state == "quarantined" && s.primary == standby && standby.lastOK.Equal(clock.Now())
+			})
+			decision, err := s.SelectMember(context.Background(), "tcp", M.Socksaddr{})
+			if err != nil || decision.Outbound() != standby.outbound {
+				t.Fatalf("dead primary remained selectable at 31 seconds: %v", err)
+			}
+			if clock.Now().Sub(started) != 31*time.Second {
+				t.Fatal("regression did not exercise the documented worst-case bound")
+			}
+		})
 	}
 }
 
@@ -939,7 +1046,7 @@ func TestSmartCloseCancelsOwnerWorkersAfterGenerationChange(t *testing.T) {
 		member.outbound = &smartTimedOutbound{smartFakeOutbound: smartFakeOutbound{tag: member.tag}, clock: clock, calls: calls, delay: time.Hour}
 	}
 	s.newGenerationLocked(s.network, clock.Now())
-	smartStartTestOwner(t, s, clock)
+	smartStartTestOwner(t, s, clock, nil)
 	smartAwaitProbe(t, calls, "a", int(s.generation%3))
 	closed := make(chan error, 1)
 	s.request("network")
