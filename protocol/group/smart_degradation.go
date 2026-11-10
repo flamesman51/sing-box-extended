@@ -24,17 +24,18 @@ type smartDegradationEpisode struct {
 }
 
 type smartDegradationState struct {
-	episode                   *smartDegradationEpisode
-	sampled, window, progress time.Time
-	baseline, previous        int64
-	ticks, flows              int
-	observed, provisional     float64
-	state, blocked            string
-	checked, retry            time.Time
-	attempts                  map[string]time.Time
-	cooldowns                 map[string]time.Time
-	scopeKey                  string
-	scopePrimary              *smartMember
+	episode               *smartDegradationEpisode
+	sampled, window       time.Time
+	baseline, previous    int64
+	activeDuration        time.Duration
+	flows                 int
+	observed, provisional float64
+	state, blocked        string
+	checked, retry        time.Time
+	attempts              map[string]time.Time
+	cooldowns             map[string]time.Time
+	scopeKey              string
+	scopePrimary          *smartMember
 }
 
 func (s *Smart) degradationKey(member *smartMember) string {
@@ -59,7 +60,7 @@ func (s *Smart) clearDegradationLocked() {
 	d.episode = nil
 	d.window = time.Time{}
 	d.sampled = time.Time{}
-	d.ticks = 0
+	d.activeDuration = 0
 	d.flows = 0
 	d.provisional = 0
 }
@@ -111,35 +112,35 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		d.retry = time.Time{}
 		d.window = time.Time{}
 	}
-	if !d.sampled.IsZero() && now.Sub(d.sampled) < time.Second {
+	if !d.sampled.IsZero() && now.Sub(d.sampled) < 500*time.Millisecond {
 		return false
 	}
 	total := s.primary.passiveRead
 	flows := 0
 	for lease := range s.leases[s.primary] {
-		if lease.generation == s.generation && now.Sub(lease.started) >= 10*time.Second && now.Sub(lease.lastRead) <= 2*time.Second {
+		if lease.generation == s.generation && now.Sub(lease.started) >= 10*time.Second && now.Sub(lease.lastRead) <= 3*time.Second {
 			flows++
 		}
 	}
-	if d.window.IsZero() || now.Sub(d.sampled) > 2*time.Second || now.Sub(d.progress) > 2*time.Second || flows == 0 {
-		d.window, d.sampled, d.progress = now, now, now
+	if d.window.IsZero() || flows == 0 {
+		d.window, d.sampled = now, now
 		d.baseline = total
 		d.previous = total
-		d.ticks = 0
+		d.activeDuration = 0
 		d.flows = flows
 		return false
 	}
 	elapsed := now.Sub(d.window)
-	d.observed = float64(total-d.previous) * 8 / now.Sub(d.sampled).Seconds() / 1e6
-	if total > d.previous {
-		d.ticks++
-		d.progress = now
+	sampleInterval := now.Sub(d.sampled)
+	d.observed = float64(total-d.previous) * 8 / sampleInterval.Seconds() / 1e6
+	if total > d.previous && sampleInterval <= 3*time.Second {
+		d.activeDuration += sampleInterval
 	}
 	d.previous = total
 	if d.observed >= s.targetMbps*.5 {
 		d.window = now
 		d.baseline = total
-		d.ticks = 0
+		d.activeDuration = 0
 		d.sampled = now
 		d.state = "idle"
 		return false
@@ -150,12 +151,12 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		d.state = "observing"
 		return false
 	}
-	qualified := d.ticks >= 18 && now.Sub(d.progress) <= 2*time.Second && total-d.baseline >= 256*1024 && d.observed < s.targetMbps*.5
-	d.window = time.Time{}
+	qualified := d.activeDuration >= 18*time.Second && float64(total-d.baseline)/elapsed.Seconds() >= float64(256*1024)/20 && d.observed < s.targetMbps*.5
 	if !qualified {
-		d.state = "idle"
+		d.state = "observing"
 		return false
 	}
+	d.window = time.Time{}
 	key := s.degradationKey(s.primary)
 	retry := d.cooldowns[key]
 	if persisted := s.ledger.DegradationCooldown(key); persisted.After(retry) {

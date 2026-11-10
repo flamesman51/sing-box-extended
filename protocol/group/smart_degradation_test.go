@@ -406,3 +406,25 @@ func TestSmartDegradationUndersizedChallengerDoesNotConsumeTurn(t *testing.T) {
 		t.Fatal("unmeasurable challenger consumed its turn or hourly cooldown")
 	}
 }
+
+func TestSmartDegradationJitteredTicksReachSuspicion(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+	s.scheduleDegradationLocked(clock.Now())
+	intervals := []time.Duration{900 * time.Millisecond, 1100 * time.Millisecond, 1400 * time.Millisecond, 2200 * time.Millisecond}
+	start := clock.Now()
+	for i := range 24 {
+		elapsed := intervals[i%len(intervals)]
+		clock.Advance(elapsed)
+		lease.CountRead(int(187500 * elapsed / time.Second))
+		s.scheduleDegradationLocked(clock.Now())
+		if s.degradation.episode != nil {
+			if clock.Now().Sub(start) < 20*time.Second {
+				t.Fatal("jitter shortened sustained demand window")
+			}
+			return
+		}
+	}
+	t.Fatalf("sustained 1.5 Mbps download stayed %q under jittered sampling", s.degradation.state)
+}
