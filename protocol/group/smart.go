@@ -1301,7 +1301,7 @@ func (s *Smart) tickLocked(now time.Time) []io.Closer {
 			s.queueLocked(s.primary, "udp443", 0, false, now)
 		}
 	}
-	if demand && (s.lastDirect.IsZero() || now.Sub(s.lastDirect) >= 5*time.Minute) {
+	if !s.options.Probe.DisableDirect && demand && (s.lastDirect.IsZero() || now.Sub(s.lastDirect) >= 5*time.Minute) {
 		s.queueLocked(nil, "direct", 0, false, now)
 	}
 	if s.hasEligiblePrimaryLocked(now) {
@@ -1403,6 +1403,9 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 	}
 	switch result.kind {
 	case "direct":
+		if s.options.Probe.DisableDirect {
+			return nil
+		}
 		s.direct = smartEvidence{state: state, at: now, expires: now.Add(2 * time.Minute)}
 		s.directRTT = result.rtt
 		if state == "failed" && !s.generationSucceeded && s.ambiguousSince.IsZero() {
@@ -1488,7 +1491,7 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			s.offline = false
 			s.ambiguousSince = time.Time{}
 		} else {
-			if !s.generationSucceeded && s.direct.value(now) == "failed" {
+			if !s.options.Probe.DisableDirect && !s.generationSucceeded && s.direct.value(now) == "failed" {
 				if s.ambiguousSince.IsZero() {
 					s.ambiguousSince = now
 				}
@@ -1505,7 +1508,9 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 				if member == s.primary && s.standby != nil {
 					s.queueLocked(s.standby, "tcp", (result.operator+1)%3, false, now)
 				}
-				s.queueLocked(nil, "direct", 0, false, now)
+				if !s.options.Probe.DisableDirect {
+					s.queueLocked(nil, "direct", 0, false, now)
+				}
 				s.notifyUpdatedLocked()
 				return nil
 			}
@@ -1823,7 +1828,7 @@ func (s *Smart) updateNotificationLocked(now time.Time) {
 			break
 		}
 	}
-	condition := !s.closed && s.network.Link && !s.paused && allFailed && s.direct.value(now) == "ok"
+	condition := !s.options.Probe.DisableDirect && !s.closed && s.network.Link && !s.paused && allFailed && s.direct.value(now) == "ok"
 	if condition {
 		if s.allDeadSince.IsZero() {
 			s.allDeadSince = now

@@ -37,6 +37,7 @@ type SmartProbeOptions struct {
 	StandbyInterval    badoption.Duration `json:"standby_interval,omitempty"`
 	BackgroundInterval badoption.Duration `json:"background_interval,omitempty"`
 	Timeout            badoption.Duration `json:"timeout,omitempty"`
+	DisableDirect      bool               `json:"disable_direct,omitempty"`
 }
 
 type SmartUDPOptions struct {
