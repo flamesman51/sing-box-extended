@@ -38,6 +38,7 @@ func TestSmartDegradationConfirmationCap(t *testing.T) {
 type smartDegradationTimedReader struct {
 	clock              *smartFakeClock
 	warmup             int64
+	warmupElapsed      time.Duration
 	read               int64
 	elapsed            time.Duration
 	intervals          []time.Duration
@@ -56,6 +57,7 @@ func (r *smartDegradationTimedReader) Read(p []byte) (int, error) {
 	if r.warmup > 0 {
 		n = int(min(int64(n), r.warmup))
 		r.warmup -= int64(n)
+		r.clock.Advance(time.Duration(n) * r.warmupElapsed / 1_000_000)
 	} else {
 		elapsed := r.elapsed
 		if len(r.intervals) > 0 {
@@ -85,8 +87,8 @@ func TestSmartDegradationBurstDoesNotHideSlowPayload(t *testing.T) {
 	if err != nil || math.Abs(rate-3) > 0.001 {
 		t.Fatalf("startup burst hid 3 Mbps payload: rate=%f err=%v", rate, err)
 	}
-	if reader.read != 2_953_125 {
-		t.Fatalf("slow proof did not stop after first complete interval: %d", reader.read)
+	if reader.read >= 2_953_125 || clock.Now().Sub(time.Unix(1800000000, 0)) > 2100*time.Millisecond {
+		t.Fatalf("slow proof waited for a complete fast quota: bytes=%d elapsed=%s", reader.read, clock.Now().Sub(time.Unix(1800000000, 0)))
 	}
 }
 
@@ -353,5 +355,36 @@ func TestSmartDegradationDoesNotReuseEarlierPassiveBytes(t *testing.T) {
 	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, func() int64 { return passive }, clock)
 	if err != nil || math.Abs(rate-15.625) > 0.001 {
 		t.Fatalf("earlier passive bytes hid final slow interval: rate=%f err=%v", rate, err)
+	}
+}
+
+type smartDegradationDeadlineReader struct {
+	reader   io.Reader
+	clock    *smartFakeClock
+	deadline time.Time
+	cancel   context.CancelFunc
+}
+
+func (r *smartDegradationDeadlineReader) Read(p []byte) (int, error) {
+	if !r.clock.Now().Before(r.deadline) {
+		r.cancel()
+		return 0, context.Canceled
+	}
+	return r.reader.Read(p)
+}
+
+func TestSmartDegradationVerySlowConfirmsBeforeDeadline(t *testing.T) {
+	clock := smartDegradationTestClock()
+	start := clock.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timed := &smartDegradationTimedReader{clock: clock, warmup: 1_000_000, warmupElapsed: 16 * time.Second, elapsed: 31250 * time.Millisecond}
+	reader := &smartDegradationDeadlineReader{reader: timed, clock: clock, deadline: start.Add(30 * time.Second), cancel: cancel}
+	rate, err := smartMeasureDegradationBody(ctx, reader, 25, nil, clock)
+	if err != nil || math.Abs(rate-.5) > .001 {
+		t.Fatalf("0.5 Mbps primary did not confirm before timeout: rate=%f elapsed=%s err=%v", rate, clock.Now().Sub(start), err)
+	}
+	if clock.Now().Sub(start) > 19*time.Second || timed.read >= 2_953_125 {
+		t.Fatalf("slow proof waited for full fast quota: elapsed=%s bytes=%d", clock.Now().Sub(start), timed.read)
 	}
 }

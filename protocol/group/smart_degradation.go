@@ -130,12 +130,20 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		return false
 	}
 	elapsed := now.Sub(d.window)
+	d.observed = float64(total-d.previous) * 8 / now.Sub(d.sampled).Seconds() / 1e6
 	if total > d.previous {
 		d.ticks++
 		d.progress = now
 	}
 	d.previous = total
-	d.observed = float64(total-d.baseline) * 8 / elapsed.Seconds() / 1e6
+	if d.observed >= s.targetMbps*.5 {
+		d.window = now
+		d.baseline = total
+		d.ticks = 0
+		d.sampled = now
+		d.state = "idle"
+		return false
+	}
 	d.sampled = now
 	d.flows = flows
 	if elapsed < 20*time.Second {

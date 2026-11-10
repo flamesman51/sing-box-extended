@@ -484,14 +484,23 @@ func (l *smartLedger) reservationLocked(networkType string, now time.Time, offse
 	if purpose != "" {
 		remainingAllowance := math.Floor(l.limitLocked(networkType)*100_000) - float64(l.state.Days[smartDegradationDayKey(networkType, day)])
 		allowance := int64(min(float64(smartDegradationWorstCase(3*25_000_000)), math.Max(0, remainingAllowance)))
+		if confirmationCap < 1_100_000 || confirmationCap > 25_000_000 {
+			return "", 0, smartLedgerState{}, errSmartDegradationBudget
+		}
 		// A harmless confirmation must leave enough allowance for another full pair.
 		if purpose == smartDegradationConfirmation {
+			// The confirmation must leave an ordinary cap large enough for a measurable challenger.
+			postConfirmationRemaining := max(0, remaining-float64(smartDegradationWorstCase(confirmationCap)))
+			postConfirmationCap := int64(min(25_000_000, math.Floor(postConfirmationRemaining*0.2)))
+			if postConfirmationCap < confirmationCap {
+				return "", 0, smartLedgerState{}, errSmartDegradationBudget
+			}
 			if confirmationCap < 1_100_000 || confirmationCap > capBytes || allowance < smartDegradationWorstCase(2*confirmationCap+capBytes) {
 				return "", 0, smartLedgerState{}, errSmartDegradationBudget
 			}
 			capBytes = confirmationCap
 		} else {
-			if allowance < smartDegradationWorstCase(1_100_000) {
+			if allowance < smartDegradationWorstCase(confirmationCap) || capBytes < confirmationCap {
 				return "", 0, smartLedgerState{}, errSmartDegradationBudget
 			}
 			capBytes = min(capBytes, allowance/11*10+allowance%11*10/11)

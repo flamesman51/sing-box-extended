@@ -131,6 +131,7 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 		return 0, err
 	}
 	download = math.Inf(1)
+	var buffer [32 * 1024]byte
 	for range 4 {
 		if err = ctx.Err(); err != nil {
 			return 0, err
@@ -140,12 +141,33 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 		if passive != nil {
 			passiveStart = passive()
 		}
-		n, readErr := io.CopyN(io.Discard, body, quota)
-		if readErr != nil || n != quota {
-			if readErr == nil {
-				readErr = io.ErrUnexpectedEOF
+		var n int64
+		for n < quota {
+			if err = ctx.Err(); err != nil {
+				return 0, err
 			}
-			return 0, readErr
+			read, readErr := body.Read(buffer[:min(int64(len(buffer)), quota-n)])
+			n += int64(read)
+			if readErr != nil && !(n == quota && errors.Is(readErr, io.EOF)) {
+				return 0, readErr
+			}
+			if read == 0 {
+				return 0, io.ErrNoProgress
+			}
+			if err = ctx.Err(); err != nil {
+				return 0, err
+			}
+			elapsed := clock.Now().Sub(start)
+			if elapsed >= 2*time.Second {
+				var passiveBytes int64
+				if passive != nil {
+					passiveBytes = max(0, passive()-passiveStart)
+				}
+				rate := (float64(n) + float64(passiveBytes)) * 8 / elapsed.Seconds() / 1_000_000
+				if rate < targetMbps/2 {
+					return min(download, rate), nil
+				}
+			}
 		}
 		for elapsed := clock.Now().Sub(start); elapsed < 500*time.Millisecond; elapsed = clock.Now().Sub(start) {
 			timer := clock.NewTimer(500*time.Millisecond - elapsed)
@@ -167,9 +189,6 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 		}
 		rate := (float64(n) + float64(passiveBytes)) * 8 / elapsed.Seconds() / 1_000_000
 		download = min(download, rate)
-		if elapsed >= 2*time.Second && rate < targetMbps/2 {
-			return download, nil
-		}
 	}
 	return download, nil
 }

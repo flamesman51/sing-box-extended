@@ -358,3 +358,51 @@ func TestSmartDegradationChallengerAdmissionPersistsPurposeCooldown(t *testing.T
 		t.Fatal("key-only change or volatile-state loss bypassed hourly challenger limit")
 	}
 }
+
+func TestSmartDegradationSampleRecoveryResetsWindow(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+	s.scheduleDegradationLocked(clock.Now())
+	for range 19 {
+		clock.Advance(time.Second)
+		lease.CountRead(1_625_000)
+		s.scheduleDegradationLocked(clock.Now())
+	}
+	clock.Advance(time.Second)
+	lease.CountRead(125_000)
+	s.scheduleDegradationLocked(clock.Now())
+	if s.degradation.episode != nil {
+		t.Fatal("19 recovered samples followed by one slow sample qualified as sustained slow")
+	}
+	for range 18 {
+		clock.Advance(time.Second)
+		lease.CountRead(125_000)
+		s.scheduleDegradationLocked(clock.Now())
+	}
+	if s.degradation.episode != nil {
+		t.Fatal("less than twenty slow samples qualified")
+	}
+	clock.Advance(time.Second)
+	lease.CountRead(125_000)
+	s.scheduleDegradationLocked(clock.Now())
+	if s.degradation.episode == nil {
+		t.Fatal("twenty consecutive low samples did not qualify")
+	}
+}
+
+func TestSmartDegradationUndersizedChallengerDoesNotConsumeTurn(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	e := smartTestDegradationEpisode(s, clock.Now())
+	smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, 3, clock.Now())
+	s.ledger.mu.Lock()
+	s.ledger.state.Days[smartDegradationDayKey("wifi", clock.Now().Format("2006-01-02"))] = 498_790_000
+	s.ledger.mu.Unlock()
+	s.startDegradationAdmissionLocked(e.challenger, smartDegradationChallenger, e, clock.Now())
+	result := smartLedgerWait(t, s.results)
+	s.applyResultLocked(result, clock.Now())
+	s.admissionWorkers.Wait()
+	if !errors.Is(result.err, errSmartDegradationBudget) || len(s.pending) != 0 || len(s.degradation.attempts) != 0 || !s.lastChallenger.IsZero() || !s.ledger.DegradationCooldown(s.degradationChallengerCooldownKey()).IsZero() {
+		t.Fatal("unmeasurable challenger consumed its turn or hourly cooldown")
+	}
+}

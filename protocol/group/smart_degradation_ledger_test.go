@@ -26,17 +26,14 @@ func TestSmartDegradationLedgerAllowanceDoesNotBlockOrdinary(t *testing.T) {
 	if _, _, err := ledger.ReserveDegradation(context.Background(), "cellular", now, 0, smartDegradationConfirmation, 10_000_000); !errors.Is(err, errSmartDegradationBudget) || errors.Is(err, errSmartBudget) {
 		t.Fatalf("confirmation allowance denial = %v", err)
 	}
-	id, capBytes, err := ledger.ReserveDegradation(context.Background(), "cellular", now, 0, smartDegradationChallenger, 0)
-	if err != nil || capBytes != 4_545_454 {
-		t.Fatalf("allowance-sized challenger = %d, %v", capBytes, err)
-	}
-	if err = ledger.Reconcile(context.Background(), id, 5_000_000, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err = ledger.ReserveDegradation(context.Background(), "cellular", now, 0, smartDegradationChallenger, 0); !errors.Is(err, errSmartDegradationBudget) {
+	ledger.mu.Lock()
+	ledger.state.Days["cellular/2026-11-09"] = 5_000_000
+	ledger.state.Days[smartDegradationDayKey("cellular", "2026-11-09")] = 5_000_000
+	ledger.mu.Unlock()
+	if _, _, err := ledger.ReserveDegradation(context.Background(), "cellular", now, 0, smartDegradationChallenger, 10_000_000); !errors.Is(err, errSmartDegradationBudget) {
 		t.Fatalf("exhausted challenger allowance = %v", err)
 	}
-	id, capBytes, err = ledger.Reserve(context.Background(), "cellular", now, 0)
+	id, capBytes, err := ledger.Reserve(context.Background(), "cellular", now, 0)
 	if err != nil || capBytes != 9_000_000 {
 		t.Fatalf("ordinary admission after purpose exhaustion = %d, %v", capBytes, err)
 	}
@@ -107,7 +104,7 @@ func TestSmartDegradationLedgerRunwayArithmetic(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			id, capBytes, err := ledger.ReserveDegradation(context.Background(), test.name, at, 0, smartDegradationChallenger, 0)
+			id, capBytes, err := ledger.ReserveDegradation(context.Background(), test.name, at, 0, smartDegradationChallenger, 10_000_000)
 			if err != nil || capBytes != 25_000_000 {
 				t.Fatalf("preserved full challenger = %d, %v", capBytes, err)
 			}
@@ -168,16 +165,16 @@ func TestSmartDegradationLedgerChallengerMinimumAndSharedLimit(t *testing.T) {
 		t.Fatalf("shared effective allowance = %v", got)
 	}
 	ledger.mu.Lock()
-	ledger.state.Days["degradation/wifi/2026-11-09"] = 98_790_000
+	ledger.state.Days["degradation/wifi/2026-11-09"] = 89_000_000
 	ledger.mu.Unlock()
-	id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 0)
-	if err != nil || capBytes != 1_100_000 {
-		t.Fatalf("minimum challenger = %d, %v", capBytes, err)
+	id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000)
+	if err != nil || capBytes != 10_000_000 {
+		t.Fatalf("target-sized minimum challenger = %d, %v", capBytes, err)
 	}
 	if err = ledger.Reconcile(context.Background(), id, 1, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 0); !errors.Is(err, errSmartDegradationBudget) {
+	if _, _, err = ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000); !errors.Is(err, errSmartDegradationBudget) {
 		t.Fatalf("one byte below minimum headroom = %v", err)
 	}
 }
@@ -215,7 +212,7 @@ func TestSmartDegradationLedgerRestartOrphansAndDayRollback(t *testing.T) {
 	if got := restarted.Snapshot("wifi", tomorrow, 0); got.Day != "2026-11-10" || got.Degradation.UsedMB != 0 || got.UsedMB != 0 {
 		t.Fatalf("daily purpose rollover: %+v", got)
 	}
-	id, _, err = restarted.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 0)
+	id, _, err = restarted.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +227,7 @@ func TestSmartDegradationLedgerRestartOrphansAndDayRollback(t *testing.T) {
 func TestSmartDegradationLedgerUncertainCellularAttribution(t *testing.T) {
 	ledger, cache := smartDegradationTestLedger(t, map[string]float64{"wifi": 5000, "cellular": 50})
 	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	id, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 0)
+	id, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,5 +369,54 @@ func TestSmartDegradationLedgerUnknownOrphanPurpose(t *testing.T) {
 				t.Fatalf("unknown purpose lost worst-case charge: %+v", state)
 			}
 		})
+	}
+}
+
+func TestSmartDegradationChallengerRequiresTargetSizedCap(t *testing.T) {
+	ledger, _ := smartDegradationTestLedger(t, map[string]float64{"wifi": 1000})
+	now := smartDegradationTestClock().Now()
+	day := now.Format("2006-01-02")
+	ledger.mu.Lock()
+	ledger.state.Days[smartDegradationDayKey("wifi", day)] = 98_790_000
+	ledger.mu.Unlock()
+	if _, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationChallenger, 10_000_000); !errors.Is(err, errSmartDegradationBudget) {
+		t.Fatalf("unmeasurable challenger admitted: %v", err)
+	}
+	if state := ledger.Metadata().Ledger; len(state.Starts) != 0 || len(state.Reservations) != 0 {
+		t.Fatal("rejected challenger consumed hourly attempt")
+	}
+}
+
+func TestSmartDegradationConfirmationRequiresPostTestChallengerCap(t *testing.T) {
+	for _, test := range []struct {
+		remaining int64
+		wantErr   error
+	}{
+		{60_000_000, errSmartDegradationBudget},
+		{61_000_000, nil},
+	} {
+		ledger, _ := smartDegradationTestLedger(t, map[string]float64{"wifi": 1000})
+		clock := smartDegradationTestClock()
+		now := clock.Now()
+		ledger.mu.Lock()
+		ledger.state.Days["wifi/"+now.Format("2006-01-02")] = 1_000_000_000 - test.remaining
+		ledger.mu.Unlock()
+		id, _, err := ledger.ReserveDegradation(context.Background(), "wifi", now, 0, smartDegradationConfirmation, 10_000_000)
+		if !errors.Is(err, test.wantErr) {
+			t.Fatalf("remaining=%d: confirmation error=%v want=%v", test.remaining, err, test.wantErr)
+		}
+		if err == nil {
+			if err = ledger.Reconcile(context.Background(), id, 11_000_000, false); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(time.Second)
+			id, capBytes, err := ledger.ReserveDegradation(context.Background(), "wifi", clock.Now(), 0, smartDegradationChallenger, 10_000_000)
+			if err != nil || capBytes < 10_000_000 {
+				t.Fatalf("accepted episode cannot measure challenger: cap=%d err=%v", capBytes, err)
+			}
+			if err = ledger.Reconcile(context.Background(), id, 0, false); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
