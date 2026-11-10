@@ -219,6 +219,97 @@ func TestSmartImprovementConfirmationDelayedAdmissionRevalidated(t *testing.T) {
 	}
 }
 
+func TestSmartImprovementConfirmationAdmissionDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, clock, candidate := smartPrepareConfirmation(t)
+		cache := new(smartLedgerBlockingCache)
+		ledger, err := getSmartLedger(cache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.ledger.Unregister(s.Tag())
+		ledger.Register(s.Tag(), map[string]float64{"wifi": 5000})
+		s.ledger = ledger
+		// Force cancellation to win the result handoff while the owner is busy.
+		s.results = make(chan smartResult)
+		blocked := cache.block(t)
+		clock.Advance(s.preference.confirmationInterval)
+		began := time.Now()
+		if !s.scheduleImprovementConfirmationLocked(clock.Now()) {
+			t.Fatal("confirmation was not scheduled")
+		}
+		admission := s.admission
+		deadline, ok := admission.job.ctx.Deadline()
+		if !ok || deadline.Sub(began) != 30*time.Second {
+			t.Fatalf("confirmation deadline = %v, present=%v; want 30 seconds from admission", deadline, ok)
+		}
+		smartLedgerWait(t, blocked.entered)
+		time.Sleep(29 * time.Second)
+		clock.Advance(29 * time.Second)
+		synctest.Wait()
+		if admission.job.ctx.Err() != nil {
+			t.Fatal("confirmation expired before its admission deadline")
+		}
+		time.Sleep(time.Second)
+		clock.Advance(time.Second)
+		synctest.Wait()
+		if !errors.Is(admission.job.ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("blocked admission context = %v; want deadline exceeded", admission.job.ctx.Err())
+		}
+		if len(s.pending) != 0 || candidate.queued["throughput"] || candidate.improvementObservations != 1 {
+			t.Fatal("expired admission queued work or reset confirmations")
+		}
+		clock.Advance(time.Minute)
+		if !s.scheduleImprovementConfirmationLocked(clock.Now()) || s.admission == admission {
+			t.Fatal("expired admission prevented a later confirmation")
+		}
+		laterAdmission := s.admission
+		synctest.Wait()
+		cleanup := cache.block(t)
+		blocked.unblock()
+		smartLedgerWait(t, cleanup.entered)
+		if len(cache.metadata(t).Ledger.Reservations) != 1 {
+			t.Fatal("expired admission did not reconcile its late durable reservation")
+		}
+		next := cache.block(t)
+		cleanup.unblock()
+		smartLedgerWait(t, next.entered)
+		if metadata := cache.metadata(t); len(metadata.Ledger.Reservations) != 0 || len(metadata.Ledger.Days) != 0 {
+			t.Fatalf("expired admission left a reservation or charged unused bytes: %+v", metadata.Ledger)
+		}
+		time.Sleep(5 * time.Second)
+		clock.Advance(5 * time.Second)
+		next.unblock()
+		result := smartAwaitConfirmationAdmission(t, s, clock)
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		s.applyAdmissionLocked(result, clock.Now())
+		synctest.Wait()
+		if result.admission != laterAdmission {
+			t.Fatal("late cleanup replaced the current admission")
+		}
+		if len(s.pending) != 1 || s.pending[0].ctx.Err() != nil || candidate.improvementObservations != 1 {
+			t.Fatal("later confirmation did not retain its own live context and observations")
+		}
+		job := s.pending[0]
+		if deadline, ok = job.ctx.Deadline(); !ok || time.Until(deadline) != 25*time.Second {
+			t.Fatal("queued confirmation lost its original admission deadline")
+		}
+		time.Sleep(25 * time.Second)
+		clock.Advance(25 * time.Second)
+		synctest.Wait()
+		if !errors.Is(job.ctx.Err(), context.DeadlineExceeded) {
+			t.Fatal("queued confirmation outlived its admission deadline")
+		}
+		s.pending = nil
+		delete(candidate.queued, "throughput")
+		if err = ledger.Reconcile(s.ctx, job.reservation, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestSmartImprovementConfirmationSpeedFloor(t *testing.T) {
 	s, clock := smartProfileThroughputTestGroup(t)
 	primary, candidate := s.primary, s.standby
@@ -425,6 +516,11 @@ func (o *smartConfirmationTestOutbound) DialContext(ctx context.Context, network
 func TestSmartImprovementConfirmationSurvivesHeartbeatAndSkipsUpload(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, clock, candidate := smartPrepareConfirmation(t)
+		const previousUpload = 7.5
+		candidate.throughput.Upload = previousUpload
+		for _, key := range s.network.Path {
+			s.history.statistic(key, candidate.identity, clock.Now()).Upload = previousUpload + 1
+		}
 		s.workCtx, s.workCancel = context.WithCancel(s.ctx)
 		s.backgroundCtx, s.backgroundCancel = context.WithCancel(s.workCtx)
 		s.options.Throughput.DownloadURL = "http://192.0.2.1/down?bytes={bytes}"
@@ -489,6 +585,27 @@ func TestSmartImprovementConfirmationSurvivesHeartbeatAndSkipsUpload(t *testing.
 			t.Fatal(err)
 		}
 		s.applyResultLocked(result, clock.Now())
+		if candidate.throughput.Upload != previousUpload {
+			t.Fatalf("download-only confirmation replaced live upload with %v", candidate.throughput.Upload)
+		}
+		for _, key := range s.network.Path {
+			if upload := s.history.Stats[key][candidate.identity].Upload; upload != previousUpload+1 {
+				t.Fatalf("download-only confirmation replaced %q history upload with %v", key, upload)
+			}
+		}
+		data, err := s.history.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		restored, err := decodeSmartHistory(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range s.network.Path {
+			if upload := restored.Stats[key][candidate.identity].Upload; upload != previousUpload+1 {
+				t.Fatalf("persisted confirmation lost %q upload: %v", key, upload)
+			}
+		}
 	})
 }
 

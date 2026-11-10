@@ -115,6 +115,111 @@ func TestSmartPreferenceLegacyResolution(t *testing.T) {
 	}
 }
 
+func TestSmartPreferenceLegacyZeroDefaults(t *testing.T) {
+	for _, preference := range []string{
+		"",
+		`,"preference":{}`,
+		`,"preference":{"profile":"default"}`,
+		`,"preference":{"switch":{}}`,
+		`,"preference":{"profile":"default","switch":{}}`,
+	} {
+		for _, fields := range []string{
+			`"probe":{"heartbeat_interval":"0s"}`,
+			`"probe":{"standby_interval":"0s"}`,
+			`"probe":{"background_interval":"0s"}`,
+			`"probe":{"timeout":"0s"}`,
+			`"throughput":{"target_mbps":0}`,
+			`"udp":{"quic_policy":""}`,
+			`"probe":{"heartbeat_interval":"0s","standby_interval":"0s","background_interval":"0s","timeout":"0s"},"throughput":{"target_mbps":0},"udp":{"quic_policy":""}`,
+		} {
+			document := `{` + fields + preference + `}`
+			t.Run(document, func(t *testing.T) {
+				s, _ := smartTestGroup()
+				if err := json.Unmarshal([]byte(document), &s.options); err != nil {
+					t.Fatal(err)
+				}
+				before := s.options
+				preference, err := resolveSmartPreference(&s.options)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(before, s.options) {
+					t.Fatalf("legacy options changed: %#v != %#v", before, s.options)
+				}
+				if err := s.configure(); err != nil {
+					t.Fatal(err)
+				}
+				if !preference.legacy || !s.preference.legacy {
+					t.Fatal("legacy zero values selected the profile engine")
+				}
+				if s.heartbeat != 15*time.Second || s.standbyInterval != time.Minute || s.backgroundInterval != 5*time.Minute || s.timeout != 0 || s.targetMbps != 25 || s.quicPolicy != "auto" {
+					t.Fatalf("legacy zero defaults changed: heartbeat=%s standby=%s background=%s timeout=%s target=%g quic=%q", s.heartbeat, s.standbyInterval, s.backgroundInterval, s.timeout, s.targetMbps, s.quicPolicy)
+				}
+			})
+		}
+	}
+}
+
+func TestSmartPreferenceExistingFieldsRequirePositiveOverrides(t *testing.T) {
+	for _, preference := range []string{
+		`{"profile":"speed-max"}`,
+		`{"profile":"data-saver"}`,
+		`{"switch":{"improvement":false}}`,
+		`{"profile":"default","rank":["latency"]}`,
+	} {
+		for _, test := range []struct {
+			fields string
+			field  string
+		}{
+			{`"probe":{"heartbeat_interval":"0s"}`, "probe.heartbeat_interval"},
+			{`"probe":{"standby_interval":"0s"}`, "probe.standby_interval"},
+			{`"probe":{"background_interval":"0s"}`, "probe.background_interval"},
+			{`"probe":{"timeout":"0s"}`, "probe.timeout"},
+			{`"throughput":{"target_mbps":0}`, "throughput.target_mbps"},
+			{`"udp":{"quic_policy":""}`, "udp.quic_policy"},
+		} {
+			document := `{"preference":` + preference + `,` + test.fields + `}`
+			t.Run(document, func(t *testing.T) {
+				var options option.SmartOutboundOptions
+				if err := json.Unmarshal([]byte(document), &options); err != nil {
+					t.Fatal(err)
+				}
+				before := options
+				if _, err := resolveSmartPreference(&options); err == nil || !strings.Contains(err.Error(), test.field) {
+					t.Fatalf("explicit invalid %s was not rejected during resolution: %v", test.field, err)
+				}
+				if !reflect.DeepEqual(before, options) {
+					t.Fatal("invalid explicit fields were replaced by profile defaults")
+				}
+			})
+		}
+	}
+}
+
+func TestSmartPreferenceExistingFieldsRejectInvalidValues(t *testing.T) {
+	for _, preference := range []string{"", `,"preference":{}`, `,"preference":{"profile":"default"}`, `,"preference":{"profile":"speed-max"}`, `,"preference":{"switch":{"improvement":false}}`} {
+		for _, fields := range []string{
+			`"probe":{"heartbeat_interval":"-1s"}`,
+			`"probe":{"standby_interval":"-1s"}`,
+			`"probe":{"background_interval":"-1s"}`,
+			`"probe":{"timeout":"-1s"}`,
+			`"throughput":{"target_mbps":-1}`,
+			`"udp":{"quic_policy":"invalid"}`,
+		} {
+			document := `{` + fields + preference + `}`
+			t.Run(document, func(t *testing.T) {
+				s, _ := smartTestGroup()
+				if err := json.Unmarshal([]byte(document), &s.options); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.configure(); err == nil {
+					t.Fatal("invalid existing field was accepted")
+				}
+			})
+		}
+	}
+}
+
 func TestSmartPreferenceExplicitLeavesWin(t *testing.T) {
 	var options option.SmartOutboundOptions
 	if err := json.Unmarshal([]byte(`{"preference":{"profile":"speed-max","rank":["quic","outages"],"min_stability":"none","speed_floor_hysteresis":0,"switch":{"improvement":false,"dwell":"1m","confirmations":1,"confirmation_interval":"2s","tier_restore":"0s","speed_margin":1}},"probe":{"heartbeat_interval":"7s","standby_interval":"11s","background_interval":"13s","timeout":"3s"},"throughput":{"enabled":false,"target_mbps":9,"wifi_daily_budget_mb":0,"cellular_daily_budget_mb":1,"other_daily_budget_mb":2},"interrupt_on_failover":false,"udp":{"enabled":false,"quic_policy":"off"},"notify_all_dead":false}`), &options); err != nil {

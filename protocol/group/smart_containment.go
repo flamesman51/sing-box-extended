@@ -345,7 +345,7 @@ func (s *Smart) runOperation(job smartJob) (result smartResult) {
 			if job.purpose == smartDegradationConfirmation {
 				passive = func() int64 { return s.degradationPassive(job.episode) }
 			}
-			result.download, result.bytes, result.err = smartMeasureDegradation(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, job.capBytes, s.targetMbps, passive, s.clock)
+			result.download, result.bytes, result.err = smartMeasureDegradation(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, job.capBytes, s.targetMbps, s.degradationThresholdLocked(), passive, s.clock)
 		} else {
 			result.download, result.upload, result.bytes, result.err = smartMeasure(workCtx, job.member.outbound, s.options.Throughput.DownloadURL, s.options.Throughput.UploadURL, job.capBytes, job.purpose != smartImprovementConfirmation && (job.networkType == "wifi" || s.cellularUploadAllowed()))
 		}

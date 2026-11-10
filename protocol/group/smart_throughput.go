@@ -42,7 +42,7 @@ func (s *Smart) improvementConfirmationJobValidLocked(member *smartMember, prima
 func (s *Smart) scheduleImprovementConfirmationLocked(now time.Time) bool {
 	member := s.improvementCandidate
 	if !s.improvementConfirmationEligibleLocked(member, now) || !s.throughputAllowedLocked(now) ||
-		s.degradation.episode != nil || s.admission != nil {
+		s.degradation.episode != nil || s.admission != nil && s.admission.job.ctx.Err() == nil {
 		return false
 	}
 	for _, candidate := range s.members {
@@ -96,7 +96,7 @@ func (s *Smart) startThroughputPurposeAdmissionLocked(member *smartMember, purpo
 		if member.confirmationCancel != nil {
 			member.confirmationCancel()
 		}
-		ctx, confirmationCancel = context.WithCancel(ctx)
+		ctx, confirmationCancel = context.WithTimeout(ctx, 30*time.Second)
 		member.confirmationCancel = confirmationCancel
 	}
 	admission := &smartAdmission{

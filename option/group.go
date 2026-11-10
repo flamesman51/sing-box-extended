@@ -62,11 +62,18 @@ type SmartProbeOptions struct {
 	BackgroundInterval badoption.Duration `json:"background_interval,omitempty"`
 	Timeout            badoption.Duration `json:"timeout,omitempty"`
 	DisableDirect      bool               `json:"disable_direct,omitempty"`
+
+	heartbeatIntervalSet  bool
+	standbyIntervalSet    bool
+	backgroundIntervalSet bool
+	timeoutSet            bool
 }
 
 type SmartUDPOptions struct {
 	Enabled    *bool  `json:"enabled,omitempty"`
 	QUICPolicy string `json:"quic_policy,omitempty"`
+
+	quicPolicySet bool
 }
 
 type SmartThroughputOptions struct {
@@ -77,6 +84,8 @@ type SmartThroughputOptions struct {
 	WIFIDailyBudgetMB     *float64 `json:"wifi_daily_budget_mb,omitempty"`
 	CellularDailyBudgetMB *float64 `json:"cellular_daily_budget_mb,omitempty"`
 	OtherDailyBudgetMB    *float64 `json:"other_daily_budget_mb,omitempty"`
+
+	targetMbpsSet bool
 }
 
 func (o *SmartProbeOptions) UnmarshalJSON(content []byte) error {
@@ -92,20 +101,18 @@ func (o *SmartProbeOptions) UnmarshalJSON(content []byte) error {
 		return err
 	}
 	for _, field := range []struct {
-		name  string
-		value *badoption.Duration
-		dest  *badoption.Duration
+		value   *badoption.Duration
+		dest    *badoption.Duration
+		present *bool
 	}{
-		{"heartbeat_interval", decoded.HeartbeatInterval, &decoded.probeOptions.HeartbeatInterval},
-		{"standby_interval", decoded.StandbyInterval, &decoded.probeOptions.StandbyInterval},
-		{"background_interval", decoded.BackgroundInterval, &decoded.probeOptions.BackgroundInterval},
-		{"timeout", decoded.Timeout, &decoded.probeOptions.Timeout},
+		{decoded.HeartbeatInterval, &decoded.probeOptions.HeartbeatInterval, &decoded.probeOptions.heartbeatIntervalSet},
+		{decoded.StandbyInterval, &decoded.probeOptions.StandbyInterval, &decoded.probeOptions.standbyIntervalSet},
+		{decoded.BackgroundInterval, &decoded.probeOptions.BackgroundInterval, &decoded.probeOptions.backgroundIntervalSet},
+		{decoded.Timeout, &decoded.probeOptions.Timeout, &decoded.probeOptions.timeoutSet},
 	} {
 		if field.value != nil {
-			if *field.value <= 0 {
-				return fmt.Errorf("smart probe.%s must be positive", field.name)
-			}
 			*field.dest = *field.value
+			*field.present = true
 		}
 	}
 	*o = SmartProbeOptions(decoded.probeOptions)
@@ -122,12 +129,8 @@ func (o *SmartUDPOptions) UnmarshalJSON(content []byte) error {
 		return err
 	}
 	if decoded.QUICPolicy != nil {
-		switch *decoded.QUICPolicy {
-		case "auto", "route_only", "off":
-			decoded.udpOptions.QUICPolicy = *decoded.QUICPolicy
-		default:
-			return fmt.Errorf("invalid smart udp.quic_policy: %q", *decoded.QUICPolicy)
-		}
+		decoded.udpOptions.QUICPolicy = *decoded.QUICPolicy
+		decoded.udpOptions.quicPolicySet = true
 	}
 	*o = SmartUDPOptions(decoded.udpOptions)
 	return nil
@@ -143,13 +146,42 @@ func (o *SmartThroughputOptions) UnmarshalJSON(content []byte) error {
 		return err
 	}
 	if decoded.TargetMbps != nil {
-		target := *decoded.TargetMbps
-		if target <= 0 || math.IsNaN(target) || math.IsInf(target, 0) {
-			return fmt.Errorf("smart throughput.target_mbps must be positive and finite")
-		}
-		decoded.throughputOptions.TargetMbps = target
+		decoded.throughputOptions.TargetMbps = *decoded.TargetMbps
+		decoded.throughputOptions.targetMbpsSet = true
 	}
 	*o = SmartThroughputOptions(decoded.throughputOptions)
+	return nil
+}
+
+// ValidateProfileFields applies presence-aware validation only for the profile engine.
+func (o *SmartOutboundOptions) ValidateProfileFields() error {
+	for _, field := range []struct {
+		name    string
+		value   badoption.Duration
+		present bool
+	}{
+		{"heartbeat_interval", o.Probe.HeartbeatInterval, o.Probe.heartbeatIntervalSet},
+		{"standby_interval", o.Probe.StandbyInterval, o.Probe.standbyIntervalSet},
+		{"background_interval", o.Probe.BackgroundInterval, o.Probe.backgroundIntervalSet},
+		{"timeout", o.Probe.Timeout, o.Probe.timeoutSet},
+	} {
+		if field.value < 0 || (field.present && field.value == 0) {
+			return fmt.Errorf("smart probe.%s must be positive", field.name)
+		}
+	}
+	target := o.Throughput.TargetMbps
+	if target < 0 || math.IsNaN(target) || math.IsInf(target, 0) || (o.Throughput.targetMbpsSet && target == 0) {
+		return fmt.Errorf("smart throughput.target_mbps must be positive and finite")
+	}
+	switch o.UDP.QUICPolicy {
+	case "":
+		if o.UDP.quicPolicySet {
+			return fmt.Errorf("invalid smart udp.quic_policy: %q", o.UDP.QUICPolicy)
+		}
+	case "auto", "route_only", "off":
+	default:
+		return fmt.Errorf("invalid smart udp.quic_policy: %q", o.UDP.QUICPolicy)
+	}
 	return nil
 }
 

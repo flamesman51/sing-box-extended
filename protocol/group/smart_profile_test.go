@@ -209,6 +209,8 @@ func TestSmartProfileUDPAndQUICAreSeparate(t *testing.T) {
 func TestSmartProfileUDPPoolBoundedAndRotating(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "realtime-gaming")
 	s.preference.rank = []string{"udp", "quic"}
+	s.preference.confirmations, s.preference.dwell = 100, 24*time.Hour
+	s.selectedAt = clock.Now()
 	for order := 2; order < 8; order++ {
 		tag := fmt.Sprintf("member-%d", order)
 		s.members = append(s.members, &smartMember{tag: tag, identity: tag, serverIdentity: tag, tier: 1, state: "healthy", configOrder: order, generation: 1})
@@ -217,13 +219,15 @@ func TestSmartProfileUDPPoolBoundedAndRotating(t *testing.T) {
 	for range 8 {
 		s.pending = nil
 		s.queueProfileUDPLocked(clock.Now(), false)
+		jobs := s.pending
+		s.pending = nil
 		counts := map[string]int{}
-		for _, job := range s.pending {
+		for _, job := range jobs {
 			counts[job.kind]++
 			if job.kind == "udp443" {
 				seen[job.member.tag] = true
 			}
-			delete(job.member.queued, job.kind)
+			smartCompleteProfileUDPRefresh(t, s, job, clock.Now())
 		}
 		if counts["udp"] > 3 || counts["udp443"] > 3 {
 			t.Fatalf("unbounded pool: %v", counts)
@@ -252,8 +256,13 @@ func TestSmartProfileQUICRefreshPreservesConfirmation(t *testing.T) {
 		if candidate.udp443.value(clock.Now()) != "ok" {
 			t.Fatal("QUIC evidence lapsed before refresh")
 		}
-		candidate.udp443 = smartEvidence{state: "ok", at: clock.Now(), expires: clock.Now().Add(10 * time.Minute)}
-		s.chooseLocked(clock.Now())
+		s.queueProfileUDPLocked(clock.Now(), false)
+		if len(s.pending) != 1 || s.pending[0].member != candidate {
+			t.Fatal("scheduled QUIC refresh did not reach the fixed candidate")
+		}
+		job := s.pending[0]
+		s.pending = nil
+		smartCompleteProfileUDPRefresh(t, s, job, clock.Now())
 		if candidate.improvementObservations != want {
 			t.Fatalf("confirmations=%d want=%d", candidate.improvementObservations, want)
 		}
@@ -374,20 +383,24 @@ func TestSmartProfileFloorRespectsEarlierCriteria(t *testing.T) {
 func TestSmartProfilePinnedUDPAndDemandPool(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "realtime-gaming")
 	s.preference.rank = []string{"quic"}
+	s.preference.confirmations, s.preference.dwell = 100, 24*time.Hour
+	s.selectedAt = clock.Now()
 	for order := 2; order < 9; order++ {
 		tag := fmt.Sprintf("member-%d", order)
 		s.members = append(s.members, &smartMember{tag: tag, identity: tag, serverIdentity: tag, tier: 1, state: "healthy", configOrder: order, generation: 1})
 	}
-	pinned := s.members[7]
-	s.improvementCandidate = pinned
-	pinned.improvementCriterion, pinned.improvementObservations = "quic", 1
+	pinned, next, standby := s.members[7], s.members[2], s.standby
 	s.members[8].tier = 2
 	seen := map[string]bool{}
 	for range 8 {
 		s.pending = nil
+		s.improvementCandidate = pinned
+		pinned.improvementCriterion, pinned.improvementObservations = "quic", 1
 		s.queueProfileUDPLocked(clock.Now(), false)
+		jobs := s.pending
+		s.pending = nil
 		fixed := map[*smartMember]bool{}
-		for _, job := range s.pending {
+		for _, job := range jobs {
 			if job.kind != "udp443" {
 				t.Fatal("QUIC-only pool probed generic UDP")
 			}
@@ -396,10 +409,9 @@ func TestSmartProfilePinnedUDPAndDemandPool(t *testing.T) {
 			}
 			fixed[job.member] = true
 			seen[job.member.tag] = true
-			job.member.udp443 = smartEvidence{state: "ok", at: clock.Now(), expires: clock.Now().Add(10 * time.Minute)}
-			delete(job.member.queued, job.kind)
+			smartCompleteProfileUDPRefresh(t, s, job, clock.Now())
 		}
-		if len(s.pending) > 4 || !fixed[s.standby] || !fixed[s.members[2]] || !fixed[pinned] {
+		if len(jobs) > 4 || !fixed[standby] || !fixed[next] || !fixed[pinned] {
 			t.Fatalf("fixed/pinned pool not bounded or refreshed: %v", fixed)
 		}
 		clock.Advance(8 * time.Minute)

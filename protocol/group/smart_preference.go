@@ -29,17 +29,6 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 		minStability: -1, improvement: true, dwell: 10 * time.Minute, confirmations: 2,
 		confirmationInterval: 30 * time.Second, tierRestore: time.Minute, speedMargin: 1.25, hysteresis: 0.2,
 	}
-	if options.Probe.HeartbeatInterval < 0 || options.Probe.StandbyInterval < 0 || options.Probe.BackgroundInterval < 0 || options.Probe.Timeout < 0 {
-		return smartPreference{}, fmt.Errorf("smart probe intervals must be positive")
-	}
-	if target := options.Throughput.TargetMbps; target < 0 || math.IsNaN(target) || math.IsInf(target, 0) {
-		return smartPreference{}, fmt.Errorf("smart throughput.target_mbps must be positive and finite")
-	}
-	switch options.UDP.QUICPolicy {
-	case "", "auto", "route_only", "off":
-	default:
-		return smartPreference{}, fmt.Errorf("invalid smart udp.quic_policy: %q", options.UDP.QUICPolicy)
-	}
 	configured := options.Preference
 	if configured == nil {
 		return preference, nil
@@ -54,6 +43,9 @@ func resolveSmartPreference(options *option.SmartOutboundOptions) (smartPreferen
 		}
 	}
 	preference.legacy = false
+	if err := options.ValidateProfileFields(); err != nil {
+		return smartPreference{}, err
+	}
 	target := 25.0
 	heartbeat, standby, background := 15*time.Second, time.Minute, 5*time.Minute
 	interrupt, throughputEnabled := true, true

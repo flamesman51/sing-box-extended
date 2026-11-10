@@ -36,7 +36,7 @@ func smartDegradationQuota(targetMbps float64) (int64, error) {
 	return int64(quota), nil
 }
 
-func smartMeasureDegradation(ctx context.Context, dialer N.Dialer, downloadURL string, capBytes int64, targetMbps float64, passive func() int64, clock smartClock) (download float64, bytes int64, err error) {
+func smartMeasureDegradation(ctx context.Context, dialer N.Dialer, downloadURL string, capBytes int64, targetMbps, slowThresholdMbps float64, passive func() int64, clock smartClock) (download float64, bytes int64, err error) {
 	var meter *smartMeasureMeter
 	defer func() {
 		if meter != nil {
@@ -51,7 +51,7 @@ func smartMeasureDegradation(ctx context.Context, dialer N.Dialer, downloadURL s
 				bytes = (used*11 + 9) / 10
 			}()
 		}
-		if ctx.Err() != nil && !errors.Is(err, errSmartContained) && !(err == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && download > 0 && download < targetMbps/2) {
+		if ctx.Err() != nil && !errors.Is(err, errSmartContained) && !(err == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && download > 0 && download < slowThresholdMbps) {
 			err = ctx.Err()
 		}
 		if err != nil {
@@ -100,7 +100,7 @@ func smartMeasureDegradation(ctx context.Context, dialer N.Dialer, downloadURL s
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return 0, 0, fmt.Errorf("smart download HTTP status %d", response.StatusCode)
 	}
-	download, err = smartMeasureDegradationBody(ctx, response.Body, targetMbps, passive, clock)
+	download, err = smartMeasureDegradationBody(ctx, response.Body, targetMbps, slowThresholdMbps, passive, clock)
 	return
 }
 
@@ -109,7 +109,7 @@ func smartDegradationCloseBody(ctx context.Context, body io.Closer) (err error) 
 	return body.Close()
 }
 
-func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps float64, passive func() int64, clock smartClock) (download float64, err error) {
+func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps, slowThresholdMbps float64, passive func() int64, clock smartClock) (download float64, err error) {
 	defer func() {
 		if err != nil {
 			download = 0
@@ -146,7 +146,7 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 		}
 		// Including warmup can overstate speed, so it is safe only for slow proof at the deadline.
 		rate := (float64(total) + float64(passiveBytes)) * 8 / elapsed.Seconds() / 1_000_000
-		if rate < targetMbps/2 {
+		if rate < slowThresholdMbps {
 			download, err = rate, nil
 		}
 	}()
@@ -188,7 +188,7 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 					passiveBytes = max(0, passive()-passiveStart)
 				}
 				rate := (float64(n) + float64(passiveBytes)) * 8 / elapsed.Seconds() / 1_000_000
-				if rate < targetMbps/2 {
+				if rate < slowThresholdMbps {
 					return min(download, rate), nil
 				}
 			}

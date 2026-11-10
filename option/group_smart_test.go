@@ -1,10 +1,13 @@
 package option
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+
+	singjson "github.com/sagernet/sing/common/json"
 )
 
 func TestSmartPreferencePresenceRoundTrip(t *testing.T) {
@@ -83,17 +86,43 @@ func TestSmartPreferenceZeroAndEmptyLeavesRemainPresent(t *testing.T) {
 	}
 }
 
-func TestSmartExistingFieldsRejectExplicitInvalidDefaults(t *testing.T) {
+func TestSmartExistingFieldsDecodeBeforePreferenceResolution(t *testing.T) {
+	for _, decode := range []struct {
+		name string
+		run  func([]byte, any) error
+	}{
+		{"standard", json.Unmarshal},
+		{"strict", singjson.UnmarshalDisallowUnknownFields},
+		{"context", func(content []byte, value any) error {
+			return singjson.UnmarshalContextDisallowUnknownFields(context.Background(), content, value)
+		}},
+	} {
+		for _, preference := range []string{"", `,"preference":{}`, `,"preference":{"profile":"default"}`, `,"preference":{"profile":"speed-max"}`, `,"preference":{"switch":{"improvement":false}}`} {
+			document := `{"probe":{"heartbeat_interval":"0s","standby_interval":"0s","background_interval":"0s","timeout":"0s"},"throughput":{"target_mbps":0},"udp":{"quic_policy":""}` + preference + `}`
+			t.Run(decode.name+"/"+document, func(t *testing.T) {
+				var options SmartOutboundOptions
+				if err := decode.run([]byte(document), &options); err != nil {
+					t.Fatal(err)
+				}
+				if options.Probe.HeartbeatInterval != 0 || options.Probe.StandbyInterval != 0 || options.Probe.BackgroundInterval != 0 || options.Probe.Timeout != 0 || options.Throughput.TargetMbps != 0 || options.UDP.QUICPolicy != "" {
+					t.Fatalf("decoding changed legacy zero values: %#v", options)
+				}
+				encoded, err := json.Marshal(options)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, metadata := range []string{"heartbeatIntervalSet", "standbyIntervalSet", "backgroundIntervalSet", "timeoutSet", "targetMbpsSet", "quicPolicySet"} {
+					if strings.Contains(string(encoded), metadata) {
+						t.Fatalf("presence metadata was serialized: %s", encoded)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSmartExistingFieldsRejectUnknownFields(t *testing.T) {
 	for _, document := range []string{
-		`{"probe":{"heartbeat_interval":"0s"}}`,
-		`{"probe":{"standby_interval":"0s"}}`,
-		`{"probe":{"background_interval":"0s"}}`,
-		`{"probe":{"timeout":"0s"}}`,
-		`{"probe":{"heartbeat_interval":"-1s"}}`,
-		`{"throughput":{"target_mbps":0}}`,
-		`{"throughput":{"target_mbps":-1}}`,
-		`{"udp":{"quic_policy":""}}`,
-		`{"udp":{"quic_policy":"invalid"}}`,
 		`{"probe":{"unknown_interval":"1s"}}`,
 		`{"throughput":{"unknown_target":1}}`,
 		`{"udp":{"unknown_policy":"auto"}}`,
@@ -101,7 +130,7 @@ func TestSmartExistingFieldsRejectExplicitInvalidDefaults(t *testing.T) {
 		t.Run(document, func(t *testing.T) {
 			var options SmartOutboundOptions
 			if err := json.Unmarshal([]byte(document), &options); err == nil {
-				t.Fatal("explicit invalid value was treated as an omitted default")
+				t.Fatal("unknown field was accepted")
 			}
 		})
 	}
@@ -121,7 +150,7 @@ func TestSmartExistingPlainFieldsRemainSourceCompatible(t *testing.T) {
 	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(options, roundTrip) {
-		t.Fatalf("existing plain fields changed: %#v != %#v", options, roundTrip)
+	if roundTrip.Probe.HeartbeatInterval != 1 || roundTrip.Probe.StandbyInterval != 2 || roundTrip.Probe.BackgroundInterval != 3 || roundTrip.Throughput.TargetMbps != 4 || roundTrip.UDP.QUICPolicy != "off" {
+		t.Fatalf("existing plain fields changed: %#v", roundTrip)
 	}
 }

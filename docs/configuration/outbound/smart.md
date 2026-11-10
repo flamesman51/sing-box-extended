@@ -55,22 +55,22 @@ An object keyed by member tag. Each entry accepts:
 - `heartbeat_interval`: primary check interval while there is demand; default `15s`.
 - `standby_interval`: standby check interval while there is demand; default `60s`.
 - `background_interval`: other-member check interval when there has been demand in the last ten minutes; default `5m`. With no recent demand, background checks run every `30m`.
-- `timeout`: optional positive per-member probe timeout. When omitted, the timeout is `3 × RTT p90 + 1s`, clamped to `2.5s`–`8s`. A member with no successful check in the current network generation has a `6s` minimum to allow a cold WireGuard handshake.
+- `timeout`: optional per-member probe timeout. When omitted, the timeout is `3 × RTT p90 + 1s`, clamped to `2.5s`–`8s`. A member with no successful check in the current network generation has a `6s` minimum to allow a cold WireGuard handshake. The legacy policy also accepts `"0s"` to select this adaptive timeout; the profile engine requires an explicitly configured timeout to be positive.
 - `disable_direct`: disables direct-connectivity probes; default `false`. Use it on networks where direct foreign HTTPS is blocked or must not be touched. Member failures are attributed normally without the ambiguous-offline deferral, and `notify_all_dead` cannot fire because it requires a fresh direct success.
 
-Configured intervals must be positive. Demand means attached traffic within the last `30s`. Probe targets and direct-connectivity targets are built in, not configurable URLs.
+Configured intervals must be positive on the profile engine. On the legacy policy, `"0s"` selects the built-in default for that interval. Negative intervals and timeouts are invalid on both engines. Demand means attached traffic within the last `30s`. Probe targets and direct-connectivity targets are built in, not configurable URLs.
 
 #### udp
 
 - `enabled`: enables independent UDP reachability probes; default `true`.
-- `quic_policy`: `auto` (default), `route_only`, or `off`.
+- `quic_policy`: `auto` (default), `route_only`, or `off`. An explicit empty string selects `auto` on the legacy policy and is invalid on the profile engine.
 
 Generic UDP and UDP/443 are tested separately: a server can carry DNS or STUN successfully while dropping QUIC traffic. See [UDP and QUIC](#udp-and-quic).
 
 #### throughput
 
 - `enabled`: enables throughput measurement; default `true`.
-- `target_mbps`: sufficient download rate in Mbit/s; default `25`, and must be positive. Profiles can supply a different default. The legacy policy stops favoring throughput improvements after this target is met; profile criteria can rank measured download speed separately.
+- `target_mbps`: sufficient download rate in Mbit/s; default `25`. An explicitly configured target must be positive and finite on the profile engine; on the legacy policy, `0` selects the built-in default `25`. Negative and non-finite targets are invalid on both engines. Profiles can supply a different default. The legacy policy stops favoring throughput improvements after this target is met; profile criteria can rank measured download speed separately.
 - `download_url`: default `https://speed.cloudflare.com/__down?bytes={bytes}`. It must be a valid URL containing the literal `{bytes}` placeholder.
 - `upload_url`: default `https://speed.cloudflare.com/__up`; it must be a valid URL.
 - `wifi_daily_budget_mb`: default `300`.
@@ -114,9 +114,9 @@ Default `true`. Notify only after every member has corroborated failures, the in
 }
 ```
 
-Precedence is **explicit field, then profile value, then built-in default**. This applies to every preference leaf and to the profile-owned existing fields: `throughput.target_mbps`, `throughput.enabled`, `probe.heartbeat_interval`, `probe.standby_interval`, `probe.background_interval`, `interrupt_on_failover`, and `udp.quic_policy`. Explicit `false`, `0`, `"0s"`, and `"none"` are never replaced by a profile default; they must still satisfy that field's validation rules. In particular, an explicit zero target or probe interval is invalid, not an omitted value. Profiles never set or increase throughput budgets.
+On the profile engine, precedence is **explicit field, then profile value, then built-in default**. This applies to every preference leaf and to the profile-owned existing fields: `throughput.target_mbps`, `throughput.enabled`, `probe.heartbeat_interval`, `probe.standby_interval`, `probe.background_interval`, `interrupt_on_failover`, and `udp.quic_policy`. Explicit `false`, `0`, `"0s"`, and `"none"` are never replaced by a profile default; they must still satisfy that field's validation rules. In particular, an explicit zero target, probe interval, or probe timeout, or an empty QUIC policy is invalid on this engine, not an omitted value. Profiles never set or increase throughput budgets.
 
-No `preference`, an empty `preference` object, or only `profile: "default"` retains the unchanged legacy policy, including the meaning of explicitly configured existing fields. Engine selection depends only on new preference leaves: for example, `throughput.target_mbps: 8` without `preference` still uses the legacy engine. Empty `switch` objects add no override. `default` keeps the legacy tier/state/stability/throughput/p90 comparison, improvement signature, dwell, confirmations, and degradation evidence.
+No `preference`, an empty `preference` object, or only `profile: "default"` retains the unchanged legacy policy, including the meaning of explicitly configured existing fields: zero probe intervals select their built-in defaults, `probe.timeout: "0s"` selects adaptive timing, `throughput.target_mbps: 0` selects `25`, and `udp.quic_policy: ""` selects `auto`. Engine selection depends only on new preference leaves: for example, `throughput.target_mbps: 8` without `preference` still uses the legacy engine. Empty `switch` objects add no override. `default` keeps the legacy tier/state/stability/throughput/p90 comparison, improvement signature, dwell, confirmations, and degradation evidence.
 
 **Default plus overrides uses the profile engine; latency is p50-bucketed and confirmations are per decisive criterion.** Any new preference leaf with the default base, including a rank without a profile or `{"switch":{"improvement":false}}`, selects this engine and reports `profile: "custom"` in status. Its base is rank `stability, throughput, latency`, no minimum stability, target `25`, and the switch defaults below. `custom` is a resolved status value, not a built-in profile name.
 

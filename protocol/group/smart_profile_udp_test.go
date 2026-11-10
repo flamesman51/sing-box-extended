@@ -2,9 +2,39 @@ package group
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
+
+	M "github.com/sagernet/sing/common/metadata"
 )
+
+type smartProfileUDPTestOutbound struct {
+	*smartFakeOutbound
+	dialer *smartProbeTestDialer
+}
+
+func (o *smartProfileUDPTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return o.dialer.DialContext(ctx, network, destination)
+}
+
+func (o *smartProfileUDPTestOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return o.dialer.ListenPacket(ctx, destination)
+}
+
+func smartCompleteProfileUDPRefresh(t *testing.T, s *Smart, job smartJob, now time.Time) {
+	t.Helper()
+	s.udpProbe = smartUDPProbe
+	job.member.outbound = &smartProfileUDPTestOutbound{
+		smartFakeOutbound: &smartFakeOutbound{tag: job.member.tag},
+		dialer:            &smartProbeTestDialer{strictUDP: true},
+	}
+	result := s.runOperation(job)
+	if result.err != nil {
+		t.Fatalf("UDP refresh failed: %v", result.err)
+	}
+	s.applyResultLocked(result, now)
+}
 
 func TestSmartProfileQUICFixedRefreshRetriesPreemption(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "responsive")
@@ -27,7 +57,7 @@ func TestSmartProfileQUICFixedRefreshRetriesPreemption(t *testing.T) {
 	if job.ctx.Err() == nil {
 		t.Fatal("test heartbeat did not preempt the background refresh")
 	}
-	s.applyResultLocked(smartResult{member: candidate, kind: "udp443", err: context.Canceled, generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration}, clock.Now())
+	s.applyResultLocked(s.runOperation(job), clock.Now())
 	s.pending = nil
 	s.queueProfileUDPLocked(clock.Now(), false)
 	if candidate.queued["udp443"] || !candidate.udpRefresh[1].retryAt.Equal(clock.Now().Add(30*time.Second)) {
@@ -49,7 +79,7 @@ func TestSmartProfileQUICFixedRefreshRetriesPreemption(t *testing.T) {
 	job = s.pending[0]
 	s.pending = nil
 	clock.Advance(time.Second)
-	s.applyResultLocked(smartResult{member: candidate, kind: "udp443", generation: job.generation, configGeneration: job.configGeneration, memberGeneration: job.memberGeneration}, clock.Now())
+	smartCompleteProfileUDPRefresh(t, s, job, clock.Now())
 	if candidate.udp443.value(clock.Now()) != "ok" || candidate.improvementObservations != 2 {
 		t.Fatal("successful retry did not preserve and advance confirmations")
 	}

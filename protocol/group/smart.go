@@ -1486,7 +1486,11 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 	case "throughput":
 		member.lastThroughput = now
 		if result.err == nil && (!s.profileEngine() || result.download > 0) {
-			member.throughput = smartThroughput{Download: result.download, Upload: result.upload, At: now, Source: "active"}
+			upload := result.upload
+			if result.purpose == smartImprovementConfirmation {
+				upload = member.throughput.Upload
+			}
+			member.throughput = smartThroughput{Download: result.download, Upload: upload, At: now, Source: "active"}
 			member.lastThroughput = now
 			if s.profileEngine() && result.download >= s.targetMbps {
 				member.floorDegraded = false
@@ -1496,7 +1500,9 @@ func (s *Smart) applyResultLocked(result smartResult, now time.Time) []io.Closer
 			for _, key := range s.network.Path {
 				stat := s.history.statistic(key, member.identity, now)
 				stat.Download = result.download
-				stat.Upload = result.upload
+				if result.purpose != smartImprovementConfirmation {
+					stat.Upload = result.upload
+				}
 				stat.ThroughputAt = now.Unix()
 				points := s.history.Timeline[key][member.identity]
 				if len(points) > 0 {
@@ -1944,6 +1950,7 @@ func (s *Smart) updateNotificationLocked(now time.Time) {
 
 func cloneSmartHistory(history *smartHistory) *smartHistory {
 	snapshot := *history
+	snapshot.outageObservations = nil
 	snapshot.Networks = maps.Clone(history.Networks)
 	for key, network := range snapshot.Networks {
 		if network != nil {

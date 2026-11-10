@@ -489,3 +489,38 @@ func TestSmartImportedPriorsListNetworksWithoutLiveEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSmartHistorySnapshotEncodeDoesNotShareOutageBaselines(t *testing.T) {
+	s, clock := smartProfileTestGroup(t, "stability-downtime")
+	member := s.primary
+	s.observeOutagesLocked(member, clock.Now())
+	s.history.Networks[s.network.Key].Label = strings.Repeat("x", smartHistoryMaxBytes)
+	snapshot := cloneSmartHistory(s.history)
+	if snapshot.outageObservations != nil {
+		t.Fatal("persistence snapshot retained runtime outage observations")
+	}
+	type encodedSnapshot struct {
+		data []byte
+		err  error
+	}
+	start := make(chan struct{})
+	done := make(chan encodedSnapshot, 1)
+	go func() {
+		<-start
+		data, err := snapshot.Encode()
+		done <- encodedSnapshot{data: data, err: err}
+	}()
+	close(start)
+	for range 1000 {
+		clock.Advance(time.Second)
+		s.observeOutagesLocked(member, clock.Now())
+	}
+	result := <-done
+	if result.err != nil || len(result.data) > smartHistoryMaxBytes || len(snapshot.Networks) != 0 {
+		t.Fatalf("oversized snapshot was not safely evicted: bytes=%d networks=%d err=%v", len(result.data), len(snapshot.Networks), result.err)
+	}
+	baseline, exists := s.history.outageObservations[member.identity]
+	if !exists || !baseline.at.Equal(clock.Now()) || s.history.Stats[s.network.Key][member.identity].OutageExposureHours <= 0 {
+		t.Fatal("snapshot eviction erased or reset the live outage baseline")
+	}
+}

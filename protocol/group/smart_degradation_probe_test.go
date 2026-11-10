@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -84,7 +85,7 @@ func smartDegradationTestClock() *smartFakeClock {
 func TestSmartDegradationBurstDoesNotHideSlowPayload(t *testing.T) {
 	clock := smartDegradationTestClock()
 	reader := &smartDegradationTimedReader{clock: clock, warmup: 1_000_000, elapsed: 5208333333 * time.Nanosecond}
-	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, nil, clock)
+	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 25*.5, nil, clock)
 	if err != nil || math.Abs(rate-3) > 0.001 {
 		t.Fatalf("startup burst hid 3 Mbps payload: rate=%f err=%v", rate, err)
 	}
@@ -98,7 +99,7 @@ func TestSmartDegradationSharedLinkUsesIdenticalIntervals(t *testing.T) {
 	passive := int64(900_000_000)
 	reader := &smartDegradationTimedReader{clock: clock, warmup: 1_000_000, elapsed: time.Second, passive: &passive, perRead: 1}
 	start := clock.Now()
-	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, func() int64 { return passive }, clock)
+	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 25*.5, func() int64 { return passive }, clock)
 	if err != nil || math.Abs(rate-31.25) > 0.001 {
 		t.Fatalf("same-interval correction: rate=%f err=%v", rate, err)
 	}
@@ -120,7 +121,7 @@ func TestSmartDegradationFastProofWaitsTwoSeconds(t *testing.T) {
 	done := make(chan result, 1)
 	start := clock.Now()
 	go func() {
-		rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, nil, clock)
+		rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 25*.5, nil, clock)
 		done <- result{rate, err}
 	}()
 	for interval := range 4 {
@@ -156,7 +157,7 @@ func TestSmartDegradationIncompleteEvidenceIsNoData(t *testing.T) {
 	for _, failure := range []error{io.EOF, errSmartMeasureCap, errSmartContained} {
 		clock := smartDegradationTestClock()
 		reader := &smartDegradationTimedReader{clock: clock, warmup: 1_000_000, elapsed: time.Second, failAt: 1_100_000, failure: failure}
-		rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, nil, clock)
+		rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 25*.5, nil, clock)
 		if rate != 0 || !errors.Is(err, errSmartDegradationNoData) || !errors.Is(err, failure) {
 			t.Fatalf("partial proof became evidence: rate=%f err=%v", rate, err)
 		}
@@ -170,7 +171,7 @@ func TestSmartDegradationCancelMinimumDurationWait(t *testing.T) {
 	reader := &smartDegradationTimedReader{clock: clock, warmup: 1_000_000}
 	done := make(chan error, 1)
 	go func() {
-		_, err := smartMeasureDegradationBody(ctx, reader, 25, nil, clock)
+		_, err := smartMeasureDegradationBody(ctx, reader, 25, 25*.5, nil, clock)
 		done <- err
 	}()
 	select {
@@ -214,7 +215,7 @@ func TestSmartDegradationHTTPProofAndAccounting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	clock := smartDegradationAutoClock{smartDegradationTestClock()}
-	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, nil, clock)
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, 25*.5, nil, clock)
 	if err != nil || rate != 31.25 {
 		t.Fatalf("HTTP proof failed: rate=%f charged=%d err=%v", rate, charged, err)
 	}
@@ -239,7 +240,7 @@ func TestSmartDegradationHTTPIncompleteAndCancelledAccounting(t *testing.T) {
 					cancel()
 				}
 			}}
-			rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, nil, smartDegradationAutoClock{smartDegradationTestClock()})
+			rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, 25*.5, nil, smartDegradationAutoClock{smartDegradationTestClock()})
 			if rate != 0 || charged <= 0 || charged > 11_000_000 {
 				t.Fatalf("partial HTTP evidence/accounting: rate=%f charged=%d err=%v", rate, charged, err)
 			}
@@ -288,7 +289,7 @@ func TestSmartDegradationContainedReadSettlesBytes(t *testing.T) {
 	}}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, nil, smartDegradationAutoClock{smartDegradationTestClock()})
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, 25*.5, nil, smartDegradationAutoClock{smartDegradationTestClock()})
 	if rate != 0 || !errors.Is(err, errSmartContained) || charged < 1_210_000 || charged > 11_000_000 {
 		t.Fatalf("contained read lost settlement: rate=%f charged=%d err=%v", rate, charged, err)
 	}
@@ -300,7 +301,7 @@ func TestSmartDegradationRefusesUndersizedProof(t *testing.T) {
 		cap    int64
 		target float64
 	}{{8_000_000, 25}, {25_000_000, 100}} {
-		rate, charged, err := smartMeasureDegradation(context.Background(), dialer, "http://203.0.113.1/down?bytes={bytes}", test.cap, test.target, nil, smartDegradationTestClock())
+		rate, charged, err := smartMeasureDegradation(context.Background(), dialer, "http://203.0.113.1/down?bytes={bytes}", test.cap, test.target, test.target*.5, nil, smartDegradationTestClock())
 		if rate != 0 || charged != 0 || !errors.Is(err, errSmartDegradationNoData) {
 			t.Fatalf("undersized proof was shrunk: rate=%f charged=%d err=%v", rate, charged, err)
 		}
@@ -316,7 +317,7 @@ func TestSmartDegradationLaterSlowIntervalCannotHideBehindBurst(t *testing.T) {
 		clock: clock, warmup: 1_000_000,
 		intervals: []time.Duration{500 * time.Millisecond, 500 * time.Millisecond, 500 * time.Millisecond, time.Second},
 	}
-	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, nil, smartDegradationAutoClock{clock})
+	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 25*.5, nil, smartDegradationAutoClock{clock})
 	if err != nil || math.Abs(rate-15.625) > 0.001 || reader.read != 8_812_500 {
 		t.Fatalf("earlier intervals hid later slowness: rate=%f read=%d err=%v", rate, reader.read, err)
 	}
@@ -340,7 +341,7 @@ func TestSmartDegradationFramingCapIsNoDataAndSettlesBytes(t *testing.T) {
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 2_000_000, 1, nil, smartDegradationAutoClock{smartDegradationTestClock()})
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 2_000_000, 1, 1*.5, nil, smartDegradationAutoClock{smartDegradationTestClock()})
 	if rate != 0 || charged != 2_200_000 || !errors.Is(err, errSmartDegradationNoData) || !errors.Is(err, errSmartMeasureCap) {
 		t.Fatalf("framing cap became evidence or lost bytes: rate=%f charged=%d err=%v", rate, charged, err)
 	}
@@ -353,7 +354,7 @@ func TestSmartDegradationDoesNotReuseEarlierPassiveBytes(t *testing.T) {
 		clock: clock, warmup: 1_000_000, elapsed: time.Second, passive: &passive,
 		passivePerInterval: []int64{3, 1, 1, 0},
 	}
-	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, func() int64 { return passive }, clock)
+	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 25*.5, func() int64 { return passive }, clock)
 	if err != nil || math.Abs(rate-15.625) > 0.001 {
 		t.Fatalf("earlier passive bytes hid final slow interval: rate=%f err=%v", rate, err)
 	}
@@ -381,7 +382,7 @@ func TestSmartDegradationVerySlowConfirmsBeforeDeadline(t *testing.T) {
 	defer cancel()
 	timed := &smartDegradationTimedReader{clock: clock, warmup: 1_000_000, warmupElapsed: 16 * time.Second, elapsed: 31250 * time.Millisecond}
 	reader := &smartDegradationDeadlineReader{reader: timed, clock: clock, deadline: start.Add(30 * time.Second), cancel: cancel}
-	rate, err := smartMeasureDegradationBody(ctx, reader, 25, nil, clock)
+	rate, err := smartMeasureDegradationBody(ctx, reader, 25, 25*.5, nil, clock)
 	if err != nil || math.Abs(rate-.5) > .001 {
 		t.Fatalf("0.5 Mbps primary did not confirm before timeout: rate=%f elapsed=%s err=%v", rate, clock.Now().Sub(start), err)
 	}
@@ -445,7 +446,7 @@ func TestSmartDegradationWarmupDeadlineSlowEvidence(t *testing.T) {
 				}
 				return 0
 			}
-			rate, err := smartMeasureDegradationBody(ctx, reader, 25, passive, clock)
+			rate, err := smartMeasureDegradationBody(ctx, reader, 25, 25*.5, passive, clock)
 			if scenario.slow {
 				if err != nil || math.Abs(rate-0.0386666667) > 0.000001 {
 					t.Fatalf("145 KB/30 s was not slow evidence: rate=%f err=%v", rate, err)
@@ -482,7 +483,7 @@ func TestSmartDegradationHTTPWarmupDeadlinePreservesSlowEvidence(t *testing.T) {
 		cancel(context.DeadlineExceeded)
 	}}
 	passive := func() int64 { once.Do(func() { close(started) }); return 0 }
-	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, passive, clock)
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, 25*.5, passive, clock)
 	<-finished
 	if err != nil || math.Abs(rate-0.0386666667) > 0.000001 || charged < 159_500 || charged > 170_000 {
 		t.Fatalf("HTTP deadline discarded slow proof/accounting: rate=%f charged=%d err=%v", rate, charged, err)
@@ -515,9 +516,108 @@ func TestSmartDegradationLateHeadersDoNotConfirmSlow(t *testing.T) {
 		cancel(context.DeadlineExceeded)
 	}}
 	passive := func() int64 { once.Do(func() { close(started) }); return 0 }
-	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, passive, clock)
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, 25*.5, passive, clock)
 	<-finished
 	if rate != 0 || charged <= 0 || !errors.Is(err, errSmartDegradationNoData) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("100 ms body after 29.9 s startup became slow evidence: rate=%f charged=%d err=%v", rate, charged, err)
+	}
+}
+
+func TestSmartDegradationProfileSlowProofUsesThreshold(t *testing.T) {
+	clock := smartDegradationTestClock()
+	passive := int64(900_000_000)
+	reader := &smartDegradationTimedReader{
+		clock: clock, warmup: 1_000_000, elapsed: 12500 * time.Millisecond,
+		passive: &passive, perRead: 13,
+	}
+	start := clock.Now()
+	rate, err := smartMeasureDegradationBody(context.Background(), reader, 25, 20, func() int64 { return passive }, clock)
+	if err != nil || math.Abs(rate-17.5) > .001 {
+		t.Fatalf("profile threshold rejected same-interval slow proof: rate=%f err=%v", rate, err)
+	}
+	if reader.read >= 2_953_125 || clock.Now().Sub(start) > 2100*time.Millisecond {
+		t.Fatalf("profile slow proof waited for a full target quota: bytes=%d elapsed=%s", reader.read, clock.Now().Sub(start))
+	}
+}
+
+func TestSmartDegradationWorkerProfileDeadlineUsesSameIntervalPassive(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(strconv.FormatBool(legacy), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s, clock := smartProfileThroughputTestGroup(t)
+				s.preference.legacy = legacy
+				// Align the fixture with synctest's clock before the worker creates its deadline.
+				time.Sleep(time.Until(clock.Now()))
+				s.clock = smartRealClock{}
+				s.options.Throughput.DownloadURL = "http://localhost/down?bytes={bytes}"
+				primary := s.primary
+				primary.passiveRead = 900_000_000
+				episode := smartTestDegradationEpisode(s, s.clock.Now())
+				primary.queued["throughput"] = true
+				primary.degradationQueued = episode
+				finished := make(chan struct{})
+				dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
+					defer close(finished)
+					defer conn.Close()
+					request, err := http.ReadRequest(bufio.NewReader(conn))
+					if err != nil {
+						return
+					}
+					if request.URL.Query().Get("bytes") != "8812500" {
+						t.Errorf("profile threshold changed target quota: %s", request.URL)
+						return
+					}
+					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 8812500\r\nConnection: close\r\n\r\n")
+					_, _ = io.CopyN(conn, smartZeroReader{}, 145_000)
+					_, _ = io.Copy(io.Discard, conn)
+				}}
+				primary.outbound = &smartConfirmationTestOutbound{smartFakeOutbound: &smartFakeOutbound{tag: primary.tag}, dialer: dialer}
+				job := smartJob{
+					ctx: episode.ctx, timeout: 30 * time.Second, member: primary, kind: "throughput",
+					capBytes: 10_000_000, purpose: smartDegradationConfirmation, episode: episode,
+					generation: episode.generation, configGeneration: episode.configGeneration, memberGeneration: episode.memberGeneration,
+				}
+				done := make(chan smartResult, 1)
+				start := s.clock.Now()
+				go func() { done <- s.runOperation(job) }()
+				synctest.Wait()
+				select {
+				case result := <-done:
+					t.Fatalf("worker returned before its body deadline: %+v", result)
+				default:
+				}
+				for range 29 {
+					time.Sleep(time.Second)
+					s.mu.Lock()
+					primary.passiveRead += 2_250_000
+					s.mu.Unlock()
+				}
+				result := <-done
+				synctest.Wait()
+				select {
+				case <-finished:
+				default:
+					t.Fatal("deadline did not close the HTTP transfer")
+				}
+				if elapsed := s.clock.Now().Sub(start); elapsed != 30*time.Second || result.bytes <= 0 || result.bytes > 170_000 {
+					t.Fatalf("worker did not settle deadline-limited transfer: result=%+v elapsed=%s", result, elapsed)
+				}
+				if legacy {
+					if result.download != 0 || !errors.Is(result.err, errSmartDegradationNoData) || !errors.Is(result.err, context.DeadlineExceeded) {
+						t.Fatalf("legacy accepted above-half-target incomplete proof: %+v", result)
+					}
+				} else if result.err != nil || math.Abs(result.download-17.4386666667) > .000001 {
+					t.Fatalf("profile discarded deadline proof with same-interval passive bytes: %+v", result)
+				}
+				s.applyResultLocked(result, s.clock.Now())
+				if legacy {
+					if primary.floorDegraded || primary.throughput.Download != 50 || s.degradation.episode != nil {
+						t.Fatal("inconclusive legacy transfer changed primary credit")
+					}
+				} else if !primary.floorDegraded || primary.throughput.Download != result.download || episode.confirmed != result.download || episode.challenger == nil {
+					t.Fatal("confirmed profile transfer did not remove floor credit and retain challenger exploration")
+				}
+			})
+		})
 	}
 }
