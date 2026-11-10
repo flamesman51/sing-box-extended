@@ -220,3 +220,16 @@ History reset clears learned statistics, events, timeline, and imported priors f
 
 Stored history is bounded: at most `48` network keys, `32` identities per key, `500` events per group, and `1 MiB` serialized history. Live identity-to-server metadata is removed when its last retained statistic is evicted; unused provider configurations do not accumulate metadata. A dedicated persistence worker serializes consistent snapshots and writes at most once per minute without waiting in the health owner loop or holding its state lock during serialization or disk writes. Reset is ordered against pending writes, and cache-scoped generation tokens prevent detached writes from overwriting replacement or reset history. Shutdown gives the group's own final history and accounting wait a shared `5s` deadline, then logs and abandons it; recent learned history may be lost, and unfinished durable reservations remain conservatively charged on restart. This deadline does not bound a hung storage layer: upstream cache-file cleanup can still wait in bbolt `DB.Close` for an outstanding transaction. Ledger owners are retired when their cache lifetime ends. The cache uses bbolt, which reuses freed pages but does not shrink its file after eviction or reset. Expect a high-water file size of a few MiB; automatic compaction is not performed.
 
+### Development
+
+The Linux real-component harness uses in-process client and server boxes, user-space WireGuard/gVisor endpoints, per-member UDP fault relays, and protocol-correct HTTPS, TCP DNS, STUN, and QUIC version-negotiation fixtures. It requires no Internet access, TUN device, or root privileges. A temporary test CA is trusted through `SSL_CERT_FILE`; direct-connectivity probes are disabled with `probe.disable_direct`.
+
+The harness checks initial selection after 20/5/1.5 Mbit/s calibration at a 10 Mbit/s target, UDP reachability, budget accounting, cache restart persistence, blackhole failover, and panic counts. The rates are scaled down so race-instrumented packet processing does not become the bottleneck; exactly one member must still meet the target. WireGuard retains the phone's `1280`-byte MTU rather than using jumbo packets to hide packet-size failures. The harness does not assert ordinary speed-improvement switching, which has a ten-minute dwell, or mid-session throughput degradation detection.
+
+The harness uses a `30s` primary heartbeat so each calibration can finish before primary validation preempts background work. A heartbeat shorter than the built-in throughput sample duration can repeatedly cancel throughput tests, consume the hourly test allowance, and leave throughput unknown. Configured outer link rates include WireGuard framing; measured application throughput is lower. The CI test workflow runs three consecutive race-enabled passes:
+
+```sh
+GOTOOLCHAIN=go1.26.8 go test -race -count=3 -timeout=9m -ldflags=-checklinkname=0 \
+  -tags with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0 \
+  ./protocol/group/ -run '^TestSmartHarness'
+```
