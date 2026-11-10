@@ -72,7 +72,8 @@ func newFaultRelay(t *testing.T, server *net.UDPAddr, faults relayFaults) *fault
 	r := &faultRelay{conn: conn, faults: faults}
 	r.buffers.New = func() any { return new([65536]byte) }
 	serverAddress := netip.AddrPortFrom(server.AddrPort().Addr().Unmap(), uint16(server.Port))
-	up, down := make(chan relayPacket, 256), make(chan relayPacket, 256)
+	// Bound FIFO delay to about 220 ms at the slowest fixture rate.
+	up, down := make(chan relayPacket, 32), make(chan relayPacket, 32)
 	r.workers.Add(3)
 	go r.forward(ctx, up, 1, false)
 	go r.forward(ctx, down, 2, true)
