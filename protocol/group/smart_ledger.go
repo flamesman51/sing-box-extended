@@ -188,30 +188,30 @@ func (l *smartLedger) retireOnCacheClose(done <-chan struct{}) {
 	smartLedgers.Unlock()
 }
 
-func (ledger *smartLedger) initialize() error {
-	cache := ledger.cache
+func (l *smartLedger) initialize() error {
+	cache := l.cache
 	if cache != nil {
 		metadata, err := cache.LoadSmartMetadata()
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		if metadata != nil && len(metadata.Data) != 0 {
-			if err = json.Unmarshal(metadata.Data, &ledger.raw); err != nil {
+			if err = json.Unmarshal(metadata.Data, &l.raw); err != nil {
 				return fmt.Errorf("decode smart metadata: %w", err)
 			}
-			if err = json.Unmarshal(metadata.Data, &ledger.installation); err != nil {
+			if err = json.Unmarshal(metadata.Data, &l.installation); err != nil {
 				return fmt.Errorf("decode smart installation: %w", err)
 			}
 		}
 	}
-	if ledger.installation.InstallID == "" {
+	if l.installation.InstallID == "" {
 		var id [16]byte
 		if _, err := rand.Read(id[:]); err != nil {
 			return err
 		}
-		ledger.installation.InstallID = hex.EncodeToString(id[:])
+		l.installation.InstallID = hex.EncodeToString(id[:])
 	}
-	for _, seed := range []*[]byte{&ledger.installation.HMACSeed, &ledger.installation.DirectSeed} {
+	for _, seed := range []*[]byte{&l.installation.HMACSeed, &l.installation.DirectSeed} {
 		if len(*seed) == 0 {
 			*seed = make([]byte, 32)
 			if _, err := rand.Read(*seed); err != nil {
@@ -219,14 +219,14 @@ func (ledger *smartLedger) initialize() error {
 			}
 		}
 	}
-	ledger.state = ledger.installation.Ledger
-	if ledger.state.Days == nil {
-		ledger.state.Days = make(map[string]int64)
+	l.state = l.installation.Ledger
+	if l.state.Days == nil {
+		l.state.Days = make(map[string]int64)
 	}
-	if ledger.state.Latest == nil {
-		ledger.state.Latest = make(map[string]string)
+	if l.state.Latest == nil {
+		l.state.Latest = make(map[string]string)
 	}
-	for _, reservation := range ledger.state.Reservations {
+	for _, reservation := range l.state.Reservations {
 		if reservation.Bytes < 0 {
 			return errors.New("negative smart reservation")
 		}
@@ -236,12 +236,12 @@ func (ledger *smartLedger) initialize() error {
 				return errors.New("invalid smart degradation reservation")
 			}
 			charged = smartDegradationWorstCase(charged)
-			ledger.state.Days[smartDegradationDayKey(reservation.NetworkType, reservation.Day)] += charged
+			l.state.Days[smartDegradationDayKey(reservation.NetworkType, reservation.Day)] += charged
 		}
-		ledger.state.Days[reservation.NetworkType+"/"+reservation.Day] += charged
+		l.state.Days[reservation.NetworkType+"/"+reservation.Day] += charged
 	}
-	ledger.state.Reservations = make(map[string]smartReservation)
-	return ledger.save(ledger.state, ledger.installation)
+	l.state.Reservations = make(map[string]smartReservation)
+	return l.save(l.state, l.installation)
 }
 
 func (l *smartLedger) Register(group string, limits map[string]float64) {

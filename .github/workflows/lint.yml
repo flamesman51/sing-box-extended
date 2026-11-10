@@ -78,3 +78,5 @@ jobs:
           args: --timeout=30m
           install-mode: binary
           verify: false
+          # Inherited fork code carries ~1000 findings; gate only what each push changes.
+          only-new-issues: true

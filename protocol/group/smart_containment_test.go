@@ -296,7 +296,7 @@ func TestSmartSynchronousContainmentContracts(t *testing.T) {
 			}
 			// Every boundary must have released its mutex before recording.
 			unlocked := make(chan struct{})
-			go func() { s.mu.Lock(); s.mu.Unlock(); close(unlocked) }()
+			go func() { s.mu.Lock(); s.mu.Unlock(); close(unlocked) }() //nolint:staticcheck // SA2001: acquiring proves every boundary released it
 			smartLedgerWait(t, unlocked)
 			if err := s.Close(); err != nil {
 				t.Fatal(err)

@@ -70,7 +70,7 @@ func smartScrubMessage(value string) string {
 
 func smartScrubStack(stack []byte) string {
 	var frames []string
-	for _, line := range strings.Split(string(stack), "\n") {
+	for line := range strings.SplitSeq(string(stack), "\n") {
 		if strings.HasPrefix(line, "\t") {
 			location := strings.Fields(line)
 			if len(location) > 0 {
@@ -78,9 +78,8 @@ func smartScrubStack(stack []byte) string {
 			}
 			continue
 		}
-		if strings.HasPrefix(line, "created by ") {
-			line = strings.TrimPrefix(line, "created by ")
-			line, _, _ = strings.Cut(line, " in goroutine ")
+		if created, isCreated := strings.CutPrefix(line, "created by "); isCreated {
+			line, _, _ = strings.Cut(created, " in goroutine ")
 		} else if index := strings.LastIndex(line, "("); index >= 0 {
 			line = line[:index]
 		} else {

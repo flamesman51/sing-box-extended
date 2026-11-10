@@ -367,7 +367,10 @@ func TestSmartMeasureCountsInnerBytesAndCapsOverhead(t *testing.T) {
 		var buffer [4096]byte
 		_, _ = conn.Read(buffer[:])
 		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\nConnection: close\r\n\r\n")
-		_, _ = io.CopyN(conn, smartZeroReader{}, 2_000_000)
+		// Windows' coarse monotonic clock can read an in-memory transfer as zero elapsed.
+		_, _ = io.CopyN(conn, smartZeroReader{}, 100_000)
+		time.Sleep(30 * time.Millisecond)
+		_, _ = io.CopyN(conn, smartZeroReader{}, 1_900_000)
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

@@ -232,10 +232,6 @@ func writeFixturePayload(ctx context.Context, w http.ResponseWriter, remaining i
 	}
 }
 
-type zeroReader struct{}
-
-func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
-
 func fixtureUDP(t *testing.T, reply func([]byte, *net.UDPAddr) []byte) uint16 {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
