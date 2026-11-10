@@ -126,7 +126,7 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			}
 			client, members, _ := newHarnessNetwork(t, links, 1000, "")
 			requestHarness(t, client)
-			calibrated := awaitHarness(t, client, 75*time.Second, "two target-meeting startup calibrations", func(status harnessStatus) bool {
+			awaitHarness(t, client, 75*time.Second, "two target-meeting startup calibrations", func(status harnessStatus) bool {
 				count := 0
 				for _, member := range status.Members {
 					if member.Tag != "a" && member.Tag != "b" {
@@ -144,14 +144,6 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			})
 			if starts := harnessLedgerStarts(t, client); starts != 2 {
 				t.Fatalf("startup used %d hourly slots, want two", starts)
-			}
-			calibratedRates := make(map[string]float64)
-			calibratedAt := make(map[string]int64)
-			for _, member := range calibrated.Members {
-				if member.Download != nil {
-					calibratedRates[member.Tag] = *member.Download
-					calibratedAt[member.Tag] = member.At
-				}
 			}
 			beforeDownloads := make([]int64, len(members))
 			for i, member := range members {
@@ -177,6 +169,22 @@ func TestSmartHarnessDegradation(t *testing.T) {
 					member.relay.set(faults)
 				}
 			case "two_slow_one_fast":
+				faults := members[2].faults
+				faults.blackhole = false
+				members[2].relay.set(faults)
+				awaitHarness(t, client, 90*time.Second, "untried C healthy before degrading A and B", func(status harnessStatus) bool {
+					assertHarnessHealthy(t, status, "a")
+					for _, member := range status.Members {
+						if member.Tag == "c" {
+							return member.State == "healthy"
+						}
+					}
+					return false
+				})
+				if harnessLedgerStarts(t, client) != 2 {
+					t.Fatal("C consumed an hourly slot despite sustained user demand")
+				}
+				degradedAt = time.Now()
 				for i, member := range members {
 					faults := member.faults
 					faults.blackhole = false
@@ -198,6 +206,15 @@ func TestSmartHarnessDegradation(t *testing.T) {
 			case "burst_then_slow":
 				primary.downloadBurst.Store(1_000_000 + 781_250)
 				primary.downloadRate.Store(187_500)
+			}
+			calibrated := statusHarness(t, client)
+			calibratedRates := make(map[string]float64)
+			calibratedAt := make(map[string]int64)
+			for _, member := range calibrated.Members {
+				if member.Download != nil {
+					calibratedRates[member.Tag] = *member.Download
+					calibratedAt[member.Tag] = member.At
+				}
 			}
 			want := "shared_bottleneck_suspected"
 			if switchExpected {
