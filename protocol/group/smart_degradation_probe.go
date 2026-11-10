@@ -51,7 +51,7 @@ func smartMeasureDegradation(ctx context.Context, dialer N.Dialer, downloadURL s
 				bytes = (used*11 + 9) / 10
 			}()
 		}
-		if ctx.Err() != nil && !errors.Is(err, errSmartContained) {
+		if ctx.Err() != nil && !errors.Is(err, errSmartContained) && !(err == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && download > 0 && download < targetMbps/2) {
 			err = ctx.Err()
 		}
 		if err != nil {
@@ -127,7 +127,30 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 	if err = ctx.Err(); err != nil {
 		return 0, err
 	}
-	if _, err = io.CopyN(io.Discard, body, 1_000_000); err != nil {
+	start := clock.Now()
+	var total, passiveStart int64
+	if passive != nil {
+		passiveStart = passive()
+	}
+	defer func() {
+		if total == 0 || err == nil || errors.Is(err, errSmartContained) || errors.Is(ctx.Err(), context.Canceled) || !(errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			return
+		}
+		elapsed := clock.Now().Sub(start)
+		if elapsed <= 0 {
+			return
+		}
+		var passiveBytes int64
+		if passive != nil {
+			passiveBytes = max(0, passive()-passiveStart)
+		}
+		// Including warmup can overstate speed, so it is safe only for slow proof at the deadline.
+		rate := (float64(total) + float64(passiveBytes)) * 8 / elapsed.Seconds() / 1_000_000
+		if rate < targetMbps/2 {
+			download, err = rate, nil
+		}
+	}()
+	if total, err = io.CopyN(io.Discard, body, 1_000_000); err != nil {
 		return 0, err
 	}
 	download = math.Inf(1)
@@ -148,6 +171,7 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 			}
 			read, readErr := body.Read(buffer[:min(int64(len(buffer)), quota-n)])
 			n += int64(read)
+			total += int64(read)
 			if readErr != nil && !(n == quota && errors.Is(readErr, io.EOF)) {
 				return 0, readErr
 			}

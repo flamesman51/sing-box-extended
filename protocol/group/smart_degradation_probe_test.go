@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -386,5 +387,104 @@ func TestSmartDegradationVerySlowConfirmsBeforeDeadline(t *testing.T) {
 	}
 	if clock.Now().Sub(start) > 19*time.Second || timed.read >= 2_953_125 {
 		t.Fatalf("slow proof waited for full fast quota: elapsed=%s bytes=%d", clock.Now().Sub(start), timed.read)
+	}
+}
+
+type smartDegradationExpiredContext struct{ context.Context }
+
+func (c smartDegradationExpiredContext) Err() error {
+	if errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+
+type smartDegradationWarmupDeadlineReader struct {
+	remaining int
+	clock     *smartFakeClock
+	cancel    context.CancelCauseFunc
+	failure   error
+}
+
+func (r *smartDegradationWarmupDeadlineReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		r.clock.Advance(30 * time.Second)
+		r.cancel(r.failure)
+		return 0, r.failure
+	}
+	n := min(len(p), r.remaining)
+	r.remaining -= n
+	return n, nil
+}
+
+func TestSmartDegradationWarmupDeadlineSlowEvidence(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		bytes   int
+		passive int64
+		failure error
+		slow    bool
+	}{
+		{name: "145_KB_in_30_seconds", bytes: 145_000, failure: context.DeadlineExceeded, slow: true},
+		{name: "zero_bytes", failure: context.DeadlineExceeded},
+		{name: "cancelled", bytes: 145_000, failure: context.Canceled},
+		{name: "truncated", bytes: 145_000, failure: io.ErrUnexpectedEOF},
+		{name: "fast_shared_primary", bytes: 145_000, passive: 100_000_000, failure: context.DeadlineExceeded},
+		{name: "half_target_boundary", bytes: 145_000, passive: 46_730_000, failure: context.DeadlineExceeded},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			clock := smartDegradationTestClock()
+			base, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			ctx := smartDegradationExpiredContext{base}
+			reader := &smartDegradationWarmupDeadlineReader{remaining: scenario.bytes, clock: clock, cancel: cancel, failure: scenario.failure}
+			start := clock.Now()
+			passive := func() int64 {
+				if clock.Now().After(start) {
+					return scenario.passive
+				}
+				return 0
+			}
+			rate, err := smartMeasureDegradationBody(ctx, reader, 25, passive, clock)
+			if scenario.slow {
+				if err != nil || math.Abs(rate-0.0386666667) > 0.000001 {
+					t.Fatalf("145 KB/30 s was not slow evidence: rate=%f err=%v", rate, err)
+				}
+			} else if rate != 0 || !errors.Is(err, errSmartDegradationNoData) || !errors.Is(err, scenario.failure) {
+				t.Fatalf("insufficient or cancelled proof became evidence: rate=%f err=%v", rate, err)
+			}
+		})
+	}
+}
+
+func TestSmartDegradationHTTPWarmupDeadlinePreservesSlowEvidence(t *testing.T) {
+	clock := smartDegradationTestClock()
+	base, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	ctx := smartDegradationExpiredContext{base}
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	var once sync.Once
+	dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
+		defer close(finished)
+		defer conn.Close()
+		if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+			return
+		}
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 8812500\r\nConnection: close\r\n\r\n")
+		select {
+		case <-started:
+		case <-ctx.Done():
+			return
+		}
+		_, _ = io.CopyN(conn, smartZeroReader{}, 145_000)
+		clock.Advance(30 * time.Second)
+		cancel(context.DeadlineExceeded)
+	}}
+	passive := func() int64 { once.Do(func() { close(started) }); return 0 }
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, passive, clock)
+	<-finished
+	if err != nil || math.Abs(rate-0.0386666667) > 0.000001 || charged < 159_500 || charged > 170_000 {
+		t.Fatalf("HTTP deadline discarded slow proof/accounting: rate=%f charged=%d err=%v", rate, charged, err)
 	}
 }

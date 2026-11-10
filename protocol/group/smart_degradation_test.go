@@ -45,7 +45,7 @@ func smartDegradationTestGroup(t *testing.T) (*Smart, *smartFakeClock) {
 }
 
 func TestSmartDegradationSustainedDemand(t *testing.T) {
-	for _, pattern := range []string{"slow", "sufficient", "chat", "gaps", "short"} {
+	for _, pattern := range []string{"slow", "sufficient", "chat", "long_stalls", "short"} {
 		t.Run(pattern, func(t *testing.T) {
 			s, clock := smartDegradationTestGroup(t)
 			l := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
@@ -62,8 +62,8 @@ func TestSmartDegradationSustainedDemand(t *testing.T) {
 					n = 4000000
 				case "chat":
 					n = 100
-				case "gaps":
-					if i%5 == 0 || i%5 == 1 || i%5 == 2 {
+				case "long_stalls":
+					if i%12 < 9 {
 						n = 0
 					}
 				}
@@ -429,20 +429,50 @@ func TestSmartDegradationJitteredTicksReachSuspicion(t *testing.T) {
 	t.Fatalf("sustained 1.5 Mbps download stayed %q under jittered sampling", s.degradation.state)
 }
 
-func TestSmartDegradationIntermittentReadsNeverAccumulateCoverage(t *testing.T) {
+func TestSmartDegradationIntermittentReadsConfirmOnceWithoutChallengerCooldown(t *testing.T) {
 	s, clock := smartDegradationTestGroup(t)
 	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
 	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
 	s.scheduleDegradationLocked(clock.Now())
-	for i := range 80 {
+	for i := range 20 {
 		clock.Advance(time.Second)
 		if i%2 == 0 {
 			lease.CountRead(375_000)
 		}
 		s.scheduleDegradationLocked(clock.Now())
-		if s.degradation.episode != nil {
-			t.Fatalf("50%% progress coverage qualified after %d seconds", i+1)
+	}
+	e := s.degradation.episode
+	if e == nil {
+		t.Fatal("intermittent sub-half-target traffic did not request confirmation")
+	}
+	result := smartLedgerWait(t, s.results)
+	s.applyResultLocked(result, clock.Now())
+	s.admissionWorkers.Wait()
+	if len(s.pending) != 1 || s.pending[0].purpose != smartDegradationConfirmation {
+		t.Fatal("suspicion did not admit exactly one primary confirmation")
+	}
+	job := s.pending[0]
+	s.pending = nil
+	if err := s.ledger.Reconcile(context.Background(), job.reservation, 1_000_000, false); err != nil {
+		t.Fatal(err)
+	}
+	smartTestDegradationResult(s, e, s.primary, smartDegradationConfirmation, 50, clock.Now())
+	for i := range 180 {
+		clock.Advance(time.Second)
+		if i%2 == 0 {
+			lease.CountRead(375_000)
 		}
+		s.scheduleDegradationLocked(clock.Now())
+	}
+	budget := s.ledger.Snapshot(s.network.Type, clock.Now(), s.network.Offset)
+	if s.degradation.episode != nil || s.admission != nil || len(s.pending) != 0 || budget.Degradation.UsedMB != 1 || budget.ReservedMB != 0 {
+		t.Fatalf("fast primary spent more than one confirmation: episode=%v admission=%v pending=%d budget=%+v", s.degradation.episode != nil, s.admission != nil, len(s.pending), budget)
+	}
+	if s.degradation.cooldowns[s.degradationKey(s.primary)].Sub(e.until.Add(-5*time.Minute)) != time.Hour {
+		t.Fatal("fast primary did not retain its one-hour suspicion cooldown")
+	}
+	if !s.lastChallenger.IsZero() || !s.degradationChallengerRetryLocked().IsZero() || len(s.degradation.attempts) != 0 {
+		t.Fatal("fast primary consumed the hourly challenger cooldown")
 	}
 }
 
@@ -475,5 +505,123 @@ func TestSmartDegradationSamplingPauseResetsCoverage(t *testing.T) {
 	s.scheduleDegradationLocked(clock.Now())
 	if s.degradation.episode == nil {
 		t.Fatal("fresh continuous window did not qualify")
+	}
+}
+
+func TestSmartDegradationLossStallsQualifyWithinThirtySeconds(t *testing.T) {
+	for _, jitter := range []bool{false, true} {
+		t.Run(map[bool]string{false: "regular", true: "jittered"}[jitter], func(t *testing.T) {
+			s, clock := smartDegradationTestGroup(t)
+			start := clock.Now()
+			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: start, lastRead: start}
+			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			s.scheduleDegradationLocked(start)
+			for i := range 32 {
+				interval := time.Second
+				if jitter {
+					interval = []time.Duration{900 * time.Millisecond, 1100 * time.Millisecond, 1050 * time.Millisecond, 950 * time.Millisecond}[i%4]
+				}
+				clock.Advance(interval)
+				// Six seconds near 1.5 Mbit/s, then alternating three- and four-second RTO stalls.
+				second := int(clock.Now().Sub(start) / time.Second)
+				cycle := second % 19
+				if cycle < 6 || cycle >= 9 && cycle < 15 {
+					rate := []int{162_500, 187_500, 212_500}[i%3]
+					lease.CountRead(int(time.Duration(rate) * interval / time.Second))
+				}
+				s.scheduleDegradationLocked(clock.Now())
+				if s.degradation.episode != nil {
+					if elapsed := clock.Now().Sub(start); elapsed < 30*time.Second || elapsed > 31*time.Second {
+						t.Fatalf("wrong detection time from flow open: %s", elapsed)
+					}
+					return
+				}
+			}
+			t.Fatalf("loss-stalled bulk download never qualified: state=%s coverage=%s", s.degradation.state, s.degradation.coverage.duration)
+		})
+	}
+}
+
+func TestSmartDegradationIdleAndClosedFlowResetWindow(t *testing.T) {
+	for _, closeFlow := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stall_over_eight_seconds", true: "flow_closed"}[closeFlow], func(t *testing.T) {
+			s, clock := smartDegradationTestGroup(t)
+			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			s.scheduleDegradationLocked(clock.Now())
+			for range 10 {
+				clock.Advance(time.Second)
+				lease.CountRead(187_500)
+				s.scheduleDegradationLocked(clock.Now())
+			}
+			if closeFlow {
+				lease.Close()
+				clock.Advance(time.Second)
+				s.scheduleDegradationLocked(clock.Now())
+				lease = &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+				s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			} else {
+				for second := 1; second <= 9; second++ {
+					clock.Advance(time.Second)
+					s.scheduleDegradationLocked(clock.Now())
+					if second == 8 && s.degradation.coverage.duration != 18*time.Second {
+						t.Fatal("eight-second RTO stall reset coverage")
+					}
+				}
+			}
+			if s.degradation.episode != nil || s.degradation.coverage.duration != 0 {
+				t.Fatal("idle or closed flow retained suspicion coverage")
+			}
+			clock.Advance(time.Second)
+			lease.CountRead(187_500)
+			s.scheduleDegradationLocked(clock.Now())
+			for range 19 {
+				clock.Advance(time.Second)
+				lease.CountRead(187_500)
+				s.scheduleDegradationLocked(clock.Now())
+				if s.degradation.episode != nil {
+					t.Fatal("idle or closed flow reused old window")
+				}
+			}
+			clock.Advance(time.Second)
+			lease.CountRead(187_500)
+			s.scheduleDegradationLocked(clock.Now())
+			if s.degradation.episode == nil {
+				t.Fatal("fresh twenty-second window did not qualify")
+			}
+		})
+	}
+}
+
+func TestSmartDegradationStalledWindowRecoveryResets(t *testing.T) {
+	s, clock := smartDegradationTestGroup(t)
+	lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+	s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+	s.scheduleDegradationLocked(clock.Now())
+	for range 10 {
+		clock.Advance(time.Second)
+		lease.CountRead(187_500)
+		s.scheduleDegradationLocked(clock.Now())
+	}
+	for range 8 {
+		clock.Advance(time.Second)
+		s.scheduleDegradationLocked(clock.Now())
+	}
+	clock.Advance(time.Second)
+	lease.CountRead(1_562_500) // Exactly half of the default 25 Mbit/s target.
+	s.scheduleDegradationLocked(clock.Now())
+	for range 19 {
+		clock.Advance(time.Second)
+		lease.CountRead(187_500)
+		s.scheduleDegradationLocked(clock.Now())
+		if s.degradation.episode != nil {
+			t.Fatal("recovery sample was averaged into a stalled low-rate window")
+		}
+	}
+	clock.Advance(time.Second)
+	lease.CountRead(187_500)
+	s.scheduleDegradationLocked(clock.Now())
+	if s.degradation.episode == nil {
+		t.Fatal("fresh twenty-second window after recovery did not qualify")
 	}
 }

@@ -10,6 +10,8 @@ import (
 const (
 	smartDegradationConfirmation = "degradation-confirmation"
 	smartDegradationChallenger   = "degradation-challenger"
+	// Cover the 1, 2, and 4 second TCP RTO backoff steps without treating long idle periods as demand.
+	smartDegradationMaxStall = 8 * time.Second
 )
 
 type smartDegradationEpisode struct {
@@ -117,16 +119,23 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 	}
 	total := s.primary.passiveRead
 	flows := 0
+	var lastRead time.Time
 	for lease := range s.leases[s.primary] {
-		if lease.generation == s.generation && now.Sub(lease.started) >= 10*time.Second && now.Sub(lease.lastRead) <= 3*time.Second {
+		if lease.generation == s.generation && now.Sub(lease.started) >= 10*time.Second {
+			if lease.lastRead.After(lastRead) {
+				lastRead = lease.lastRead
+			}
 			flows++
 		}
 	}
-	if d.window.IsZero() || flows == 0 || now.Sub(d.sampled) > 3*time.Second {
+	if d.window.IsZero() || flows == 0 || now.Sub(lastRead) > smartDegradationMaxStall || now.Sub(d.sampled) > 3*time.Second {
 		d.window, d.sampled = now, now
 		d.previous = total
 		d.coverage = smartDegradationCoverage{}
 		d.flows = flows
+		if flows == 0 || now.Sub(lastRead) > smartDegradationMaxStall {
+			d.window = time.Time{}
+		}
 		return false
 	}
 	sampleInterval := now.Sub(d.sampled)
@@ -147,7 +156,7 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		d.state = "observing"
 		return false
 	}
-	qualified := d.coverage.active >= d.coverage.duration*9/10 && d.coverage.bytes >= 256*1024 && d.observed < s.targetMbps*.5
+	qualified := d.coverage.bytes >= 256*1024
 	if !qualified {
 		d.state = "observing"
 		return false
@@ -338,10 +347,10 @@ type smartDegradationSample struct {
 
 type smartDegradationCoverage struct {
 	// Samples are at least 500 ms, so 41 entries cover a partially trimmed 20 s window.
-	samples          [41]smartDegradationSample
-	head, count      int
-	duration, active time.Duration
-	bytes            float64
+	samples     [41]smartDegradationSample
+	head, count int
+	duration    time.Duration
+	bytes       float64
 }
 
 func (c *smartDegradationCoverage) add(duration time.Duration, bytes int64) {
@@ -349,18 +358,12 @@ func (c *smartDegradationCoverage) add(duration time.Duration, bytes int64) {
 	c.count++
 	c.duration += duration
 	c.bytes += float64(bytes)
-	if bytes > 0 {
-		c.active += duration
-	}
 	for c.duration > 20*time.Second {
 		oldest := &c.samples[c.head]
 		trim := min(oldest.duration, c.duration-20*time.Second)
 		removedBytes := oldest.bytes * float64(trim) / float64(oldest.duration)
 		c.duration -= trim
 		c.bytes -= removedBytes
-		if oldest.bytes > 0 {
-			c.active -= trim
-		}
 		oldest.bytes -= removedBytes
 		oldest.duration -= trim
 		if oldest.duration == 0 {
