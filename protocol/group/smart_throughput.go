@@ -31,9 +31,7 @@ func (s *Smart) startThroughputAdmissionLocked(member *smartMember, now time.Tim
 	}
 	s.admission = admission
 	ledger, networkType, offset := s.ledger, s.network.Type, s.network.Offset
-	s.admissionWorkers.Add(1)
-	go func() {
-		defer s.admissionWorkers.Done()
+	s.admissionWorkers.Go(func() {
 		id, capBytes, err := ledger.Reserve(ctx, networkType, now, offset)
 		admission.job.reservation, admission.job.capBytes = id, capBytes
 		result := smartResult{kind: "admission", admission: admission, err: err}
@@ -55,7 +53,7 @@ func (s *Smart) startThroughputAdmissionLocked(member *smartMember, now time.Tim
 		if !accepted && id != "" {
 			s.discardReservation(id)
 		}
-	}()
+	})
 }
 
 func (s *Smart) applyAdmissionLocked(result smartResult, now time.Time) {
@@ -94,13 +92,11 @@ func (s *Smart) discardReservation(id string) {
 	if id == "" || s.ledger == nil {
 		return
 	}
-	s.accountingWorkers.Add(1)
-	go func() {
-		defer s.accountingWorkers.Done()
+	s.accountingWorkers.Go(func() {
 		if err := s.reconcileReservation(id, 0, false); err != nil && s.logger != nil {
 			s.logger.Error("reconcile unstarted smart throughput test: ", err)
 		}
-	}()
+	})
 }
 
 func (s *Smart) discardBufferedJobsLocked() {
