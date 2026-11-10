@@ -137,7 +137,7 @@ func smartMeasureDegradationBody(ctx context.Context, body io.Reader, targetMbps
 			return
 		}
 		elapsed := clock.Now().Sub(start)
-		if elapsed <= 0 {
+		if elapsed < 2*time.Second {
 			return
 		}
 		var passiveBytes int64

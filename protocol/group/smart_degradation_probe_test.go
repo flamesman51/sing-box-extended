@@ -488,3 +488,36 @@ func TestSmartDegradationHTTPWarmupDeadlinePreservesSlowEvidence(t *testing.T) {
 		t.Fatalf("HTTP deadline discarded slow proof/accounting: rate=%f charged=%d err=%v", rate, charged, err)
 	}
 }
+
+func TestSmartDegradationLateHeadersDoNotConfirmSlow(t *testing.T) {
+	clock := smartDegradationTestClock()
+	base, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	ctx := smartDegradationExpiredContext{base}
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	var once sync.Once
+	dialer := &smartProbeTestDialer{httpHandler: func(conn net.Conn) {
+		defer close(finished)
+		defer conn.Close()
+		if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+			return
+		}
+		clock.Advance(29_900 * time.Millisecond)
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 8812500\r\nConnection: close\r\n\r\n")
+		select {
+		case <-started:
+		case <-ctx.Done():
+			return
+		}
+		_, _ = io.CopyN(conn, smartZeroReader{}, 1_000)
+		clock.Advance(100 * time.Millisecond)
+		cancel(context.DeadlineExceeded)
+	}}
+	passive := func() int64 { once.Do(func() { close(started) }); return 0 }
+	rate, charged, err := smartMeasureDegradation(ctx, dialer, "http://203.0.113.1/down?bytes={bytes}", 10_000_000, 25, passive, clock)
+	<-finished
+	if rate != 0 || charged <= 0 || !errors.Is(err, errSmartDegradationNoData) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("100 ms body after 29.9 s startup became slow evidence: rate=%f charged=%d err=%v", rate, charged, err)
+	}
+}
