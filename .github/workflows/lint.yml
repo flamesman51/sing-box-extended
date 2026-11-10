@@ -7,6 +7,7 @@ on:
       - stable
       - testing
       - unstable
+      - smart
     paths-ignore:
       - '**.md'
       - '.github/**'
