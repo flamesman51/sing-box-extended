@@ -152,13 +152,18 @@ type harnessStatus struct {
 		UDP              string   `json:"udp"`
 		QUIC             string   `json:"udp443"`
 		Download         *float64 `json:"download_mbps"`
+		Upload           *float64 `json:"upload_mbps"`
+		UploadStatus     string   `json:"upload_status"`
 		Source           string   `json:"throughput_source"`
 		At               int64    `json:"throughput_at"`
 		DownloadEvidence struct {
 			Window float64 `json:"window"`
 		} `json:"download"`
 		UploadEvidence struct {
-			Window float64 `json:"window"`
+			Window float64  `json:"window"`
+			Valid  bool     `json:"valid"`
+			Value  *float64 `json:"value"`
+			At     int64    `json:"at"`
 		} `json:"upload"`
 		UnderLoad struct {
 			Value float64 `json:"value"`
@@ -346,6 +351,7 @@ func TestSmartHarness(t *testing.T) {
 	owner := t
 	t.Cleanup(func() { t.Logf("real-component harness runtime: %s", time.Since(started)) })
 	client, members, config := newHarnessNetwork(t, []harnessLink{{tag: "fast", mbps: 20}, {tag: "medium", mbps: 5, delay: 10 * time.Millisecond}, {tag: "slow", mbps: 1.5, delay: 20 * time.Millisecond}}, 100, "2s")
+	initial := statusHarness(t, client)
 	requestHarness(t, client)
 	var calibrated harnessStatus
 	if !t.Run("initial_selection_after_calibration", func(t *testing.T) {
@@ -366,14 +372,32 @@ func TestSmartHarness(t *testing.T) {
 			if member.Tag == "fast" && rate < 10 || member.Tag != "fast" && rate >= 10 {
 				t.Fatalf("%s calibrated %.2f Mbit/s, inconsistent with configured link", member.Tag, rate)
 			}
-			if member.DownloadEvidence.Window != 7 || member.UploadEvidence.Window != 8 {
-				t.Fatalf("%s measurement windows: download=%gs upload=%gs, want 7s and 8s", member.Tag, member.DownloadEvidence.Window, member.UploadEvidence.Window)
+			if member.DownloadEvidence.Window != 7 || member.UploadEvidence.Valid && member.UploadEvidence.Window != 8 {
+				t.Fatalf("%s measurement windows: download=%gs upload=%gs valid=%v, want 7s and 8s for valid results", member.Tag, member.DownloadEvidence.Window, member.UploadEvidence.Window, member.UploadEvidence.Valid)
 			}
 		}
+		var uploaded int64
 		for i, fixture := range members {
-			if fixture.fixtures.uploads.Load() < 3 || fixture.fixtures.uploadBytes.Load() == 0 {
-				t.Fatalf("member %d lacks repeated receipt-verified uploads", i)
+			member := calibrated.Members[i]
+			posts, bytes := fixture.fixtures.uploads.Load(), fixture.fixtures.uploadBytes.Load()
+			uploaded += bytes
+			if posts < 1 || bytes == 0 || member.UploadEvidence.Valid && posts < 3 {
+				t.Fatalf("member %s lacks receipt-verified uploads: posts=%d bytes=%d valid=%v", member.Tag, posts, bytes, member.UploadEvidence.Valid)
 			}
+			// The 2 s POST cadence and delayed path's per-POST overhead can leave an inconclusive cohort.
+			if !member.UploadEvidence.Valid {
+				for _, previous := range initial.Members {
+					if previous.Tag == member.Tag && (member.UploadStatus != "inconclusive" || !reflect.DeepEqual(member.Upload, previous.Upload) || !reflect.DeepEqual(member.UploadEvidence, previous.UploadEvidence)) {
+						t.Fatalf("%s inconclusive upload replaced previous evidence: before=%+v after=%+v", member.Tag, previous, member)
+					}
+				}
+			}
+			if member.Tag == "fast" && !member.UploadEvidence.Valid {
+				t.Fatal("fast path did not complete a verified upload cohort")
+			}
+		}
+		if (calibrated.Budget.Used-initial.Budget.Used)*1_000_000 < float64(uploaded)*1.1 {
+			t.Fatalf("verified upload traffic, including inconclusive cohorts, was not charged: uploaded=%d budget=%+v", uploaded, calibrated.Budget)
 		}
 	}) {
 		return
