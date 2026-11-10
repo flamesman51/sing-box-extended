@@ -625,3 +625,52 @@ func TestSmartDegradationStalledWindowRecoveryResets(t *testing.T) {
 		t.Fatal("fresh twenty-second window after recovery did not qualify")
 	}
 }
+
+func TestSmartDegradationExtremeThrottlingByteFloor(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		sample  func(int) int
+		qualify bool
+	}{
+		{
+			name: "CI_16_KiB_every_one_or_two_seconds",
+			sample: func(second int) int {
+				if second%4 == 0 {
+					return 0
+				}
+				return 16 * 1024
+			},
+			qualify: true,
+		},
+		{
+			name:    "128_KiB_per_twenty_seconds",
+			sample:  func(second int) int { return second*128*1024/20 - (second-1)*128*1024/20 },
+			qualify: true,
+		},
+		{
+			name:   "16_kbit_trickle",
+			sample: func(int) int { return 2 * 1024 },
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			s, clock := smartDegradationTestGroup(t)
+			lease := &smartLease{group: s, member: s.primary, generation: s.generation, started: clock.Now().Add(-10 * time.Second), lastRead: clock.Now()}
+			s.leases[s.primary] = map[*smartLease]struct{}{lease: {}}
+			s.scheduleDegradationLocked(clock.Now())
+			for second := 1; second <= 60; second++ {
+				clock.Advance(time.Second)
+				lease.CountRead(scenario.sample(second))
+				s.scheduleDegradationLocked(clock.Now())
+				if s.degradation.episode != nil {
+					if !scenario.qualify || second != 20 {
+						t.Fatalf("unexpected suspicion after %d seconds", second)
+					}
+					return
+				}
+			}
+			if scenario.qualify {
+				t.Fatalf("extreme throttling never qualified: window bytes=%f", s.degradation.coverage.bytes)
+			}
+		})
+	}
+}

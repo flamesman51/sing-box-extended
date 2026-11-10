@@ -156,7 +156,7 @@ func (s *Smart) scheduleDegradationLocked(now time.Time) bool {
 		d.state = "observing"
 		return false
 	}
-	qualified := d.coverage.bytes >= 256*1024
+	qualified := d.coverage.bytes >= 128*1024
 	if !qualified {
 		d.state = "observing"
 		return false
