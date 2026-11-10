@@ -247,9 +247,28 @@ func TestSmartHarness(t *testing.T) {
 		members = append(members, harnessMember{fixtures: fixtures, relay: relay, faults: faults})
 	}
 	config := map[string]any{
-		"log":          map[string]any{"disabled": true},
-		"endpoints":    endpoints,
-		"outbounds":    []any{map[string]any{"type": "smart", "tag": "smart", "outbounds": []string{"fast", "medium", "slow"}, "probe": map[string]any{"disable_direct": true, "heartbeat_interval": "30s", "standby_interval": "30s", "background_interval": "45s", "timeout": "2s"}, "throughput": map[string]any{"target_mbps": 10, "download_url": "https://fixture.invalid/download?bytes={bytes}", "upload_url": "https://fixture.invalid/upload", "wifi_daily_budget_mb": 100, "cellular_daily_budget_mb": 100, "other_daily_budget_mb": 100}}},
+		"log":       map[string]any{"disabled": true},
+		"endpoints": endpoints,
+		"outbounds": []any{map[string]any{
+			"type":      "smart",
+			"tag":       "smart",
+			"outbounds": []string{"fast", "medium", "slow"},
+			"probe": map[string]any{
+				"disable_direct":      true,
+				"heartbeat_interval":  "30s",
+				"standby_interval":    "30s",
+				"background_interval": "30s",
+				"timeout":             "2s",
+			},
+			"throughput": map[string]any{
+				"target_mbps":              10,
+				"download_url":             "https://fixture.invalid/download?bytes={bytes}",
+				"upload_url":               "https://fixture.invalid/upload",
+				"wifi_daily_budget_mb":     100,
+				"cellular_daily_budget_mb": 100,
+				"other_daily_budget_mb":    100,
+			},
+		}},
 		"route":        map[string]any{"final": "smart"},
 		"experimental": map[string]any{"cache_file": map[string]any{"enabled": true, "path": filepath.Join(t.TempDir(), "cache.db")}},
 	}
