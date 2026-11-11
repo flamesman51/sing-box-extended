@@ -83,8 +83,10 @@ func TestSmartSTUNCancellationIsNotCompletedObservation(t *testing.T) {
 }
 
 func smartApplyRTTTestResult(s *Smart, member *smartMember, samples []float64, sizes []int, now time.Time) {
-	s.applyResultLocked(smartResult{member: member, kind: "udp", udpRTTs: samples, udpBursts: len(sizes), udpBurstSizes: sizes,
-		generation: s.generation, memberGeneration: member.generation, configGeneration: s.configGeneration}, now)
+	s.applyResultLocked(smartResult{
+		member: member, kind: "udp", udpRTTs: samples, udpBursts: len(sizes), udpBurstSizes: sizes,
+		generation: s.generation, memberGeneration: member.generation, configGeneration: s.configGeneration,
+	}, now)
 }
 
 func TestSmartRTTObservationMinimumsAndRollingCap(t *testing.T) {
@@ -147,8 +149,10 @@ func TestSmartRTTConfirmationUsesBurstAlone(t *testing.T) {
 		t.Fatal("three-reply burst did not count as one RTT observation")
 	}
 	clock.Advance(s.preference.confirmationInterval)
-	s.applyResultLocked(smartResult{member: candidate, kind: "tcp", rtt: time.Millisecond,
-		generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration}, clock.Now())
+	s.applyResultLocked(smartResult{
+		member: candidate, kind: "tcp", rtt: time.Millisecond,
+		generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration,
+	}, clock.Now())
 	if candidate.improvementObservations != 1 {
 		t.Fatal("TCP heartbeat advanced RTT confirmation")
 	}
@@ -187,7 +191,7 @@ func TestSmartRTTAndJitterScheduledConfirmationsSwitch(t *testing.T) {
 				t.Fatalf("initial %s observation did not enter confirmation: count=%d criterion=%s", criterion, candidate.improvementObservations, candidate.improvementCriterion)
 			}
 			clock.Advance(s.preference.confirmationInterval)
-			s.leases[primary] = map[*smartLease]struct{}{&smartLease{lastRead: clock.Now(), lastWrite: clock.Now()}: {}}
+			s.leases[primary] = map[*smartLease]struct{}{{lastRead: clock.Now(), lastWrite: clock.Now()}: {}}
 			if !s.scheduleImprovementConfirmationLocked(clock.Now()) {
 				t.Fatal("STUN-only confirmation required a throughput ledger")
 			}
@@ -219,8 +223,10 @@ func TestSmartRTTAndJitterScheduledConfirmationsSwitch(t *testing.T) {
 func TestSmartRTTAndQUICDiagnosticsAreSeparate(t *testing.T) {
 	s, clock := smartProfileTestGroup(t, "responsive")
 	member := s.primary
-	s.applyResultLocked(smartResult{member: member, kind: "udp443", rtt: 5 * time.Millisecond,
-		generation: s.generation, memberGeneration: member.generation, configGeneration: s.configGeneration}, clock.Now())
+	s.applyResultLocked(smartResult{
+		member: member, kind: "udp443", rtt: 5 * time.Millisecond,
+		generation: s.generation, memberGeneration: member.generation, configGeneration: s.configGeneration,
+	}, clock.Now())
 	if len(member.udpRTTs) != 0 || len(member.quicRTTs) != 1 || member.quicRTTs[0] != 5 || !member.udpObservation.At.IsZero() {
 		t.Fatal("QUIC diagnostic RTT leaked into generic STUN evidence")
 	}
@@ -358,10 +364,12 @@ func TestSmartSTUNConfirmationBlocksOverlappingAdmission(t *testing.T) {
 				t.Fatal("regular admission cancelled or overlapped the live STUN confirmation")
 			}
 			s.pending = nil
-			s.applyResultLocked(smartResult{member: candidate, kind: job.kind, purpose: job.purpose,
+			s.applyResultLocked(smartResult{
+				member: candidate, kind: job.kind, purpose: job.purpose,
 				udpRTTs: []float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, udpBursts: 2, udpBurstSizes: []int{5, 5},
 				generation: job.generation, memberGeneration: job.memberGeneration, configGeneration: job.configGeneration,
-				primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch}, clock.Now())
+				primaryEpoch: job.primaryEpoch, improvementEpoch: job.improvementEpoch,
+			}, clock.Now())
 			s.startThroughputAdmissionLocked(candidate, clock.Now())
 			if s.admission == nil {
 				t.Fatal("completed STUN confirmation blocked regular admission")

@@ -132,11 +132,13 @@ func (m *smartMeasureMeter) account(allowed, actual int) {
 }
 
 func (m *smartMeasureMeter) available() int64 { m.mu.Lock(); defer m.mu.Unlock(); return m.remaining }
+
 func (m *smartMeasureMeter) chargedBytes() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.used + m.used/10 + (m.used%10+9)/10
 }
+
 func (m *smartMeasureMeter) exhausted() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

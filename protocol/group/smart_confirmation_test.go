@@ -730,8 +730,10 @@ func TestSmartDirectConfirmationSourcesExcludeTCP(t *testing.T) {
 				t.Fatalf("initial %s observation missing", criterion)
 			}
 			clock.Advance(s.preference.confirmationInterval)
-			s.applyResultLocked(smartResult{member: candidate, kind: "tcp", rtt: time.Millisecond,
-				generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration}, clock.Now())
+			s.applyResultLocked(smartResult{
+				member: candidate, kind: "tcp", rtt: time.Millisecond,
+				generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration,
+			}, clock.Now())
 			if candidate.improvementObservations != 1 || s.primary != primary {
 				t.Fatalf("TCP heartbeat advanced %s confirmation", criterion)
 			}
@@ -763,8 +765,10 @@ func TestSmartHistoricalConfirmationsRecomputeEstimates(t *testing.T) {
 			for observation := 2; observation <= 3; observation++ {
 				clock.Advance(s.preference.confirmationInterval)
 				// A single slow check is not the historical spread estimate.
-				s.applyResultLocked(smartResult{member: candidate, kind: "tcp", rtt: 100 * time.Millisecond,
-					generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration}, clock.Now())
+				s.applyResultLocked(smartResult{
+					member: candidate, kind: "tcp", rtt: 100 * time.Millisecond,
+					generation: s.generation, memberGeneration: candidate.generation, configGeneration: s.configGeneration,
+				}, clock.Now())
 				if observation < 3 && candidate.improvementObservations != observation {
 					t.Fatalf("%s observation count=%d want=%d", criterion, candidate.improvementObservations, observation)
 				}
@@ -788,7 +792,9 @@ func TestSmartUploadMarginAndIndependentFreshness(t *testing.T) {
 		age    time.Duration
 		better bool
 	}{
-		{100, false, 0, false}, {4.9, true, 0, false}, {5, true, 0, true},
+		{100, false, 0, false},
+		{4.9, true, 0, false},
+		{5, true, 0, true},
 		{100, true, 24 * time.Hour, false},
 	} {
 		candidate.throughput.UploadResult = smartDirectionResult{Value: test.value, At: clock.Now().Add(-test.age), Valid: test.valid}

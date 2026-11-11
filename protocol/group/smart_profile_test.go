@@ -34,9 +34,12 @@ func TestSmartProfileBalanceRanking(t *testing.T) {
 		fast    float64
 		want    string
 	}{
-		{"balance-speed-4k", 30, "b"}, {"server", 30, "b"},
-		{"default", 30, "a"}, {"stability-downtime", 30, "a"},
-		{"balance-speed-4k", 20, "b"}, {"server", 20, "b"},
+		{"balance-speed-4k", 30, "b"},
+		{"server", 30, "b"},
+		{"default", 30, "a"},
+		{"stability-downtime", 30, "a"},
+		{"balance-speed-4k", 20, "b"},
+		{"server", 20, "b"},
 	} {
 		t.Run(fmt.Sprintf("%s/%g", test.profile, test.fast), func(t *testing.T) {
 			s, clock := smartProfileTestGroup(t, test.profile)
@@ -464,10 +467,14 @@ func TestSmartProfileRTTEvidenceMinimums(t *testing.T) {
 		count     int
 		known     bool
 	}{
-		{"latency", 2, false}, {"latency", 3, true},
-		{"rtt_spread", 7, false}, {"rtt_spread", 8, true},
-		{"rtt", 4, false}, {"rtt", 5, true},
-		{"jitter", 9, false}, {"jitter", 10, true},
+		{"latency", 2, false},
+		{"latency", 3, true},
+		{"rtt_spread", 7, false},
+		{"rtt_spread", 8, true},
+		{"rtt", 4, false},
+		{"rtt", 5, true},
+		{"jitter", 9, false},
+		{"jitter", 10, true},
 	} {
 		t.Run(fmt.Sprintf("%s/%d", test.criterion, test.count), func(t *testing.T) {
 			member.rtts = make([]float64, test.count)

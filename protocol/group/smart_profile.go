@@ -107,6 +107,7 @@ func smartBoolCompare(a, b bool) int {
 	}
 	return 1
 }
+
 func (s *Smart) profileCriterionCompareLocked(a, b *smartMember, criterion string, now time.Time) int {
 	switch criterion {
 	case "stability":
