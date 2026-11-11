@@ -66,6 +66,43 @@ Compare stack counts, not only the process total: a running WireGuard endpoint
 normally owns several gVisor and crypto workers. Profiles can contain private
 paths and connection metadata; inspect locally and redact before sharing.
 
+## Integration tests
+
+The `test/` directory is a separate Go module. It uses this checkout of the core
+and the same published dependency forks as the main module; sibling checkouts
+are not required. From the repository root:
+
+```sh
+export GOTOOLCHAIN=go1.26.8
+tags=with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_trusttunnel,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
+(cd test && go test -count=1 -v -timeout=15m -ldflags=-checklinkname=0 -tags "$tags" .)
+```
+
+This tag set covers the tested protocols without generated admin-panel assets.
+The optional `with_naive_outbound` tests additionally require the
+[Cronet build toolchain](https://github.com/sagernet/cronet-go#linux-build-instructions)
+on Linux; they are not required for the portable integration run.
+
+Use `-run '^$'` to compile without running tests. The package initializer still
+checks Docker and pulls missing interoperability images when a daemon is
+available. Docker interoperability tests require a daemon and image downloads;
+OpenVPN/OpenConnect container tests also need container TUN/NET_ADMIN support.
+Do not run them against a production VPN or grant the test process root access.
+The self-to-self and endpoint UDP NAT tests use loopback and userspace network
+stacks, not host TUN devices.
+
+Brutal tests require the `tcp-brutal` kernel module; kTLS tests require kernel
+TLS support to be loaded. Missing kernel support is an environment failure,
+not a reason to load modules or change the workstation's network setup.
+
+For an offline run, add
+`-skip '^(TestTUICDomainUDP|TestReality|TestKTLSReality|TestBrutalVLESS)$'`:
+these tests contact external QUIC or Reality handshake servers. Without Docker,
+legacy interoperability tests report daemon connection failures, while newer
+OpenVPN/OpenConnect tests skip missing prerequisites. OpenConnect Docker
+interoperability additionally requires `OPENCONNECT_IT=1`.
+Keep these environment failures separate from self-to-self protocol failures.
+
 ## Formatting
 
 Run `golangci-lint fmt ./...` from the repository root to apply the gci and
