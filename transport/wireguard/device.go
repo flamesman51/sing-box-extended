@@ -7,6 +7,7 @@ import (
 
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/wireguard-go/device"
@@ -49,4 +50,28 @@ func NewDevice(options DeviceOptions) (Device, error) {
 	} else {
 		return newSystemStackDevice(options)
 	}
+}
+
+func validateDeviceOptions(options DeviceOptions) error {
+	if !tun.WithGVisor {
+		if !options.System {
+			_, err := newStackDevice(options)
+			return err
+		}
+		return nil
+	}
+	for index, prefix := range options.Address {
+		if !prefix.IsValid() {
+			return E.New("invalid local address")
+		}
+		if prefix.Addr() == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+			return E.New("parse local address ", prefix, ": duplicate address")
+		}
+		for _, previous := range options.Address[:index] {
+			if prefix.Addr() == previous.Addr() {
+				return E.New("parse local address ", prefix, ": duplicate address")
+			}
+		}
+	}
+	return nil
 }

@@ -7,6 +7,65 @@
 
 Sing-box with extended features.
 
+## Off-phone goroutine debugging
+
+The validation regression runs on Linux without Android, root, a TUN interface,
+credentials, or a real relay. It generates temporary WireGuard keys and uses
+loopback blackholes. The optional lifecycle lab requires an ignored private
+configuration and exercises libbox gRPC status/group subscriptions, Smart status
+queries, reconnects, and box shutdown. It rejects TUN, system WireGuard devices,
+non-loopback listeners, and services.
+
+```sh
+export GOTOOLCHAIN=go1.26.8
+tags=with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0
+GOROUTINE_LAB_OUTPUT=/tmp/sing-box-goroutines \
+  go test -count=1 -v -ldflags=-checklinkname=0 -tags "$tags" \
+  ./experimental/libbox -run '^TestGoroutine(CheckConfig|Lifecycle)Lab$'
+```
+
+`TestGoroutineCheckConfigLab` repeats successful and failed configuration
+validation with 13 WireGuard endpoints. Before the fix, each successful
+validation left 78 gVisor TCP processor goroutines on a six-CPU runtime; VPN
+restart could not release them because validation never starts the endpoint's
+cleanup scope. Remote profile refresh validates even unchanged content. Device
+allocation now happens in `Start`, while constructor validation remains
+resource-free. Twenty successful validations previously grew from 4 to 1,564
+goroutines on a six-CPU runtime; the fixed validation loop stays at its baseline.
+Device access is published only after startup completes. Dials and packet
+listeners before startup or after shutdown return `WireGuard device is not ready`;
+invalid non-IP destinations retain their existing validation error. Local-address
+validation and missing-gVisor errors still fail construction, while operating
+system device creation errors occur during startup.
+
+For a longer lifecycle experiment, set `GOROUTINE_LAB_CONFIG`,
+`GOROUTINE_LAB_CYCLES`, `GOROUTINE_LAB_DWELL` (a Go duration), and
+`GOROUTINE_LAB_EVENTS=1` to exercise device pause/wake and network resets. The
+output directory receives active profiles per cycle, a final stopped profile,
+and the validation profile. Shutdown waits up to five seconds for asynchronous
+workers to return within five goroutines of baseline.
+
+`GOROUTINE_LAB_CONFIG` points to an ignored private JSON file, for example under
+`build/`. An unset variable or missing file skips the lifecycle test; the
+synthetic validation regression still runs.
+WireGuard tests require a separate device/key, never a phone's or another
+active client's key. A loopback mixed inbound plus
+`GOROUTINE_LAB_PROXY=http://127.0.0.1:21880` enables repeated HTTPS traffic;
+`experimental.debug.listen` on loopback exposes `/debug/pprof/goroutine?debug=1`
+during the run. Do not reuse a production TUN configuration.
+
+```sh
+GOROUTINE_LAB_CONFIG="$PWD/build/leak-lab.json" \
+GOROUTINE_LAB_OUTPUT=/tmp/sing-box-goroutines \
+GOROUTINE_LAB_CYCLES=2 GOROUTINE_LAB_DWELL=30s GOROUTINE_LAB_EVENTS=1 \
+  go test -count=1 -v -ldflags=-checklinkname=0 -tags "$tags" \
+  ./experimental/libbox -run '^TestGoroutineLifecycleLab$'
+```
+
+Compare stack counts, not only the process total: a running WireGuard endpoint
+normally owns several gVisor and crypto workers. Profiles can contain private
+paths and connection metadata; inspect locally and redact before sharing.
+
 ## Formatting
 
 Run `golangci-lint fmt ./...` from the repository root to apply the gci and

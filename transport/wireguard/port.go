@@ -11,7 +11,15 @@ import (
 )
 
 func (e *Endpoint) PortAddresses() (netip.Addr, netip.Addr) {
-	return e.tunDevice.Inet4Address(), e.tunDevice.Inet6Address()
+	var inet4, inet6 netip.Addr
+	for _, prefix := range e.options.Address {
+		if prefix.Addr().Is4() && (!e.options.System || !inet4.IsValid()) {
+			inet4 = prefix.Addr()
+		} else if prefix.Addr().Is6() && (!e.options.System || !inet6.IsValid()) {
+			inet6 = prefix.Addr()
+		}
+	}
+	return inet4, inet6
 }
 
 func (e *Endpoint) PortMTU() uint32 {
@@ -19,10 +27,10 @@ func (e *Endpoint) PortMTU() uint32 {
 }
 
 func (e *Endpoint) WritePackets(packets [][]byte) error {
-	wgDevice := e.device
-	if wgDevice == nil {
+	if !e.started.Load() {
 		return E.New("WireGuard device is not ready")
 	}
+	wgDevice := e.device
 	packetRefs := make([]*device.InputPacketRef, 0, len(packets))
 	refs := make([]device.InputPacketRef, len(packets))
 	packetSlices := make([][]byte, len(packets))
@@ -64,13 +72,14 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 		return nil
 	}
 	var replies [][]byte
+	inet4, inet6 := e.PortAddresses()
 	for _, packetRef := range unmatchedRefs {
 		packet := packetRef.PacketSlices[0]
 		var source netip.Addr
 		if header.IPVersion(packet) == header.IPv4Version {
-			source = e.tunDevice.Inet4Address()
+			source = inet4
 		} else {
-			source = e.tunDevice.Inet6Address()
+			source = inet6
 		}
 		reply, replyOk := tun.BuildUnreachable(packet, source, state.headroom)
 		if replyOk {

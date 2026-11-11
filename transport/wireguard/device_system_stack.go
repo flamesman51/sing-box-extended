@@ -60,6 +60,8 @@ func newSystemStackDevice(options DeviceOptions) (*systemStackDevice, error) {
 		}
 		gErr := ipStack.AddProtocolAddress(tun.DefaultNIC, protoAddr, stack.AddressProperties{})
 		if gErr != nil {
+			ipStack.Close()
+			ipStack.Wait()
 			return nil, E.New("parse local address ", protoAddr.AddressWithPrefix, ": ", gErr.String())
 		}
 	}

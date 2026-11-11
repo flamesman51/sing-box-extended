@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-tun"
@@ -33,7 +34,9 @@ type Endpoint struct {
 	peers          []peerConfig
 	ipcConf        string
 	allowedAddress []netip.Prefix
+	started        atomic.Bool
 	tunDevice      Device
+	deviceOptions  DeviceOptions
 	returnDevice   *returnDeviceWrapper
 	device         *device.Device
 	allowedIPs     *device.AllowedIPs
@@ -114,8 +117,7 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		Address:         options.Address,
 		AllowedAddress:  allowedAddresses,
 	}
-	tunDevice, err := NewDevice(deviceOptions)
-	if err != nil {
+	if err = validateDeviceOptions(deviceOptions); err != nil {
 		return nil, E.Cause(err, "create WireGuard device")
 	}
 	return &Endpoint{
@@ -123,8 +125,8 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		peers:          peers,
 		ipcConf:        ipcConf,
 		allowedAddress: allowedAddresses,
-		tunDevice:      tunDevice,
-		returnDevice:   &returnDeviceWrapper{Device: tunDevice},
+		deviceOptions:  deviceOptions,
+		returnDevice:   new(returnDeviceWrapper),
 	}, nil
 }
 
@@ -151,6 +153,18 @@ func (e *Endpoint) Start(postStart bool) error {
 	if postStart != hasDomainPeer {
 		return nil
 	}
+	// Configuration checks construct endpoints without starting their cleanup scope.
+	tunDevice, err := NewDevice(e.deviceOptions)
+	if err != nil {
+		return E.Cause(err, "create WireGuard device")
+	}
+	e.returnDevice.Device = tunDevice
+	started := false
+	defer func() {
+		if !started {
+			tunDevice.Close()
+		}
+	}()
 	var bind conn.Bind
 	udpListener, isUDPListener := common.Cast[dialer.UDPListener](e.options.Dialer)
 	if isUDPListener {
@@ -167,7 +181,7 @@ func (e *Endpoint) Start(postStart bool) error {
 		}
 		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr)
 	}
-	err := e.tunDevice.Start()
+	err = tunDevice.Start()
 	if err != nil {
 		return err
 	}
@@ -180,7 +194,12 @@ func (e *Endpoint) Start(postStart bool) error {
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers, e.options.PreallocatedBuffersPerPool, e.options.DisablePauses)
-	e.tunDevice.SetDevice(wgDevice)
+	defer func() {
+		if !started {
+			wgDevice.Close()
+		}
+	}()
+	tunDevice.SetDevice(wgDevice)
 	domainPeers := make(map[device.NoisePublicKey]*peerConfig)
 	for peerIndex, peer := range e.peers {
 		if !peer.destination.IsDomain() {
@@ -189,7 +208,6 @@ func (e *Endpoint) Start(postStart bool) error {
 		var publicKey device.NoisePublicKey
 		err = publicKey.FromHex(peer.publicKeyHex)
 		if err != nil {
-			wgDevice.Close()
 			return E.Cause(err, "decode public key for peer ", peerIndex)
 		}
 		domainPeers[publicKey] = &e.peers[peerIndex]
@@ -306,12 +324,10 @@ func (e *Endpoint) Start(postStart bool) error {
 	// goroutine bound it later, it would only log the error and reset the port to 0.
 	err = wgDevice.Up()
 	if err != nil {
-		wgDevice.Close()
 		return E.Cause(err, "start wireguard device")
 	}
 	err = wgDevice.IpcSet(ipcConf.String())
 	if err != nil {
-		wgDevice.Close()
 		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
 	}
 	e.device = wgDevice
@@ -320,12 +336,19 @@ func (e *Endpoint) Start(postStart bool) error {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
 	}
 	e.allowedIPs = wgDevice.AllowedIPs()
+	e.tunDevice = tunDevice
+	started = true
+	// Publish immutable device fields only after initialization is complete.
+	e.started.Store(true)
 	return nil
 }
 
 func (e *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
+	}
+	if !e.started.Load() {
+		return nil, E.New("WireGuard device is not ready")
 	}
 	return e.tunDevice.DialContext(ctx, network, destination)
 }
@@ -334,10 +357,16 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
+	if !e.started.Load() {
+		return nil, E.New("WireGuard device is not ready")
+	}
 	return e.tunDevice.ListenPacket(ctx, destination)
 }
 
 func (e *Endpoint) Close() error {
+	if !e.started.Swap(false) {
+		return nil
+	}
 	if e.pauseCallback != nil {
 		e.pause.UnregisterCallback(e.pauseCallback)
 		e.pauseCallback = nil
@@ -346,30 +375,29 @@ func (e *Endpoint) Close() error {
 		e.egressPool.Close()
 		e.egressPool = nil
 	}
-	if e.device != nil {
-		e.device.Down()
-		e.device.Close()
-		e.device = nil
-		return nil
-	}
-	return e.tunDevice.Close()
+	e.device.Down()
+	e.device.Close()
+	return nil
 }
 
 func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
-	if e.allowedIPs == nil {
+	if !e.started.Load() {
 		return nil
 	}
 	return e.allowedIPs.LookupFromPacket(netip.Addr{}, address, nil)
 }
 
 func (e *Endpoint) BindUpdate() error {
-	if e.device == nil {
+	if !e.started.Load() {
 		return nil
 	}
 	return e.device.BindUpdate()
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
+	if !e.started.Load() {
+		return
+	}
 	switch event {
 	case pause.EventNetworkPause:
 		e.device.Down()
