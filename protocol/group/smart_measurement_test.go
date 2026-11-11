@@ -77,6 +77,9 @@ func (s *smartMeasurementServer) serve(conn net.Conn) {
 		}
 		if s.receipt == "early" {
 			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			// Closing with unread body bytes sends a RST, which on Windows
+			// can discard the response before the client reads it.
+			_, _ = io.Copy(io.Discard, request.Body)
 			return
 		}
 		size := request.ContentLength

@@ -89,7 +89,7 @@ func TestSmartMeasurementDirectionsPreservedAndRestoredIndependently(t *testing.
 		t.Fatal(err)
 	}
 	s.restoreThroughputLocked(now.Add(time.Minute))
-	if s.primary.throughput.DownloadResult != freshDown || s.primary.throughput.UploadResult != up || !s.primary.throughput.UploadInconclusive {
+	if !smartSameDirectionResult(s.primary.throughput.DownloadResult, freshDown) || !smartSameDirectionResult(s.primary.throughput.UploadResult, up) || !s.primary.throughput.UploadInconclusive {
 		t.Fatal("independent results did not round trip")
 	}
 	plan = s.regularMeasurementPlanLocked(s.primary, now.Add(time.Minute))
@@ -372,7 +372,17 @@ func TestSmartMigratedLegacyUploadSurvivesVerifiedReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.restoreThroughputLocked(now)
-	if s.primary.throughput.LegacyUpload != 10 || s.primary.throughput.UploadResult != verified {
+	if s.primary.throughput.LegacyUpload != 10 || !smartSameDirectionResult(s.primary.throughput.UploadResult, verified) {
 		t.Fatalf("verified replacement lost migrated diagnostic: %+v", s.primary.throughput)
 	}
+}
+
+// A JSON round trip keeps the instant but not the Location: a Local time in a
+// UTC zone encodes as "Z" and decodes as UTC.
+func smartSameDirectionResult(a, b smartDirectionResult) bool {
+	if !a.At.Equal(b.At) {
+		return false
+	}
+	a.At = b.At
+	return a == b
 }
