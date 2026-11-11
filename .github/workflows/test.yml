@@ -31,10 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The fork ships Linux and Android only; other runners tripped GitHub's fork usage limit.
         os:
           - ubuntu-latest
-          - windows-latest
-          - macos-latest
         go:
           - ~1.25
           - ~1.26
@@ -56,21 +55,16 @@ jobs:
           echo "TEST_PACKAGES=$(go list ./... | grep -v /smartharness | tr '\n' ' ')" >> "$GITHUB_ENV"
           # Upstream sudoku test, flaky on every runner OS.
           echo "TEST_SKIP=^TestSession_LargeTransferBackpressure$" >> "$GITHUB_ENV"
-      - name: Test (unix)
-        if: matrix.os != 'windows-latest'
+      - name: Test
         run: go test -v -exec sudo -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" -skip "$TEST_SKIP" $TEST_PACKAGES
-      - name: Test (windows)
-        if: matrix.os == 'windows-latest'
-        shell: bash
-        run: go test -v -tags "$BUILD_TAGS" -ldflags "$LDFLAGS_SHARED" -skip "$TEST_SKIP" $TEST_PACKAGES
       - name: Smart unit tests (race)
-        if: matrix.os == 'ubuntu-latest' && matrix.go == '~1.26'
+        if: matrix.go == '~1.26'
         env:
           GOTOOLCHAIN: go1.26.8
         run: go test -race -count=1 -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0 ./protocol/group/ ./transport/wireguard/
       # Two-core runners cannot carry the throughput scenarios under -race; local acceptance runs them with it.
       - name: Smart real-component harness
-        if: matrix.os == 'ubuntu-latest' && matrix.go == '~1.26'
+        if: matrix.go == '~1.26'
         env:
           GOTOOLCHAIN: go1.26.8
         run: go test -count=1 -timeout=15m -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,badlinkname,tfogo_checklinkname0 ./protocol/group/smartharness/

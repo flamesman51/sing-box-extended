@@ -30,13 +30,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The fork ships Linux and Android only.
         include:
-          - goos: windows
-            goarch: amd64
-          - goos: windows
-            goarch: '386'
-          - goos: windows
-            goarch: arm64
           - goos: linux
             goarch: amd64
           - goos: linux
@@ -45,14 +40,8 @@ jobs:
             goarch: arm
           - goos: linux
             goarch: '386'
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
           - goos: android
             goarch: arm64
-        #  - goos: freebsd
-        #    goarch: amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
