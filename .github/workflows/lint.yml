@@ -1,23 +1,15 @@
 name: Lint
 
+# Manual only: GitHub paused this fork's Actions for usage, so pushes rely on local
+# lint and CI runs deliberately before a release.
 on:
-  push:
-    branches:
-      - oldstable
-      - stable
-      - testing
-      - unstable
-      - smart
-    paths-ignore:
-      - '**.md'
-      - '.github/**'
-      - '!.github/workflows/lint.yml'
-  pull_request:
-    branches:
-      - oldstable
-      - stable
-      - testing
-      - unstable
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Report only issues introduced after this revision"
+        required: true
+        default: "HEAD~1"
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.build }}
@@ -64,8 +56,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         with:
           version: latest
-          args: --timeout=30m
+          # Inherited fork code carries ~1000 findings; gate only what changed since `since`.
+          args: --timeout=30m --new-from-rev=${{ inputs.since }}
           install-mode: binary
           verify: false
-          # Inherited fork code carries ~1000 findings; gate only what each push changes.
-          only-new-issues: true

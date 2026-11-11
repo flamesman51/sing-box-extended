@@ -1,25 +1,9 @@
 name: Test
 
+# Manual only: GitHub paused this fork's Actions for usage, so pushes rely on local
+# tests and CI runs deliberately before a release.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - oldstable
-      - stable
-      - testing
-      - unstable
-      - smart
-    paths-ignore:
-      - '**.md'
-      - '.github/**'
-      - '!.github/workflows/test.yml'
-  pull_request:
-    branches:
-      - oldstable
-      - stable
-      - testing
-      - unstable
-      - smart
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.build }}
