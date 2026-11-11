@@ -7,11 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AliRizaAynaci/gorl/v2"
-	"github.com/AliRizaAynaci/gorl/v2/core"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/AliRizaAynaci/gorl/v2"
+	"github.com/AliRizaAynaci/gorl/v2/core"
 	"github.com/shtorm-7/go-cache/v2"
 )
 

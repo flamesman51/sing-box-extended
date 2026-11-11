@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"strings"
 
-	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
@@ -19,6 +18,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
+
+	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/yosida95/uritemplate/v3"
 )
 

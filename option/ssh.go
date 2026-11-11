@@ -15,12 +15,12 @@ type SSHInboundOptions struct {
 type SSHFallbackServerOptions struct {
 	DialerOptions
 	ServerOptions
-	CA                     *SSHCAOptions              `json:"ca,omitempty"`
-	IssueCA                *SSHCAOptions              `json:"issue_ca,omitempty"`
-	HostKey                badoption.Listable[string] `json:"host_key,omitempty"`
-	HostKeyPath            badoption.Listable[string] `json:"host_key_path,omitempty"`
-	HostKeyAlgorithms      badoption.Listable[string] `json:"host_key_algorithms,omitempty"`
-	ClientVersion          string                     `json:"client_version,omitempty"`
+	CA                *SSHCAOptions              `json:"ca,omitempty"`
+	IssueCA           *SSHCAOptions              `json:"issue_ca,omitempty"`
+	HostKey           badoption.Listable[string] `json:"host_key,omitempty"`
+	HostKeyPath       badoption.Listable[string] `json:"host_key_path,omitempty"`
+	HostKeyAlgorithms badoption.Listable[string] `json:"host_key_algorithms,omitempty"`
+	ClientVersion     string                     `json:"client_version,omitempty"`
 }
 
 type SSHCAOptions struct {

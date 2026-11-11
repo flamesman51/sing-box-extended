@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/sagernet/sing-box/option"
+
 	"golang.org/x/net/http2/hpack"
 )
 

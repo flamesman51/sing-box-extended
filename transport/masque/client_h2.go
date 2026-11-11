@@ -13,11 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/quic-go/quicvarint"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
 
-	"github.com/sagernet/quic-go/quicvarint"
 	"github.com/yosida95/uritemplate/v3"
 	"golang.org/x/net/http2"
 )

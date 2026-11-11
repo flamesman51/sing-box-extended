@@ -130,9 +130,7 @@ func (c *streamSplitConn) pullLoop() {
 		maxBackoff    = 250 * time.Millisecond
 	)
 
-	var (
-		backoff = minBackoff
-	)
+	backoff := minBackoff
 	buf := make([]byte, readChunkSize)
 	for {
 		select {

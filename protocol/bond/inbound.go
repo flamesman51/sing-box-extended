@@ -5,7 +5,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/kmutex"
@@ -17,6 +16,8 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/shtorm-7/go-cache/v2"
 )
 

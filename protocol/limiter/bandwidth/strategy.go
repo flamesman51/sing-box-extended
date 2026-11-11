@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/common/onclose"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
+
 	"golang.org/x/time/rate"
 )
 

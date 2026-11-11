@@ -4,9 +4,6 @@ import (
 	"context"
 	"net"
 
-	"github.com/dolonet/mtg-multi/antireplay"
-	"github.com/dolonet/mtg-multi/events"
-	"github.com/dolonet/mtg-multi/mtglib"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
@@ -16,6 +13,10 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
+
+	"github.com/dolonet/mtg-multi/antireplay"
+	"github.com/dolonet/mtg-multi/events"
+	"github.com/dolonet/mtg-multi/mtglib"
 )
 
 func RegisterInbound(registry *inbound.Registry) {

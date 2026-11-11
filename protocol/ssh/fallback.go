@@ -318,5 +318,3 @@ func proxyChannelRequests(requests <-chan *ssh.Request, target ssh.Channel) {
 		}
 	}
 }
-
-

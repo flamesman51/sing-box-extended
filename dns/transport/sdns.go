@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ameshkov/dnscrypt/v2"
-	mDNS "github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
@@ -15,6 +13,9 @@ import (
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	"github.com/ameshkov/dnscrypt/v2"
+	mDNS "github.com/miekg/dns"
 )
 
 var _ adapter.DNSTransport = (*SDNSTransport)(nil)

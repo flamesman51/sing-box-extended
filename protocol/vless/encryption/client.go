@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/sing-box/common/xray/cpuid"
 	E "github.com/sagernet/sing/common/exceptions"
+
 	"lukechampine.com/blake3"
 )
 

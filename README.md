@@ -7,6 +7,12 @@
 
 Sing-box with extended features.
 
+## Formatting
+
+Run `golangci-lint fmt ./...` from the repository root to apply the gci and
+gofumpt settings in `.golangci.yml`. Check formatting without changing files
+with `golangci-lint fmt --diff ./...`.
+
 ## 🔥 Features
 
 ### Protocols

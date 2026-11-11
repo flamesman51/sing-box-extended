@@ -26,6 +26,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
+
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 

@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	C "github.com/sagernet/sing-box/constant"
@@ -17,6 +16,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
 	"github.com/sagernet/sing/service"
+
+	"github.com/gofrs/uuid/v5"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {

@@ -7,11 +7,12 @@ import (
 	"errors"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/huandu/go-sqlbuilder"
 	"github.com/sagernet/sing-box/common/sql"
 	"github.com/sagernet/sing-box/service/manager/constant"
 	"github.com/sagernet/sing/common/byteformats"
+
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/huandu/go-sqlbuilder"
 	_ "modernc.org/sqlite"
 )
 
@@ -457,6 +458,7 @@ func (r *SQLiteRepository) GetNode(uuid string) (constant.Node, error) {
 	n.SquadIDs = []int(squadIDs)
 	return n, notFoundErr(err)
 }
+
 func (r *SQLiteRepository) UpdateNode(uuid string, node constant.NodeUpdate) (constant.Node, error) {
 	var n constant.Node
 	err := r.db.QueryRowContext(
@@ -2165,7 +2167,8 @@ func (r *SQLiteRepository) DeleteRateLimiter(id int) (constant.RateLimiter, erro
 }
 
 func init() {
-	squadFilters = map[string]sql.Filter{"id": sql.EqualFilter("id"),
+	squadFilters = map[string]sql.Filter{
+		"id":               sql.EqualFilter("id"),
 		"id_in":            sql.InFilter("id"),
 		"pk":               sql.EqualFilter("id"),
 		"name":             sql.EqualFilter("name"),
@@ -2176,8 +2179,10 @@ func init() {
 		"sort_asc":         sql.SortAscFilter([]string{"id", "name", "created_at", "updated_at"}),
 		"sort_desc":        sql.SortDescFilter([]string{"id", "name", "created_at", "updated_at"}),
 		"offset":           sql.OffsetFilter(),
-		"limit":            sql.LimitFilter()}
-	nodeFilters = map[string]sql.Filter{"uuid": sql.EqualFilter("uuid"),
+		"limit":            sql.LimitFilter(),
+	}
+	nodeFilters = map[string]sql.Filter{
+		"uuid": sql.EqualFilter("uuid"),
 		"pk":   sql.EqualFilter("uuid"),
 		"name": sql.EqualFilter("name"),
 		"squad_id_in": sql.ExistsAndWhereInFilter(func() *sqlbuilder.SelectBuilder {
@@ -2199,8 +2204,10 @@ func init() {
 		"sort_asc":         sql.SortAscFilter([]string{"uuid", "name", "created_at", "updated_at"}),
 		"sort_desc":        sql.SortDescFilter([]string{"uuid", "name", "created_at", "updated_at"}),
 		"offset":           sql.OffsetFilter(),
-		"limit":            sql.LimitFilter()}
-	userFilters = map[string]sql.Filter{"id": sql.EqualFilter("id"),
+		"limit":            sql.LimitFilter(),
+	}
+	userFilters = map[string]sql.Filter{
+		"id": sql.EqualFilter("id"),
 		"pk": sql.EqualFilter("id"),
 		"squad_id_in": sql.ExistsAndWhereInFilter(func() *sqlbuilder.SelectBuilder {
 			return sqlbuilder.SQLite.NewSelectBuilder().
@@ -2223,8 +2230,10 @@ func init() {
 		"sort_asc":         sql.SortAscFilter([]string{"id", "username", "inbound", "type", "created_at", "updated_at"}),
 		"sort_desc":        sql.SortDescFilter([]string{"id", "username", "inbound", "type", "created_at", "updated_at"}),
 		"offset":           sql.OffsetFilter(),
-		"limit":            sql.LimitFilter()}
-	connectionLimiterFilters = map[string]sql.Filter{"id": sql.EqualFilter("id"),
+		"limit":            sql.LimitFilter(),
+	}
+	connectionLimiterFilters = map[string]sql.Filter{
+		"id": sql.EqualFilter("id"),
 		"pk": sql.EqualFilter("id"),
 		"squad_id_in": sql.ExistsAndWhereInFilter(func() *sqlbuilder.SelectBuilder {
 			return sqlbuilder.SQLite.NewSelectBuilder().
@@ -2250,8 +2259,10 @@ func init() {
 		"sort_asc":         sql.SortAscFilter([]string{"id", "username", "outbound", "strategy", "connection_type", "lock_type", "count", "created_at", "updated_at"}),
 		"sort_desc":        sql.SortDescFilter([]string{"id", "username", "outbound", "strategy", "connection_type", "lock_type", "count", "created_at", "updated_at"}),
 		"offset":           sql.OffsetFilter(),
-		"limit":            sql.LimitFilter()}
-	bandwidthLimiterFilters = map[string]sql.Filter{"id": sql.EqualFilter("id"),
+		"limit":            sql.LimitFilter(),
+	}
+	bandwidthLimiterFilters = map[string]sql.Filter{
+		"id": sql.EqualFilter("id"),
 		"pk": sql.EqualFilter("id"),
 		"squad_id_in": sql.ExistsAndWhereInFilter(func() *sqlbuilder.SelectBuilder {
 			return sqlbuilder.SQLite.NewSelectBuilder().
@@ -2277,8 +2288,10 @@ func init() {
 		"sort_desc": sql.ReplacedSortDescFilter(map[string]string{"speed": "raw_speed"},
 			[]string{"id", "username", "outbound", "strategy", "connection_type", "mode", "raw_speed", "created_at", "updated_at"}),
 		"offset": sql.OffsetFilter(),
-		"limit":  sql.LimitFilter()}
-	trafficLimiterFilters = map[string]sql.Filter{"id": sql.EqualFilter("id"),
+		"limit":  sql.LimitFilter(),
+	}
+	trafficLimiterFilters = map[string]sql.Filter{
+		"id": sql.EqualFilter("id"),
 		"pk": sql.EqualFilter("id"),
 		"squad_id_in": sql.ExistsAndWhereInFilter(func() *sqlbuilder.SelectBuilder {
 			return sqlbuilder.SQLite.NewSelectBuilder().
@@ -2309,8 +2322,10 @@ func init() {
 		"sort_desc": sql.ReplacedSortDescFilter(map[string]string{"used": "raw_used", "quota": "raw_quota"},
 			[]string{"id", "username", "outbound", "strategy", "mode", "raw_used", "raw_quota", "created_at", "updated_at"}),
 		"offset": sql.OffsetFilter(),
-		"limit":  sql.LimitFilter()}
-	rateLimiterFilters = map[string]sql.Filter{"id": sql.EqualFilter("id"),
+		"limit":  sql.LimitFilter(),
+	}
+	rateLimiterFilters = map[string]sql.Filter{
+		"id": sql.EqualFilter("id"),
 		"pk": sql.EqualFilter("id"),
 		"squad_id_in": sql.ExistsAndWhereInFilter(func() *sqlbuilder.SelectBuilder {
 			return sqlbuilder.SQLite.NewSelectBuilder().
@@ -2338,5 +2353,6 @@ func init() {
 		"sort_asc":         sql.SortAscFilter([]string{"id", "username", "outbound", "strategy", "connection_type", "count", "interval", "created_at", "updated_at"}),
 		"sort_desc":        sql.SortDescFilter([]string{"id", "username", "outbound", "strategy", "connection_type", "count", "interval", "created_at", "updated_at"}),
 		"offset":           sql.OffsetFilter(),
-		"limit":            sql.LimitFilter()}
+		"limit":            sql.LimitFilter(),
+	}
 }

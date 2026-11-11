@@ -3,9 +3,10 @@ package sqlite
 import (
 	"database/sql"
 
+	"github.com/sagernet/sing-box/common/migrate/source"
+
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/sqlite"
-	"github.com/sagernet/sing-box/common/migrate/source"
 )
 
 var migrations = map[string]string{

@@ -7,8 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang-migrate/migrate/v4/source"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/golang-migrate/migrate/v4/source"
 )
 
 type RawDriver struct {

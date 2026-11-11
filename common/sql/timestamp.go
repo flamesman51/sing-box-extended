@@ -3,8 +3,9 @@ package sql
 import (
 	"time"
 
-	"github.com/huandu/go-sqlbuilder"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/huandu/go-sqlbuilder"
 )
 
 const timestampFormat = "2006-01-02 15:04:05.000"

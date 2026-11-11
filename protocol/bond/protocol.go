@@ -4,11 +4,12 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+
+	"github.com/gofrs/uuid/v5"
 )
 
 const (

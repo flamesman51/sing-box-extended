@@ -5,9 +5,10 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/huandu/go-sqlbuilder"
 	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/huandu/go-sqlbuilder"
 )
 
 type Filter func(sb *sqlbuilder.SelectBuilder, value []string) error

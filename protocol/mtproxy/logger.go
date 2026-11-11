@@ -3,8 +3,9 @@ package mtproxy
 import (
 	"fmt"
 
-	"github.com/dolonet/mtg-multi/mtglib"
 	"github.com/sagernet/sing/common/logger"
+
+	"github.com/dolonet/mtg-multi/mtglib"
 )
 
 type LoggerAdapter struct {

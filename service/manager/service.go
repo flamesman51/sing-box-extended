@@ -8,8 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-playground/validator/v10"
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	C "github.com/sagernet/sing-box/constant"
@@ -19,6 +17,9 @@ import (
 	"github.com/sagernet/sing-box/service/manager/repository/main/postgresql"
 	"github.com/sagernet/sing-box/service/manager/repository/main/sqlite"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/gofrs/uuid/v5"
 	"github.com/shtorm-7/go-cache/v2"
 	wpconstant "github.com/shtorm-7/workerpool/constant"
 	"github.com/shtorm-7/workerpool/pool"
